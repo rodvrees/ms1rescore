@@ -1,0 +1,12 @@
+[package]
+name = "ms1rescore-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ms1rescore_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+rayon = "1.10"

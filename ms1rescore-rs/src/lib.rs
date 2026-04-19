@@ -1,0 +1,120 @@
+mod digest;
+mod isotope;
+mod spectral;
+mod xic;
+
+use pyo3::prelude::*;
+
+/// Extract XICs for multiple target m/z values across all MS1 scans.
+///
+/// Args:
+///     ms1_rts: Retention times for each MS1 scan.
+///     ms1_mz_arrays: m/z arrays for each MS1 scan (sorted).
+///     ms1_int_arrays: Intensity arrays for each MS1 scan.
+///     target_mzs: Target m/z values to extract XICs for.
+///     ppm_tolerance: Mass tolerance in ppm.
+///
+/// Returns:
+///     List of (rts, intensities) tuples, one per target m/z.
+#[pyfunction]
+#[pyo3(signature = (ms1_rts, ms1_mz_arrays, ms1_int_arrays, target_mzs, ppm_tolerance=20.0))]
+fn extract_xics_batch(
+    ms1_rts: Vec<f64>,
+    ms1_mz_arrays: Vec<Vec<f64>>,
+    ms1_int_arrays: Vec<Vec<f64>>,
+    target_mzs: Vec<f64>,
+    ppm_tolerance: f64,
+) -> Vec<(Vec<f64>, Vec<f64>)> {
+    xic::extract_xics_batch(&ms1_rts, &ms1_mz_arrays, &ms1_int_arrays, &target_mzs, ppm_tolerance)
+}
+
+/// Batch compute spectral angles between predicted and observed MS2 spectra.
+///
+/// Args:
+///     pred_mzs: Predicted fragment m/z arrays (sorted).
+///     pred_ints: Predicted fragment intensity arrays.
+///     obs_mzs: Observed fragment m/z arrays (sorted).
+///     obs_ints: Observed fragment intensity arrays.
+///     fragment_tol_da: Fragment matching tolerance in Da.
+///
+/// Returns:
+///     List of spectral angles (0-1, 1=identical).
+#[pyfunction]
+#[pyo3(signature = (pred_mzs, pred_ints, obs_mzs, obs_ints, fragment_tol_da=0.02))]
+fn spectral_angles_batch(
+    pred_mzs: Vec<Vec<f64>>,
+    pred_ints: Vec<Vec<f64>>,
+    obs_mzs: Vec<Vec<f64>>,
+    obs_ints: Vec<Vec<f64>>,
+    fragment_tol_da: f64,
+) -> Vec<f64> {
+    spectral::spectral_angles_batch(&pred_mzs, &pred_ints, &obs_mzs, &obs_ints, fragment_tol_da)
+}
+
+/// Batch extract MS1 isotope envelopes at specific scans.
+///
+/// Args:
+///     ms1_mz_arrays: m/z arrays for each MS1 scan.
+///     ms1_int_arrays: Intensity arrays for each MS1 scan.
+///     scan_indices: Which MS1 scan to extract from (one per target).
+///     target_mzs: Monoisotopic m/z values.
+///     charge: Charge state.
+///     n_peaks: Number of isotope peaks to extract.
+///     ppm_tolerance: Mass tolerance in ppm.
+///
+/// Returns:
+///     List of normalized isotope envelopes.
+#[pyfunction]
+#[pyo3(signature = (ms1_mz_arrays, ms1_int_arrays, scan_indices, target_mzs, charge=1, n_peaks=3, ppm_tolerance=20.0))]
+fn extract_ms1_envelopes_batch(
+    ms1_mz_arrays: Vec<Vec<f64>>,
+    ms1_int_arrays: Vec<Vec<f64>>,
+    scan_indices: Vec<usize>,
+    target_mzs: Vec<f64>,
+    charge: usize,
+    n_peaks: usize,
+    ppm_tolerance: f64,
+) -> Vec<Vec<f64>> {
+    isotope::extract_envelopes_batch(
+        &ms1_mz_arrays,
+        &ms1_int_arrays,
+        &scan_indices,
+        &target_mzs,
+        charge,
+        n_peaks,
+        ppm_tolerance,
+    )
+}
+
+/// Batch compute monoisotopic mass and elemental composition for peptide sequences.
+///
+/// Returns tuple of 7 parallel lists:
+///     (masses, mh_mzs, n_C, n_H, n_N, n_O, n_S)
+#[pyfunction]
+fn compute_peptide_masses(sequences: Vec<String>) -> (Vec<f64>, Vec<f64>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+    digest::compute_peptide_info_batch(&sequences)
+}
+
+/// Match peptide [M+H]+ m/z values against MALDI feature m/z values.
+///
+/// Returns tuple of 3 parallel lists:
+///     (feature_indices, peptide_indices, ppm_errors)
+#[pyfunction]
+#[pyo3(signature = (maldi_mzs, peptide_mzs, ppm_tolerance=20.0))]
+fn match_mz(
+    maldi_mzs: Vec<f64>,
+    peptide_mzs: Vec<f64>,
+    ppm_tolerance: f64,
+) -> (Vec<u32>, Vec<u32>, Vec<f64>) {
+    digest::match_mz_batch(&maldi_mzs, &peptide_mzs, ppm_tolerance)
+}
+
+#[pymodule]
+fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(extract_xics_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(spectral_angles_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_ms1_envelopes_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_peptide_masses, m)?)?;
+    m.add_function(wrap_pyfunction!(match_mz, m)?)?;
+    Ok(())
+}
