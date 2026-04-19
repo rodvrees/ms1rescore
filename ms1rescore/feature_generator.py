@@ -26,42 +26,54 @@ from ms1rescore.maldi_features import (
 
 logger = logging.getLogger(__name__)
 
-# Feature name groups
-_MASS_ACCURACY = ["ppm_error_abs", "ppm_rank", "ppm_best_ratio"]
-_AMBIGUITY = ["n_candidates", "log_n_candidates"]
-_PROTEIN = [
+# ---------------------------------------------------------------------------
+# Feature groups
+# ---------------------------------------------------------------------------
+
+# MALDI-intrinsic features: computed entirely from MALDI data and in-silico
+# properties. These are used as the sole input to the ranker/SVM so that the
+# model scores MALDI match quality, not LC-MS/MS identification quality.
+MALDI_INTRINSIC_FEATURES = [
+    # mass accuracy
+    "ppm_error_abs", "ppm_rank", "ppm_best_ratio",
+    # ambiguity
+    "n_candidates", "log_n_candidates",
+    # protein (structural, not LC evidence)
     "protein_n_features", "log_protein_n_features", "protein_coverage",
     "protein_rank", "protein_best_ratio",
-]
-_PEPTIDE = ["peptide_length", "n_missed_cleavages", "has_modifications"]
-_MALDI_SIGNAL = ["log_maldi_intensity"]
-_LCMS_EVIDENCE = [
-    "lcms_ms2_spectral_angle", "lcms_ms2_n_matches",
-    "lcms_xic_max_intensity", "lcms_xic_n_scans", "lcms_xic_snr",
-    "lcms_xic_best_charge",
-    "lcms_rt_residual", "lcms_ms1_isotope_cosine",
-]
-_THEO_ISOTOPE = [
+    # peptide properties
+    "peptide_length", "n_missed_cleavages", "has_modifications",
+    # MALDI signal
+    "log_maldi_intensity",
+    # theoretical isotope
     "theo_isotope_cosine", "theo_isotope_chi2", "theo_isotope_kl",
     "theo_has_sulfur", "averagine_deviation", "averagine_deviation_sulfur",
     "theo_m1_ratio_diff", "theo_m2_ratio_diff",
-    "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
-]
-_IONIZATION = [
-    "n_arginine", "n_basic_residues", "n_phenylalanine",
-    "n_aromatic", "gravy_score", "charge_proxy",
-]
-_SPATIAL = [
+    # ionization priors
+    "n_arginine", "n_basic_residues", "n_phenylalanine", "n_aromatic",
+    "gravy_score", "charge_proxy",
+    # spatial (optional — included only if computed)
     "spatial_autocorrelation", "fraction_detected", "intensity_cv",
     "log_mean_intensity", "spatial_entropy",
-]
-_COLOCALIZATION = [
+    # co-localization (optional)
     "protein_colocalization", "protein_colocalization_max",
     "protein_colocalization_median", "protein_colocalization_n_partners",
+    # observed isotope envelope similarity MALDI vs LC-MS/MS (optional)
+    "isotope_envelope_cosine", "isotope_envelope_pearson",
+    "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
+    "isotope_n_matched",
 ]
-_ENVELOPE = [
-    "isotope_envelope_cosine", "isotope_envelope_pearson", "isotope_envelope_mse",
-    "isotope_m1_ratio_diff", "isotope_m2_ratio_diff", "isotope_n_matched",
+
+# LC-MS/MS prior features: computed from raw mzML. These are NOT passed to the
+# ranker/SVM — doing so would cause the model to score LC-MS/MS identification
+# quality instead of MALDI match quality. Instead they are applied as a
+# multiplicative Bayesian prior after MALDI-intrinsic scoring.
+LCMS_PRIOR_FEATURES = [
+    "lcms_ms2_spectral_angle", "lcms_ms2_n_matches",
+    "lcms_xic_max_intensity", "lcms_xic_n_scans", "lcms_xic_snr",
+    "lcms_xic_best_charge", "lcms_rt_residual",
+    "lcms_ms1_isotope_cosine",
+    "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
 ]
 
 
@@ -70,18 +82,35 @@ def get_feature_names(
     has_ion_images: bool = False,
     has_envelopes: bool = False,
 ) -> list[str]:
-    """Return the list of feature names based on available data."""
-    names = (
-        _MASS_ACCURACY + _AMBIGUITY + _PROTEIN + _PEPTIDE + _MALDI_SIGNAL
-        + _LCMS_EVIDENCE + _THEO_ISOTOPE + _IONIZATION
-    )
-    if has_spatial:
-        names += _SPATIAL
-    if has_ion_images:
-        names += _COLOCALIZATION
-    if has_envelopes:
-        names += _ENVELOPE
-    return names
+    """Return the full list of feature names based on available data.
+
+    Returns MALDI_INTRINSIC_FEATURES + LCMS_PRIOR_FEATURES, filtered to
+    include optional groups only when the corresponding data was computed.
+    """
+    intrinsic = [
+        f for f in MALDI_INTRINSIC_FEATURES
+        if (
+            f not in (
+                "spatial_autocorrelation", "fraction_detected", "intensity_cv",
+                "log_mean_intensity", "spatial_entropy",
+            )
+            or has_spatial
+        ) and (
+            f not in (
+                "protein_colocalization", "protein_colocalization_max",
+                "protein_colocalization_median", "protein_colocalization_n_partners",
+            )
+            or has_ion_images
+        ) and (
+            f not in (
+                "isotope_envelope_cosine", "isotope_envelope_pearson",
+                "isotope_envelope_mse", "isotope_m1_ratio_diff",
+                "isotope_m2_ratio_diff", "isotope_n_matched",
+            )
+            or has_envelopes
+        )
+    ]
+    return intrinsic + LCMS_PRIOR_FEATURES
 
 
 def candidates_to_psm_list(candidates_df: pd.DataFrame) -> PSMList:
@@ -136,17 +165,17 @@ def compute_all_features(
 
     # LC-MS/MS evidence (pre-computed)
     if lcms_evidence is not None:
-        for feat in _LCMS_EVIDENCE:
+        for feat in LCMS_PRIOR_FEATURES:
             df[feat] = df.index.map(
                 lambda idx: lcms_evidence.get(idx, {}).get(feat, 0.0)
             )
-        # Fill NaN for rt_residual and isotope_cosine
+        # Fill NaN for rt_residual and isotope_cosine with median (fair fill)
         for feat in ["lcms_rt_residual", "lcms_ms1_isotope_cosine"]:
             valid = df[feat].dropna()
             fill = valid.median() if len(valid) > 0 else 0.0
             df[feat] = df[feat].fillna(fill)
     else:
-        for feat in _LCMS_EVIDENCE:
+        for feat in LCMS_PRIOR_FEATURES:
             df[feat] = 0.0
 
     # Theoretical isotope

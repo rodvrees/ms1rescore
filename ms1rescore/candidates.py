@@ -1,6 +1,7 @@
 """FASTA digest, decoy generation, and MALDI m/z matching."""
 
 import logging
+import random
 
 import numpy as np
 import pandas as pd
@@ -11,23 +12,20 @@ from ms1rescore.utils import PROTON
 logger = logging.getLogger(__name__)
 
 
-def _reverse_protein_keep_cleavage(seq: str) -> str:
+def _shuffle_protein(seq: str, random_state: int = 42) -> str:
     """
-    Reverse a protein sequence while keeping K and R at their original positions.
+    Shuffle all residues of a protein sequence randomly.
 
-    Ensures the reversed protein produces the same number of tryptic peptides
-    with the same length distribution as the target.
+    Unlike K/R-preserving reversal, this produces decoy peptides with
+    different elemental compositions from target peptides of the same mass,
+    making isotope envelope features (theo_isotope_cosine, etc.) genuinely
+    discriminative. K/R-preserving reversal frequently produces isobaric
+    decoys with identical isotope envelopes.
     """
-    kr_positions = {i: seq[i] for i in range(len(seq)) if seq[i] in "KR"}
-    non_kr = [seq[i] for i in range(len(seq)) if seq[i] not in "KR"]
-    non_kr.reverse()
-    result = list(seq)
-    j = 0
-    for i in range(len(result)):
-        if i not in kr_positions:
-            result[i] = non_kr[j]
-            j += 1
-    return "".join(result)
+    rng = random.Random(random_state)
+    residues = list(seq)
+    rng.shuffle(residues)
+    return "".join(residues)
 
 
 def digest_fasta(
@@ -62,7 +60,7 @@ def digest_fasta(
                 rows.append((pep, protein_id, False))
 
         if generate_decoys:
-            decoy_seq = _reverse_protein_keep_cleavage(seq)
+            decoy_seq = _shuffle_protein(seq)
             cleaved_d = parser.cleave(
                 decoy_seq,
                 parser.expasy_rules.get(enzyme, enzyme),

@@ -8,6 +8,8 @@ import pandas as pd
 
 from ms1rescore.candidates import digest_fasta, match_to_maldi_features
 from ms1rescore.feature_generator import (
+    LCMS_PRIOR_FEATURES,
+    MALDI_INTRINSIC_FEATURES,
     candidates_to_psm_list,
     compute_all_features,
     get_feature_names,
@@ -25,6 +27,186 @@ from ms1rescore.lcms_evidence import (
 logger = logging.getLogger(__name__)
 
 
+def compute_lcms_prior(
+    candidates_df: pd.DataFrame,
+    present_lcms_features: list[str],
+) -> np.ndarray:
+    """
+    Compute a per-candidate multiplicative weight in (0, 1] based on
+    available LC-MS/MS evidence.
+
+    Each present feature is min-max normalized to [0, 1] across all candidates.
+    Features where all values are zero (no evidence for any candidate) are
+    excluded from the average. The returned weight is the mean of the
+    normalized non-zero features, or 1.0 if no LC-MS/MS features are present.
+
+    LC-MS/MS features are NOT passed to the ranker so that the model scores
+    MALDI match quality rather than LC-MS/MS identification quality. The prior
+    applies LC-MS/MS evidence as a Bayesian weight after MALDI-intrinsic
+    scoring, keeping the two inference steps conceptually separate.
+    """
+    normed = []
+    for feat in present_lcms_features:
+        if feat not in candidates_df.columns:
+            continue
+        col = candidates_df[feat].fillna(0.0).values.astype(float)
+        col_min, col_max = col.min(), col.max()
+        if col_max - col_min < 1e-12:
+            # All values identical (e.g. all zero) — feature carries no information
+            continue
+        normed.append((col - col_min) / (col_max - col_min))
+
+    if not normed:
+        return np.ones(len(candidates_df))
+
+    return np.stack(normed, axis=0).mean(axis=0)
+
+
+def _rescore_svm(
+    psm_list,
+    intrinsic_feature_names: list[str],
+    train_fdr: float,
+):
+    """Run mokapot PercolatorModel on MALDI-intrinsic features."""
+    from mokapot import brew
+    from mokapot.model import PercolatorModel
+    from ms2rescore.rescoring_engines.mokapot import convert_psm_list
+
+    lin = convert_psm_list(psm_list, feature_names=intrinsic_feature_names)
+    model = PercolatorModel(train_fdr=train_fdr, max_iter=10)
+    result = brew(lin, model=model)
+    conf_obj = result[0] if isinstance(result, tuple) else result
+    return conf_obj
+
+
+def _rescore_catboost(
+    features_df: pd.DataFrame,
+    intrinsic_feature_names: list[str],
+    train_fdr: float,
+    init_ppm_threshold: float,
+    init_isotope_threshold: float,
+) -> np.ndarray:
+    """
+    Semi-supervised CatBoostRanker on MALDI-intrinsic features.
+
+    Pseudo-label iteration:
+      1. Seed positives: ppm_error_abs < init_ppm_threshold AND
+         theo_isotope_cosine > init_isotope_threshold (targets only).
+      2. Train CatBoostRanker on seed positives + all decoys.
+      3. Score all candidates; compute provisional TDC q-values.
+      4. Expand positives to candidates with q <= 0.05 (targets only).
+      5. Repeat until convergence (<1% change in positive set size) or 5 iters.
+
+    Returns a score array (higher = more likely correct).
+    """
+    try:
+        from catboost import CatBoostRanker, Pool
+    except ImportError as e:
+        raise ImportError(
+            "CatBoost is required for model='catboost'. "
+            "Install with: pip install catboost>=1.2"
+        ) from e
+
+    df = features_df.reset_index(drop=True)
+    present = [f for f in intrinsic_feature_names if f in df.columns]
+    X = df[present].fillna(0.0).values.astype(np.float32)
+    is_decoy = df["is_decoy"].values.astype(bool)
+    is_target = ~is_decoy
+
+    # Initial positive seed: stringent mass accuracy + isotope filter
+    seed_mask = (
+        is_target
+        & (df.get("ppm_error_abs", pd.Series(np.inf, index=df.index)) < init_ppm_threshold)
+        & (df.get("theo_isotope_cosine", pd.Series(0.0, index=df.index)) > init_isotope_threshold)
+    ).values
+
+    n_seed = seed_mask.sum()
+    logger.info(f"  CatBoost: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
+    if n_seed == 0:
+        logger.warning("  CatBoost: no seed positives — falling back to top-ppm init")
+        ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+        seed_mask = is_target & (ppm_col < ppm_col[is_target].quantile(0.10)).values
+
+    catboost_params = dict(
+        iterations=500,
+        learning_rate=0.05,
+        depth=6,
+        loss_function="YetiRank",
+        verbose=False,
+        random_seed=42,
+    )
+
+    scores = np.zeros(len(df))
+    prev_pos_size = -1
+
+    for iteration in range(5):
+        # Build training set: pseudo-positives (label=1) + decoys (label=0)
+        pos_idx = np.where(seed_mask)[0]
+        dec_idx = np.where(is_decoy)[0]
+        train_idx = np.concatenate([pos_idx, dec_idx])
+        labels = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(dec_idx))])
+
+        # CatBoostRanker requires group_id; use a single group
+        group_ids = np.zeros(len(train_idx), dtype=np.int32)
+
+        pool = Pool(
+            data=X[train_idx],
+            label=labels,
+            group_id=group_ids,
+        )
+        model_cb = CatBoostRanker(**catboost_params)
+        model_cb.fit(pool)
+
+        scores = model_cb.predict(X)
+
+        # Provisional TDC q-values (higher score = better)
+        q_values = _tdc_qvalues(scores, is_decoy)
+
+        # Expand pseudo-positives: all targets with q <= 0.05
+        new_seed = is_target & (q_values <= 0.05)
+        n_new = new_seed.sum()
+
+        logger.info(
+            f"  CatBoost iter {iteration + 1}: "
+            f"pseudo-positives = {n_new} (prev = {prev_pos_size})"
+        )
+
+        change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
+        if prev_pos_size >= 0 and change < 0.01:
+            logger.info("  CatBoost: converged")
+            break
+
+        prev_pos_size = n_new
+        seed_mask = new_seed.values if hasattr(new_seed, "values") else new_seed
+
+    return scores
+
+
+def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
+    """
+    Compute per-candidate target-decoy q-values.
+
+    Uses standard TDC: sort by descending score, compute cumulative
+    FDR = n_decoy / n_target at each position, then take the minimum
+    FDR seen at or below each score (q-value = rolling min from the bottom).
+    """
+    order = np.argsort(-scores)
+    n_target_cum = np.cumsum(~is_decoy[order]).astype(float)
+    n_decoy_cum = np.cumsum(is_decoy[order]).astype(float)
+
+    # Avoid division by zero
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fdr = np.where(n_target_cum > 0, n_decoy_cum / n_target_cum, 1.0)
+
+    # q-value: minimum FDR at or below this score (monotone from the tail)
+    qval_ordered = np.minimum.accumulate(fdr[::-1])[::-1]
+
+    # Map back to original order
+    q_values = np.empty_like(qval_ordered)
+    q_values[order] = qval_ordered
+    return q_values
+
+
 def rescore(
     fasta_path: str,
     maldi_mzs: np.ndarray,
@@ -40,6 +222,9 @@ def rescore(
     missed_cleavages: int = 2,
     min_length: int = 7,
     max_length: int = 30,
+    model: str = "svm",
+    init_ppm_threshold: float = 2.0,
+    init_isotope_threshold: float = 0.7,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -65,13 +250,31 @@ def rescore(
     ppm_tolerance
         Mass tolerance for MALDI-to-database matching in ppm.
     train_fdr
-        FDR threshold for mokapot training.
+        FDR threshold for mokapot training (SVM backend only).
     cache_dir
         Directory for caching intermediate results.
+    missed_cleavages
+        Number of missed cleavages for in-silico digest.
+    min_length
+        Minimum peptide length.
+    max_length
+        Maximum peptide length.
+    model
+        Rescoring backend: "svm" (mokapot PercolatorModel, default) or
+        "catboost" (semi-supervised CatBoostRanker). Both backends use only
+        MALDI_INTRINSIC_FEATURES for training. LC-MS/MS evidence is applied
+        as a multiplicative prior after scoring.
+    init_ppm_threshold
+        CatBoost only: ppm_error_abs threshold for the initial positive seed.
+    init_isotope_threshold
+        CatBoost only: theo_isotope_cosine threshold for the initial positive seed.
 
     Returns
     -------
-    tuple of (psm_list, confidence_estimates, feature_names)
+    tuple of (psm_list, result, feature_names)
+        result is a confidence estimates dict (SVM) or a DataFrame with
+        columns [peptide, feature_idx, score, reweighted_score, q_value,
+        reweighted_q_value] (CatBoost).
     """
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -88,7 +291,6 @@ def rescore(
         max_length=max_length,
         generate_decoys=True,
     )
-    # Compute per-feature MALDI intensities from ion images if available
     maldi_intensities = None
     if ion_images is not None:
         maldi_intensities = np.array([
@@ -112,7 +314,6 @@ def rescore(
     lcms_data = load_lcms_data(mzml_paths, cache_path=_cache("lcms_data.pkl"))
 
     # --- Step 3: MS2PIP predictions ---
-    # Only predict for (peptide, charge) pairs where a matching MS2 scan exists.
     logger.info("Step 3: Finding MS2 matches and running MS2PIP...")
     from ms1rescore.lcms_evidence import _find_matching_ms2_scans
     from ms1rescore.utils import mz_to_mass
@@ -166,7 +367,6 @@ def rescore(
     )
 
     # --- Step 6: Extract LC-MS/MS envelopes from XIC best scans ---
-    # Build per-feature LC-MS/MS envelopes from XIC data (symmetric)
     lcms_envelopes_xic = None
     if maldi_envelopes is not None:
         logger.info("Step 6: Extracting LC-MS/MS envelopes from XIC scans...")
@@ -203,27 +403,81 @@ def rescore(
         has_envelopes=maldi_envelopes is not None and lcms_envelopes_xic is not None,
     )
 
+    # Intrinsic features that are actually present in the DataFrame
+    intrinsic_present = [
+        f for f in MALDI_INTRINSIC_FEATURES if f in features_df.columns
+    ]
+    lcms_present = [
+        f for f in LCMS_PRIOR_FEATURES if f in features_df.columns
+    ]
+
     # --- Step 8: Build PSMList ---
     logger.info("Step 8: Building PSMList...")
     psm_list = candidates_to_psm_list(features_df)
     populate_psm_features(psm_list, features_df, feature_names)
 
-    logger.info(f"  {len(feature_names)} features: {feature_names}")
+    logger.info(f"  {len(feature_names)} features ({len(intrinsic_present)} intrinsic, {len(lcms_present)} LC-MS/MS prior)")
 
-    # --- Step 9: Mokapot rescoring ---
-    logger.info("Step 9: Running mokapot rescoring...")
-    from mokapot import brew
-    from mokapot.model import PercolatorModel
-    from ms2rescore.rescoring_engines.mokapot import convert_psm_list
+    # --- Step 9: Rescoring ---
+    logger.info(f"Step 9: Running rescoring (model='{model}')...")
 
-    lin = convert_psm_list(psm_list, feature_names=feature_names)
-    model = PercolatorModel(train_fdr=train_fdr, max_iter=10)
-    result = brew(lin, model=model)
-    conf = (result[0] if isinstance(result, tuple) else result).confidence_estimates
+    if model == "svm":
+        # Pass only intrinsic features to the SVM
+        populate_psm_features(psm_list, features_df, intrinsic_present)
+        conf_obj = _rescore_svm(psm_list, intrinsic_present, train_fdr)
+        conf = conf_obj.confidence_estimates
+        psm_conf = conf["psms"]
 
-    psm_conf = conf["psms"]
-    for fdr_threshold in [0.01, 0.05, 0.10]:
-        n = (psm_conf["mokapot q-value"] <= fdr_threshold).sum()
-        logger.info(f"  At {fdr_threshold*100:.0f}% FDR: {n} target features")
+        # LC-MS/MS prior reweight
+        lcms_prior = compute_lcms_prior(features_df, lcms_present)
+        if "mokapot score" in psm_conf.columns:
+            psm_conf = psm_conf.copy()
+            psm_conf["reweighted_score"] = psm_conf["mokapot score"] * lcms_prior[
+                psm_conf.index if "index" not in psm_conf.columns else psm_conf["index"]
+            ]
 
-    return psm_list, conf, feature_names
+        for fdr_threshold in [0.01, 0.05, 0.10]:
+            n = (psm_conf["mokapot q-value"] <= fdr_threshold).sum()
+            logger.info(f"  At {fdr_threshold*100:.0f}% FDR: {n} target features")
+
+        return psm_list, conf, feature_names
+
+    elif model == "catboost":
+        scores = _rescore_catboost(
+            features_df,
+            intrinsic_present,
+            train_fdr=train_fdr,
+            init_ppm_threshold=init_ppm_threshold,
+            init_isotope_threshold=init_isotope_threshold,
+        )
+
+        is_decoy = features_df["is_decoy"].values.astype(bool)
+        q_values = _tdc_qvalues(scores, is_decoy)
+
+        # LC-MS/MS prior reweight
+        lcms_prior = compute_lcms_prior(features_df, lcms_present)
+        reweighted_scores = scores * lcms_prior
+        reweighted_q = _tdc_qvalues(reweighted_scores, is_decoy)
+
+        result_df = pd.DataFrame({
+            "peptide": features_df["peptide"].values,
+            "feature_idx": features_df.get("feature_idx", pd.Series(range(len(features_df)))).values,
+            "is_decoy": is_decoy,
+            "catboost_score": scores,
+            "q_value": q_values,
+            "reweighted_score": reweighted_scores,
+            "reweighted_q_value": reweighted_q,
+        })
+
+        for fdr_threshold in [0.01, 0.05, 0.10]:
+            n = ((result_df["q_value"] <= fdr_threshold) & ~is_decoy).sum()
+            n_rw = ((result_df["reweighted_q_value"] <= fdr_threshold) & ~is_decoy).sum()
+            logger.info(
+                f"  At {fdr_threshold*100:.0f}% FDR: {n} targets (base), "
+                f"{n_rw} targets (reweighted)"
+            )
+
+        return psm_list, result_df, feature_names
+
+    else:
+        raise ValueError(f"Unknown model '{model}'. Choose 'svm' or 'catboost'.")
