@@ -12,14 +12,22 @@ import pandas as pd
 from psm_utils import PSM, PSMList, Peptidoform
 
 from ms1rescore.maldi_features import (
+    compute_adduct_colocalization,
+    compute_calibrated_ppm_features,
     compute_candidate_ambiguity_features,
+    compute_chca_cluster_features,
     compute_colocalization_features,
     compute_envelope_similarity,
+    compute_im2deep_features,
+    compute_isotopologue_colocalization,
     compute_maldi_ionization_features,
     compute_maldi_signal_features,
     compute_mass_accuracy_features,
+    compute_mass_defect_features,
     compute_peptide_properties,
+    compute_peptide_property_features,
     compute_protein_consistency_features,
+    compute_spatial_autocorrelation_full,
     compute_spatial_features,
     compute_theoretical_isotope_features,
 )
@@ -31,34 +39,60 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # MALDI-intrinsic features: computed entirely from MALDI data and in-silico
-# properties. These are used as the sole input to the ranker/SVM so that the
-# model scores MALDI match quality, not LC-MS/MS identification quality.
+# properties. These are the sole input to the ranker/SVM so that the model
+# scores MALDI match quality, not LC-MS/MS identification quality.
+#
+# Optional features are included in the list but filtered out by
+# get_feature_names() when the required data was not provided.
 MALDI_INTRINSIC_FEATURES = [
-    # mass accuracy
+    # --- mass accuracy (A-group) ---
     "ppm_error_abs", "ppm_rank", "ppm_best_ratio",
-    # ambiguity
+    "ppm_error_calibrated_z",        # A3  — optional, requires pixel_coords
+    # --- ambiguity ---
     "n_candidates", "log_n_candidates",
-    # protein (structural, not LC evidence)
+    # --- protein consistency ---
     "protein_n_features", "log_protein_n_features", "protein_coverage",
     "protein_rank", "protein_best_ratio",
-    # peptide properties
+    # --- peptide properties (basic) ---
     "peptide_length", "n_missed_cleavages", "has_modifications",
-    # MALDI signal
+    # --- peptide properties (extended, C-group) ---
+    "nterm_basic",                   # C2
+    "peptide_pi",                    # C8
+    "has_oxidized_met", "has_cys", "n_proline", "nterm_pyroglu_risk",  # C9
+    "acidic_residue_density",        # C12
+    "n_tryptophan", "n_tyrosine",    # C15
+    # --- MALDI signal ---
     "log_maldi_intensity",
-    # theoretical isotope
+    # --- mass defect features (A-group) ---
+    "kendrick_mass_defect",          # A10 — computed in match_to_maldi_features
+    "mass_defect_residual",          # A11
+    # --- CHCA matrix interference ---
+    "chca_cluster_distance_ppm",     # A12
+    # --- theoretical isotope ---
     "theo_isotope_cosine", "theo_isotope_chi2", "theo_isotope_kl",
     "theo_has_sulfur", "averagine_deviation", "averagine_deviation_sulfur",
     "theo_m1_ratio_diff", "theo_m2_ratio_diff",
-    # ionization priors
+    "monoisotopic_confidence",       # A8
+    # --- ionization priors ---
     "n_arginine", "n_basic_residues", "n_phenylalanine", "n_aromatic",
     "gravy_score", "charge_proxy",
-    # spatial (optional — included only if computed)
+    # --- ion mobility (B-group) — optional, requires im2deep + observed CCS ---
+    "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
+    "im2deep_ccs_zscore", "im2deep_ccs_rank", "im2deep_mahalanobis",
+    # --- spatial (optional — requires spatial_features DataFrame) ---
     "spatial_autocorrelation", "fraction_detected", "intensity_cv",
     "log_mean_intensity", "spatial_entropy",
-    # co-localization (optional)
+    # --- full spatial autocorrelation (E5/E6) — optional, requires ion_images ---
+    "spatial_morans_i", "spatial_gearys_c",
+    # --- protein co-localization — optional, requires ion_images ---
     "protein_colocalization", "protein_colocalization_max",
     "protein_colocalization_median", "protein_colocalization_n_partners",
-    # observed isotope envelope similarity MALDI vs LC-MS/MS (optional)
+    # --- isotopologue co-localization (E1) — optional, requires ion_images ---
+    "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
+    "isotope_image_colocalization_mean",
+    # --- adduct co-localization (E2) — optional, requires ion_images ---
+    "adduct_colocalization_na", "adduct_colocalization_k", "adduct_colocalization_chca",
+    # --- observed isotope envelope similarity MALDI vs LC-MS/MS — optional ---
     "isotope_envelope_cosine", "isotope_envelope_pearson",
     "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
     "isotope_n_matched",
@@ -66,8 +100,8 @@ MALDI_INTRINSIC_FEATURES = [
 
 # LC-MS/MS prior features: computed from raw mzML. These are NOT passed to the
 # ranker/SVM — doing so would cause the model to score LC-MS/MS identification
-# quality instead of MALDI match quality. Instead they are applied as a
-# multiplicative Bayesian prior after MALDI-intrinsic scoring.
+# quality rather than MALDI match quality. They are applied as a multiplicative
+# Bayesian prior after MALDI-intrinsic scoring (see pipeline.compute_lcms_prior).
 LCMS_PRIOR_FEATURES = [
     "lcms_ms2_spectral_angle", "lcms_ms2_n_matches",
     "lcms_xic_max_intensity", "lcms_xic_n_scans", "lcms_xic_snr",
@@ -76,39 +110,60 @@ LCMS_PRIOR_FEATURES = [
     "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
 ]
 
+# ---------------------------------------------------------------------------
+# Optional-feature membership sets (used by get_feature_names)
+# ---------------------------------------------------------------------------
+_SPATIAL_FEATS = frozenset([
+    "spatial_autocorrelation", "fraction_detected", "intensity_cv",
+    "log_mean_intensity", "spatial_entropy",
+])
+_COLOC_FEATS = frozenset([
+    "protein_colocalization", "protein_colocalization_max",
+    "protein_colocalization_median", "protein_colocalization_n_partners",
+])
+_ENVELOPE_FEATS = frozenset([
+    "isotope_envelope_cosine", "isotope_envelope_pearson",
+    "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
+    "isotope_n_matched",
+])
+_PIXEL_FEATS = frozenset(["ppm_error_calibrated_z"])
+_CCS_FEATS = frozenset([
+    "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
+    "im2deep_ccs_zscore", "im2deep_ccs_rank", "im2deep_mahalanobis",
+])
+_ISOTOPOLOGUE_COLOC_FEATS = frozenset([
+    "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
+    "isotope_image_colocalization_mean",
+])
+_ADDUCT_COLOC_FEATS = frozenset([
+    "adduct_colocalization_na", "adduct_colocalization_k", "adduct_colocalization_chca",
+])
+_MORANS_FEATS = frozenset(["spatial_morans_i", "spatial_gearys_c"])
+
 
 def get_feature_names(
     has_spatial: bool = False,
     has_ion_images: bool = False,
     has_envelopes: bool = False,
+    has_pixel_coords: bool = False,
+    has_ccs: bool = False,
 ) -> list[str]:
     """Return the full list of feature names based on available data.
 
-    Returns MALDI_INTRINSIC_FEATURES + LCMS_PRIOR_FEATURES, filtered to
-    include optional groups only when the corresponding data was computed.
+    Optional feature groups are included only when the corresponding data
+    was computed. ``MALDI_INTRINSIC_FEATURES + LCMS_PRIOR_FEATURES`` is the
+    superset; this function selects the applicable subset.
     """
     intrinsic = [
         f for f in MALDI_INTRINSIC_FEATURES
-        if (
-            f not in (
-                "spatial_autocorrelation", "fraction_detected", "intensity_cv",
-                "log_mean_intensity", "spatial_entropy",
-            )
-            or has_spatial
-        ) and (
-            f not in (
-                "protein_colocalization", "protein_colocalization_max",
-                "protein_colocalization_median", "protein_colocalization_n_partners",
-            )
-            or has_ion_images
-        ) and (
-            f not in (
-                "isotope_envelope_cosine", "isotope_envelope_pearson",
-                "isotope_envelope_mse", "isotope_m1_ratio_diff",
-                "isotope_m2_ratio_diff", "isotope_n_matched",
-            )
-            or has_envelopes
-        )
+        if (f not in _SPATIAL_FEATS or has_spatial)
+        and (f not in _COLOC_FEATS or has_ion_images)
+        and (f not in _ISOTOPOLOGUE_COLOC_FEATS or has_ion_images)
+        and (f not in _ADDUCT_COLOC_FEATS or has_ion_images)
+        and (f not in _MORANS_FEATS or has_ion_images)
+        and (f not in _ENVELOPE_FEATS or has_envelopes)
+        and (f not in _PIXEL_FEATS or has_pixel_coords)
+        and (f not in _CCS_FEATS or has_ccs)
     ]
     return intrinsic + LCMS_PRIOR_FEATURES
 
@@ -148,28 +203,64 @@ def compute_all_features(
     ion_image_mzs: np.ndarray | None = None,
     maldi_envelopes: dict | None = None,
     lcms_envelopes: dict | None = None,
+    pixel_coords: np.ndarray | None = None,
+    maldi_mzs: np.ndarray | None = None,
+    observed_ccs_per_feature: dict | None = None,
+    im2deep_calibration_slope: float = 1.0,
+    im2deep_calibration_intercept: float = 0.0,
 ) -> pd.DataFrame:
     """
     Compute all features on the candidate DataFrame.
 
-    Returns the DataFrame with all feature columns added.
+    Parameters
+    ----------
+    candidates_df
+        Output of match_to_maldi_features().
+    lcms_evidence
+        Pre-computed LC-MS/MS evidence dict from compute_all_lcms_evidence().
+    spatial_features
+        Pre-computed per-feature spatial statistics DataFrame (optional).
+    ion_images
+        MALDI ion images array, shape (n_features, H, W) (optional).
+    ion_image_mzs
+        m/z values aligned with ion_images (optional).
+    maldi_envelopes
+        MALDI isotope envelopes: feature_mz → array (optional).
+    lcms_envelopes
+        LC-MS/MS isotope envelopes: feature_mz → array (optional).
+    pixel_coords
+        (N_features,) or (N_features, 2) pixel coordinates aligned with
+        maldi_mzs, used for LOWESS ppm calibration (A3, optional).
+    maldi_mzs
+        Array of MALDI feature m/z values in feature-index order (required
+        for A3 if pixel_coords is provided).
+    observed_ccs_per_feature
+        Dict mapping feature_idx → observed CCS value for IM2Deep features (optional).
+    im2deep_calibration_slope / im2deep_calibration_intercept
+        Linear calibration parameters for IM2Deep predictions.
+
+    Returns
+    -------
+    DataFrame with all feature columns added.
     """
     df = candidates_df.copy()
 
-    # Mass accuracy
+    # --- Always-computed features ---
     df = compute_mass_accuracy_features(df)
     df = compute_candidate_ambiguity_features(df)
     df = compute_protein_consistency_features(df)
     df = compute_peptide_properties(df)
+    df = compute_peptide_property_features(df)          # C-group
     df = compute_maldi_signal_features(df)
+    df = compute_mass_defect_features(df)               # A11
+    df = compute_chca_cluster_features(df)              # A12
 
-    # LC-MS/MS evidence (pre-computed)
+    # --- LC-MS/MS evidence (pre-computed) ---
     if lcms_evidence is not None:
         for feat in LCMS_PRIOR_FEATURES:
             df[feat] = df.index.map(
                 lambda idx: lcms_evidence.get(idx, {}).get(feat, 0.0)
             )
-        # Fill NaN for rt_residual and isotope_cosine with median (fair fill)
         for feat in ["lcms_rt_residual", "lcms_ms1_isotope_cosine"]:
             valid = df[feat].dropna()
             fill = valid.median() if len(valid) > 0 else 0.0
@@ -178,25 +269,41 @@ def compute_all_features(
         for feat in LCMS_PRIOR_FEATURES:
             df[feat] = 0.0
 
-    # Theoretical isotope
+    # --- Theoretical isotope (adds monoisotopic_confidence, A8) ---
     df = compute_theoretical_isotope_features(
         df,
         maldi_envelopes=maldi_envelopes,
         lcms_envelopes=lcms_envelopes,
     )
 
-    # MALDI ionization
+    # --- MALDI ionization ---
     df = compute_maldi_ionization_features(df)
 
-    # Spatial (optional)
+    # --- A3: LOWESS ppm calibration (optional) ---
+    if pixel_coords is not None:
+        df = compute_calibrated_ppm_features(df, maldi_mzs=maldi_mzs, pixel_coords=pixel_coords)
+
+    # --- B: IM2Deep CCS features (optional) ---
+    if observed_ccs_per_feature is not None:
+        df = compute_im2deep_features(
+            df,
+            observed_ccs_per_feature=observed_ccs_per_feature,
+            calibration_slope=im2deep_calibration_slope,
+            calibration_intercept=im2deep_calibration_intercept,
+        )
+
+    # --- Spatial (optional) ---
     if spatial_features is not None:
         df = compute_spatial_features(df, spatial_features)
 
-    # Co-localization (optional)
+    # --- Ion-image-based features (optional) ---
     if ion_images is not None and ion_image_mzs is not None:
         df = compute_colocalization_features(df, ion_images, ion_image_mzs)
+        df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs)  # E1
+        df = compute_adduct_colocalization(df, ion_images, ion_image_mzs)        # E2
+        df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs) # E5/E6
 
-    # Envelope similarity MALDI vs LC-MS/MS (optional)
+    # --- Envelope similarity MALDI vs LC-MS/MS (optional) ---
     if maldi_envelopes is not None and lcms_envelopes is not None:
         df = compute_envelope_similarity(df, maldi_envelopes, lcms_envelopes)
 

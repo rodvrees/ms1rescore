@@ -21,6 +21,8 @@ dependencies = [
 [project.optional-dependencies]
 maldi = ["imzy"]
 catboost = ["catboost>=1.2"]
+calibration = ["statsmodels>=0.14"]
+mobility = ["im2deep>=0.1"]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -14,18 +14,28 @@ logger = logging.getLogger(__name__)
 
 def _shuffle_protein(seq: str, random_state: int = 42) -> str:
     """
-    Shuffle all residues of a protein sequence randomly.
+    Shuffle non-K/R residues of a protein sequence randomly while keeping
+    K and R at their original positions.
 
-    Unlike K/R-preserving reversal, this produces decoy peptides with
-    different elemental compositions from target peptides of the same mass,
-    making isotope envelope features (theo_isotope_cosine, etc.) genuinely
-    discriminative. K/R-preserving reversal frequently produces isobaric
-    decoys with identical isotope envelopes.
+    Keeping K/R in place ensures the decoy protein is digested at the same
+    tryptic cleavage sites as the target, preserving peptide length and charge
+    distributions. Shuffling (rather than reversing) the non-K/R residues
+    gives decoy peptides different amino acid compositions from targets of the
+    same mass/length, making isotope envelope features (theo_isotope_cosine,
+    theo_isotope_chi2, theo_isotope_kl) genuinely discriminative. K/R-fixed
+    reversal creates isobaric peptides with near-identical isotope patterns.
     """
+    kr_positions = {i for i in range(len(seq)) if seq[i] in "KR"}
+    non_kr = [seq[i] for i in range(len(seq)) if seq[i] not in "KR"]
     rng = random.Random(random_state)
-    residues = list(seq)
-    rng.shuffle(residues)
-    return "".join(residues)
+    rng.shuffle(non_kr)
+    result = list(seq)
+    j = 0
+    for i in range(len(result)):
+        if i not in kr_positions:
+            result[i] = non_kr[j]
+            j += 1
+    return "".join(result)
 
 
 def digest_fasta(
@@ -193,6 +203,10 @@ def match_to_maldi_features(
 
     # Candidates per feature
     result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")
+
+    # A10 — Kendrick mass defect (CH₂ reference unit: 14 / 14.01565)
+    kendrick_mass = result["feature_mz"] * (14.0 / 14.01565)
+    result["kendrick_mass_defect"] = np.floor(kendrick_mass) - kendrick_mass
 
     logger.info(
         f"Matched {result['feature_mz'].nunique()}/{len(maldi_mzs)} features → "
