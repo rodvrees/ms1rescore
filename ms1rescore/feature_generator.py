@@ -98,17 +98,29 @@ MALDI_INTRINSIC_FEATURES = [
     "isotope_n_matched",
 ]
 
-# LC-MS/MS prior features: computed from raw mzML. These are NOT passed to the
-# ranker/SVM — doing so would cause the model to score LC-MS/MS identification
-# quality rather than MALDI match quality. They are applied as a multiplicative
-# Bayesian prior after MALDI-intrinsic scoring (see pipeline.compute_lcms_prior).
-LCMS_PRIOR_FEATURES = [
+# LC-MS/MS prior features: NOT passed to the ranker/SVM — doing so would cause
+# the model to score LC-MS/MS identification quality rather than MALDI match
+# quality. Applied as a multiplicative Bayesian prior after MALDI-intrinsic
+# scoring (see pipeline.compute_lcms_prior).
+#
+# Split into two sub-groups so compute_all_features can handle them differently:
+#   _LCMS_MZML_FEATURES  — derived from raw mzML (always populated by lcms_evidence)
+#   _LCMS_ID_FEATURES    — derived from LC-MS/MS IDs (Strategy C, via lcms_ids.py)
+
+_LCMS_MZML_FEATURES = [
     "lcms_ms2_spectral_angle", "lcms_ms2_n_matches",
     "lcms_xic_max_intensity", "lcms_xic_n_scans", "lcms_xic_snr",
     "lcms_xic_best_charge", "lcms_rt_residual",
     "lcms_ms1_isotope_cosine",
     "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
 ]
+
+_LCMS_ID_FEATURES = [
+    "lcms_q_value", "lcms_pep", "lcms_score",
+    "n_psms", "lcms_intensity", "source_lcms_confirmed",
+]
+
+LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_ID_FEATURES
 
 # ---------------------------------------------------------------------------
 # Optional-feature membership sets (used by get_feature_names)
@@ -255,9 +267,9 @@ def compute_all_features(
     df = compute_mass_defect_features(df)               # A11
     df = compute_chca_cluster_features(df)              # A12
 
-    # --- LC-MS/MS evidence (pre-computed) ---
+    # --- LC-MS/MS mzML evidence (pre-computed per candidate) ---
     if lcms_evidence is not None:
-        for feat in LCMS_PRIOR_FEATURES:
+        for feat in _LCMS_MZML_FEATURES:
             df[feat] = df.index.map(
                 lambda idx: lcms_evidence.get(idx, {}).get(feat, 0.0)
             )
@@ -266,8 +278,23 @@ def compute_all_features(
             fill = valid.median() if len(valid) > 0 else 0.0
             df[feat] = df[feat].fillna(fill)
     else:
-        for feat in LCMS_PRIOR_FEATURES:
+        for feat in _LCMS_MZML_FEATURES:
             df[feat] = 0.0
+
+    # --- LC-MS/MS ID features (Strategy C) ---
+    # These are pre-populated by digest_identified_proteins(); default to 0.0
+    # if using the full-FASTA Strategy A path (no lcms_ids).
+    for feat in _LCMS_ID_FEATURES:
+        if feat == "source_lcms_confirmed":
+            continue  # computed from source column below
+        if feat not in df.columns:
+            df[feat] = 0.0
+
+    # source_lcms_confirmed: 1.0 for Strategy C confirmed peptides, 0.0 otherwise
+    if "source" in df.columns:
+        df["source_lcms_confirmed"] = (df["source"] == "lcms_confirmed").astype(float)
+    else:
+        df["source_lcms_confirmed"] = 0.0
 
     # --- Theoretical isotope (adds monoisotopic_confidence, A8) ---
     df = compute_theoretical_isotope_features(

@@ -213,3 +213,237 @@ def match_to_maldi_features(
         f"{(~result['is_decoy']).sum()} target + {result['is_decoy'].sum()} decoy candidates"
     )
     return result
+
+
+def digest_identified_proteins(
+    fasta_path: str,
+    lcms_ids,
+    enzyme: str = "trypsin",
+    missed_cleavages: int = 2,
+    min_length: int = 7,
+    max_length: int = 30,
+) -> pd.DataFrame:
+    """
+    Strategy C hybrid candidate generation.
+
+    Builds a candidate DataFrame from:
+    1. In-silico digest of LC-MS/MS-identified proteins (target + K/R-preserving
+       shuffled decoy, via ``_shuffle_protein``).
+    2. Directly identified LC-MS/MS peptides (``source="lcms_confirmed"``), even
+       if also present in the protein digest.
+
+    A peptide present in both the protein digest and ``lcms_ids.peptides`` is
+    labelled ``"lcms_confirmed"``. Novel directly-identified peptides (not
+    reachable by digesting the identified proteins) are added as targets with
+    K/R-preserving peptide-level decoys.
+
+    LC-MS/MS evidence columns are joined onto target rows and set to NaN for
+    all decoy rows: ``lcms_q_value``, ``lcms_pep``, ``lcms_score``,
+    ``n_psms``, ``lcms_charge``, ``lcms_rt_mean``, ``lcms_intensity``.
+
+    Parameters
+    ----------
+    fasta_path
+        Path to the protein FASTA file.
+    lcms_ids
+        ``LCMSIds`` namedtuple returned by ``parse_lcms_ids()``.
+    enzyme
+        Enzyme name recognised by ``pyteomics.parser.expasy_rules``.
+    missed_cleavages
+        Maximum allowed missed cleavages.
+    min_length, max_length
+        Peptide length range (inclusive).
+
+    Returns
+    -------
+    DataFrame with the same columns as ``digest_fasta()`` plus
+    ``source``, ``lcms_q_value``, ``lcms_pep``, ``lcms_score``,
+    ``n_psms``, ``lcms_charge``, ``lcms_rt_mean``, ``lcms_intensity``.
+    Returns an empty DataFrame (with those columns) if no identified
+    proteins are found in the FASTA.
+    """
+    from ms1rescore.lcms_ids import filter_fasta_to_proteins
+
+    _EV_COLS = {
+        "q_value": "lcms_q_value",
+        "pep": "lcms_pep",
+        "score": "lcms_score",
+        "n_psms": "n_psms",
+        "charge": "lcms_charge",
+        "rt_mean": "lcms_rt_mean",
+        "lcms_intensity": "lcms_intensity",
+    }
+    _EMPTY_COLS = [
+        "peptide", "protein", "is_decoy", "mass", "mh_mz",
+        "n_C", "n_H", "n_N", "n_O", "n_S", "source",
+    ] + list(_EV_COLS.values())
+
+    # --- Step 1: Filter FASTA to identified proteins ---
+    protein_seqs = filter_fasta_to_proteins(fasta_path, lcms_ids.proteins)
+
+    if not protein_seqs:
+        logger.warning(
+            "No identified proteins found in FASTA — check accession format. "
+            "Returning empty DataFrame."
+        )
+        return pd.DataFrame(columns=_EMPTY_COLS)
+
+    # --- Step 2: Digest identified proteins (target + shuffled decoy) ---
+    rows = []  # (peptide, protein, is_decoy)
+    for acc, seq in protein_seqs.items():
+        cleaved = parser.cleave(
+            seq,
+            parser.expasy_rules.get(enzyme, enzyme),
+            missed_cleavages=missed_cleavages,
+        )
+        for pep in cleaved:
+            if min_length <= len(pep) <= max_length:
+                rows.append((pep, acc, False))
+
+        decoy_seq = _shuffle_protein(seq)
+        cleaved_d = parser.cleave(
+            decoy_seq,
+            parser.expasy_rules.get(enzyme, enzyme),
+            missed_cleavages=missed_cleavages,
+        )
+        for pep in cleaved_d:
+            if min_length <= len(pep) <= max_length:
+                rows.append((pep, f"DECOY_{acc}", True))
+
+    df = pd.DataFrame(rows, columns=["peptide", "protein", "is_decoy"])
+    df = df.drop_duplicates(subset=["peptide", "is_decoy"])
+
+    # --- Step 3: Compute masses (Rust if available, else pyteomics) ---
+    sequences = df["peptide"].tolist()
+    try:
+        from ms1rescore_rs import compute_peptide_masses
+
+        masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(sequences)
+        df["mass"] = masses
+        df["mh_mz"] = mh_mzs
+        df["n_C"] = n_cs
+        df["n_H"] = n_hs
+        df["n_N"] = n_ns
+        df["n_O"] = n_os
+        df["n_S"] = n_ss
+        logger.info("  (used Rust backend for mass computation)")
+    except ImportError:
+        logger.info("  (using pyteomics for mass computation)")
+        masses_list = []
+        for seq in sequences:
+            try:
+                comp = mass.Composition(sequence=seq)
+                pep_mass = mass.calculate_mass(composition=comp)
+                masses_list.append({
+                    "mass": pep_mass, "mh_mz": pep_mass + PROTON,
+                    "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
+                    "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
+                    "n_S": comp.get("S", 0),
+                })
+            except Exception:
+                masses_list.append({
+                    "mass": 0, "mh_mz": 0, "n_C": 0, "n_H": 0,
+                    "n_N": 0, "n_O": 0, "n_S": 0,
+                })
+        mass_df = pd.DataFrame(masses_list)
+        for col in mass_df.columns:
+            df[col] = mass_df[col].values
+
+    df = df[df["mass"] > 0].reset_index(drop=True)
+
+    # --- Step 4: Label source ---
+    df["source"] = np.where(df["is_decoy"], "decoy", "protein_digest")
+
+    # --- Step 5: Union with directly identified peptides ---
+    lcms_pep_df = lcms_ids.peptides
+    if len(lcms_pep_df) > 0:
+        confirmed_seqs = set(lcms_pep_df["sequence"].values)
+
+        # Mark digest targets that are LC-MS/MS confirmed
+        target_mask = ~df["is_decoy"]
+        df.loc[target_mask & df["peptide"].isin(confirmed_seqs), "source"] = "lcms_confirmed"
+
+        # Find novel confirmed peptides not reachable from the protein digest
+        existing_targets = set(df.loc[target_mask, "peptide"].values)
+        novel_seqs = [s for s in confirmed_seqs if s not in existing_targets]
+
+        if novel_seqs:
+            logger.info(
+                f"  {len(novel_seqs)} LC-MS/MS-confirmed peptides not in protein digest "
+                f"— adding as lcms_confirmed targets"
+            )
+            novel_rows = []
+            for seq in novel_seqs:
+                prot_row = lcms_pep_df[lcms_pep_df["sequence"] == seq].iloc[0]
+                prot = str(prot_row.get("protein", ""))
+                novel_rows.append((seq, prot, False))
+                # K/R-preserving peptide-level decoy
+                dec = _shuffle_protein(seq, random_state=42)
+                if dec != seq:
+                    novel_rows.append((dec, f"DECOY_{prot}", True))
+
+            novel_df = pd.DataFrame(novel_rows, columns=["peptide", "protein", "is_decoy"])
+            novel_df = novel_df.drop_duplicates(subset=["peptide", "is_decoy"])
+
+            # Compute masses for novel sequences
+            novel_seqs_list = novel_df["peptide"].tolist()
+            try:
+                from ms1rescore_rs import compute_peptide_masses
+
+                masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(novel_seqs_list)
+                novel_df["mass"] = masses
+                novel_df["mh_mz"] = mh_mzs
+                novel_df["n_C"] = n_cs
+                novel_df["n_H"] = n_hs
+                novel_df["n_N"] = n_ns
+                novel_df["n_O"] = n_os
+                novel_df["n_S"] = n_ss
+            except ImportError:
+                novel_masses = []
+                for seq in novel_seqs_list:
+                    try:
+                        comp = mass.Composition(sequence=seq)
+                        pm = mass.calculate_mass(composition=comp)
+                        novel_masses.append({
+                            "mass": pm, "mh_mz": pm + PROTON,
+                            "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
+                            "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
+                            "n_S": comp.get("S", 0),
+                        })
+                    except Exception:
+                        novel_masses.append({
+                            "mass": 0, "mh_mz": 0, "n_C": 0, "n_H": 0,
+                            "n_N": 0, "n_O": 0, "n_S": 0,
+                        })
+                novel_mass_df = pd.DataFrame(novel_masses)
+                for col in novel_mass_df.columns:
+                    novel_df[col] = novel_mass_df[col].values
+
+            novel_df = novel_df[novel_df["mass"] > 0].reset_index(drop=True)
+            novel_df.loc[~novel_df["is_decoy"], "source"] = "lcms_confirmed"
+            novel_df.loc[novel_df["is_decoy"], "source"] = "decoy"
+            df = pd.concat([df, novel_df], ignore_index=True)
+
+    # --- Step 6: Join LC-MS/MS evidence columns ---
+    for new_col in _EV_COLS.values():
+        df[new_col] = np.nan
+
+    if len(lcms_pep_df) > 0:
+        ev = lcms_pep_df.drop_duplicates(subset="sequence").set_index("sequence")
+        for old_col, new_col in _EV_COLS.items():
+            if old_col in ev.columns:
+                df[new_col] = df["peptide"].map(ev[old_col])
+
+    # --- Step 7: Wipe evidence for decoys (symmetric TDC requirement) ---
+    decoy_mask = df["is_decoy"].values
+    for new_col in _EV_COLS.values():
+        df.loc[decoy_mask, new_col] = np.nan
+
+    n_confirmed = (df["source"] == "lcms_confirmed").sum()
+    n_digest = (df["source"] == "protein_digest").sum()
+    n_decoy = (df["source"] == "decoy").sum()
+    logger.info(
+        f"Strategy C candidates: {n_confirmed} lcms_confirmed + "
+        f"{n_digest} protein_digest + {n_decoy} decoy"
+    )
+    return df
