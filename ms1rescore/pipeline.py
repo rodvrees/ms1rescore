@@ -82,10 +82,20 @@ def compute_lcms_prior(
 
 def _rescore_svm(
     psm_list,
+    features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
     train_fdr: float,
 ):
-    """Run mokapot PercolatorModel on MALDI-intrinsic features."""
+    """Run mokapot PercolatorModel on MALDI-intrinsic features.
+
+    Returns
+    -------
+    (conf_obj, all_scores)
+        ``conf_obj`` is the mokapot LinearConfidence object (for peptide/protein
+        level results). ``all_scores`` is a numpy array of SVM decision scores
+        for ALL candidates (targets + decoys) in ``features_df`` row order,
+        or ``None`` if score extraction fails.
+    """
     from mokapot import brew
     from mokapot.model import PercolatorModel
     from ms2rescore.rescoring_engines.mokapot import convert_psm_list
@@ -94,7 +104,20 @@ def _rescore_svm(
     model = PercolatorModel(train_fdr=train_fdr, max_iter=10)
     result = brew(lin, model=model)
     conf_obj = result[0] if isinstance(result, tuple) else result
-    return conf_obj
+
+    # Score ALL candidates (targets + decoys) for TDC reweighting.
+    # PercolatorModel trains a LinearSVC; access the fitted estimator directly.
+    present = [f for f in intrinsic_feature_names if f in features_df.columns]
+    X_all = features_df[present].fillna(0.0).values.astype(float)
+    all_scores = None
+    try:
+        all_scores = model.estimator_.decision_function(X_all)
+    except AttributeError:
+        logger.warning(
+            "Could not extract SVM scores via model.estimator_. "
+            "LC-MS/MS prior reweighting will be skipped."
+        )
+    return conf_obj, all_scores
 
 
 def _rescore_catboost(
@@ -134,8 +157,14 @@ def _rescore_catboost(
     # Initial positive seed: stringent mass accuracy + isotope filter
     seed_mask = (
         is_target
-        & (df.get("ppm_error_abs", pd.Series(np.inf, index=df.index)) < init_ppm_threshold)
-        & (df.get("theo_isotope_cosine", pd.Series(0.0, index=df.index)) > init_isotope_threshold)
+        & (
+            df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+            < init_ppm_threshold
+        )
+        & (
+            df.get("theo_isotope_cosine", pd.Series(0.0, index=df.index))
+            > init_isotope_threshold
+        )
     ).values
 
     n_seed = seed_mask.sum()
@@ -313,10 +342,13 @@ def rescore(
 
     Returns
     -------
-    tuple of (psm_list, result, feature_names)
-        result is a confidence estimates dict (SVM) or a DataFrame with
-        columns [peptide, feature_idx, score, reweighted_score, q_value,
-        reweighted_q_value] (CatBoost).
+    tuple of (psm_list, result_df, feature_names)
+        ``result_df`` is a DataFrame with columns ``[peptide, feature_idx,
+        is_decoy, svm_score/catboost_score, q_value, reweighted_score,
+        reweighted_q_value]`` for both backends. ``q_value`` and
+        ``reweighted_q_value`` are TDC q-values computed over all candidates
+        (targets + decoys). The reweighted values incorporate the LC-MS/MS
+        prior multiplicative weight.
     """
     if cache_dir:
         os.makedirs(cache_dir, exist_ok=True)
@@ -328,7 +360,9 @@ def rescore(
     if lcms_peptides_path is not None:
         from ms1rescore.lcms_ids import parse_lcms_ids
 
-        logger.info("Step 1: Strategy C — parsing LC-MS/MS IDs and digesting identified proteins...")
+        logger.info(
+            "Step 1: Strategy C — parsing LC-MS/MS IDs and digesting identified proteins..."
+        )
         lcms_ids = parse_lcms_ids(
             proteins_path=lcms_proteins_path,
             peptides_path=lcms_peptides_path,
@@ -366,12 +400,14 @@ def rescore(
         )
     maldi_intensities = None
     if ion_images is not None:
-        maldi_intensities = np.array([
-            img[img > 0].mean() if (img > 0).any() else 0.0
-            for img in ion_images
-        ])
+        maldi_intensities = np.array(
+            [img[img > 0].mean() if (img > 0).any() else 0.0 for img in ion_images]
+        )
     candidates = match_to_maldi_features(
-        maldi_mzs, peptide_db, ppm_tolerance, maldi_intensities=maldi_intensities,
+        maldi_mzs,
+        peptide_db,
+        ppm_tolerance,
+        maldi_intensities=maldi_intensities,
     )
     if len(candidates) == 0:
         raise ValueError("No candidates matched any MALDI features")
@@ -391,11 +427,13 @@ def rescore(
     from ms1rescore.lcms_evidence import _find_matching_ms2_scans
     from ms1rescore.utils import mz_to_mass
 
+    # For each unique MALDI feature m/z, find matching MS2 scans within ppm tolerance.
     feature_ms2_charges = {}
     for mz in candidates["feature_mz"].unique():
         neutral_mass = mz_to_mass(mz, charge=1)
         scan_idxs = _find_matching_ms2_scans(neutral_mass, lcms_data, ppm_tolerance)
         if scan_idxs:
+            # Store the set of observed precursor charges for this feature's MS2 matches
             feature_ms2_charges[mz] = set(
                 int(lcms_data.ms2_precursor_charge[i]) for i in scan_idxs
             )
@@ -404,12 +442,15 @@ def rescore(
     )
 
     peptide_charge_pairs = set()
+    # For each feature with MS2 matches, get the candidate peptides and observed charges to run MS2PIP on.
     for mz, charges in feature_ms2_charges.items():
         peps = candidates[candidates["feature_mz"] == mz]["peptide"].unique()
         for pep in peps:
             for c in charges:
                 peptide_charge_pairs.add((pep, c))
-    logger.info(f"  {len(peptide_charge_pairs)} unique (peptide, charge) pairs for MS2PIP")
+    logger.info(
+        f"  {len(peptide_charge_pairs)} unique (peptide, charge) pairs for MS2PIP"
+    )
 
     ms2pip_cache = get_ms2pip_predictions(
         list(peptide_charge_pairs),
@@ -421,6 +462,7 @@ def rescore(
     logger.info("Step 4: Computing DeepLC predictions...")
     unique_peptides = candidates["peptide"].unique().tolist()
     deeplc_model = None
+    # If a PD .msf file is provided, finetune DeepLC on the identified peptides from that file. Otherwise, use the pretrained model.
     if msf_path:
         deeplc_model = finetune_deeplc(msf_path, cache_path=_cache("deeplc_model.pt"))
     deeplc_cache = get_deeplc_predictions(
@@ -454,7 +496,9 @@ def rescore(
                 best_xic_idx = np.argmax(ints)
                 best_rt = rts[best_xic_idx]
                 best_ms1_idx = np.argmin(np.abs(lcms_data.ms1_rts - best_rt))
-                env = _extract_ms1_envelope(mz, best_ms1_idx, lcms_data, charge=1, n_peaks=3)
+                env = _extract_ms1_envelope(
+                    mz, best_ms1_idx, lcms_data, charge=1, n_peaks=3
+                )
                 if env.sum() > 0:
                     lcms_envelopes_xic[mz] = env
 
@@ -480,16 +524,16 @@ def rescore(
     intrinsic_present = [
         f for f in MALDI_INTRINSIC_FEATURES if f in features_df.columns
     ]
-    lcms_present = [
-        f for f in LCMS_PRIOR_FEATURES if f in features_df.columns
-    ]
+    lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
 
     # --- Step 8: Build PSMList ---
     logger.info("Step 8: Building PSMList...")
     psm_list = candidates_to_psm_list(features_df)
     populate_psm_features(psm_list, features_df, feature_names)
 
-    logger.info(f"  {len(feature_names)} features ({len(intrinsic_present)} intrinsic, {len(lcms_present)} LC-MS/MS prior)")
+    logger.info(
+        f"  {len(feature_names)} features ({len(intrinsic_present)} intrinsic, {len(lcms_present)} LC-MS/MS prior)"
+    )
 
     # --- Step 9: Rescoring ---
     logger.info(f"Step 9: Running rescoring (model='{model}')...")
@@ -497,23 +541,61 @@ def rescore(
     if model == "svm":
         # Pass only intrinsic features to the SVM
         populate_psm_features(psm_list, features_df, intrinsic_present)
-        conf_obj = _rescore_svm(psm_list, intrinsic_present, train_fdr)
-        conf = conf_obj.confidence_estimates
-        psm_conf = conf["psms"]
+        conf_obj, all_scores = _rescore_svm(
+            psm_list, features_df, intrinsic_present, train_fdr
+        )
 
-        # LC-MS/MS prior reweight
+        is_decoy = features_df["is_decoy"].values.astype(bool)
         lcms_prior = compute_lcms_prior(features_df, lcms_present)
-        if "mokapot score" in psm_conf.columns:
-            psm_conf = psm_conf.copy()
-            psm_conf["reweighted_score"] = psm_conf["mokapot score"] * lcms_prior[
-                psm_conf.index if "index" not in psm_conf.columns else psm_conf["index"]
-            ]
+
+        if all_scores is not None:
+            q_values = _tdc_qvalues(all_scores, is_decoy)
+            reweighted_scores = all_scores * lcms_prior
+            reweighted_q = _tdc_qvalues(reweighted_scores, is_decoy)
+        else:
+            # Fallback: fill from mokapot's target-only q-values; reweighting skipped
+            logger.warning(
+                "SVM score extraction failed — reweighted_q_value will equal q_value."
+            )
+            q_values = np.ones(len(features_df))
+            reweighted_scores = np.zeros(len(features_df))
+            reweighted_q = np.ones(len(features_df))
+            conf = conf_obj.confidence_estimates
+            psm_conf = conf["psms"]
+            score_col = next(
+                (c for c in psm_conf.columns if "score" in c.lower()), None
+            )
+            qval_col = next(
+                (c for c in psm_conf.columns if "q-value" in c.lower()), None
+            )
+            if score_col and qval_col:
+                q_values[~is_decoy] = psm_conf[qval_col].values[: (~is_decoy).sum()]
+
+        result_df = pd.DataFrame(
+            {
+                "peptide": features_df["peptide"].values,
+                "feature_idx": features_df.get(
+                    "feature_idx", pd.Series(range(len(features_df)))
+                ).values,
+                "is_decoy": is_decoy,
+                "svm_score": all_scores if all_scores is not None else np.zeros(len(features_df)),
+                "q_value": q_values,
+                "reweighted_score": reweighted_scores,
+                "reweighted_q_value": reweighted_q,
+            }
+        )
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = (psm_conf["mokapot q-value"] <= fdr_threshold).sum()
-            logger.info(f"  At {fdr_threshold*100:.0f}% FDR: {n} target features")
+            n = ((result_df["q_value"] <= fdr_threshold) & ~is_decoy).sum()
+            n_rw = (
+                (result_df["reweighted_q_value"] <= fdr_threshold) & ~is_decoy
+            ).sum()
+            logger.info(
+                f"  At {fdr_threshold*100:.0f}% FDR: {n} targets (base), "
+                f"{n_rw} targets (reweighted)"
+            )
 
-        return psm_list, conf, feature_names
+        return psm_list, result_df, feature_names
 
     elif model == "catboost":
         scores = _rescore_catboost(
@@ -532,19 +614,25 @@ def rescore(
         reweighted_scores = scores * lcms_prior
         reweighted_q = _tdc_qvalues(reweighted_scores, is_decoy)
 
-        result_df = pd.DataFrame({
-            "peptide": features_df["peptide"].values,
-            "feature_idx": features_df.get("feature_idx", pd.Series(range(len(features_df)))).values,
-            "is_decoy": is_decoy,
-            "catboost_score": scores,
-            "q_value": q_values,
-            "reweighted_score": reweighted_scores,
-            "reweighted_q_value": reweighted_q,
-        })
+        result_df = pd.DataFrame(
+            {
+                "peptide": features_df["peptide"].values,
+                "feature_idx": features_df.get(
+                    "feature_idx", pd.Series(range(len(features_df)))
+                ).values,
+                "is_decoy": is_decoy,
+                "catboost_score": scores,
+                "q_value": q_values,
+                "reweighted_score": reweighted_scores,
+                "reweighted_q_value": reweighted_q,
+            }
+        )
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
             n = ((result_df["q_value"] <= fdr_threshold) & ~is_decoy).sum()
-            n_rw = ((result_df["reweighted_q_value"] <= fdr_threshold) & ~is_decoy).sum()
+            n_rw = (
+                (result_df["reweighted_q_value"] <= fdr_threshold) & ~is_decoy
+            ).sum()
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} targets (base), "
                 f"{n_rw} targets (reweighted)"
