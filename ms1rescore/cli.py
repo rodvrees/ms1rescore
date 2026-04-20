@@ -379,7 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose",
         "-v",
         action="store_true",
-        help="Enable INFO-level logging (default: WARNING).",
+        help="Enable DEBUG-level logging (default: INFO).",
     )
 
     return parser
@@ -395,7 +395,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
+        level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stderr,
@@ -403,6 +403,16 @@ def main() -> None:
 
     # --- Load MALDI data ---
     maldi_mzs, ion_images, ion_image_mzs = _load_maldi(args.maldi_npz, args.maldi_mzs)
+    if args.verbose:
+        logger.debug(
+            f"Outputting maldi_mz, ion_images and ion_image_mzs for debugging:"
+        )
+        # Write to disk to check the loaded data (in case of issues with the NPZ loading)
+        np.savetxt("debug_maldi_mzs.txt", maldi_mzs)
+        if ion_images is not None:
+            np.save("debug_ion_images.npy", ion_images)
+        if ion_image_mzs is not None:
+            np.savetxt("debug_ion_image_mzs.txt", ion_image_mzs)
 
     # --- Optional spatial features ---
     spatial_features = None
@@ -435,6 +445,9 @@ def main() -> None:
             peptide_fdr=args.peptide_fdr,
             format=lcms_id_format,
         )
+        if args.verbose:
+            logger.debug("Writing parsed LC-MS/MS IDs to debug_lcms_ids.tsv")
+            lcms_ids.peptides.to_csv("debug_lcms_ids.tsv", sep="\t", index=False)
         min_length, max_length, missed_cleavages = _infer_digest_params(
             lcms_ids,
             missed_cleavages_override=args.missed_cleavages,
@@ -447,16 +460,17 @@ def main() -> None:
         missed_cleavages = (
             args.missed_cleavages if args.missed_cleavages is not None else 2
         )
-        logger.info(
-            f"Strategy A (full FASTA): min_length={min_length}, "
-            f"max_length={max_length}, missed_cleavages={missed_cleavages}"
-        )
+
+    logger.info(
+        f"Parameters extracted: min_length={min_length}, "
+        f"max_length={max_length}, missed_cleavages={missed_cleavages}"
+    )
 
     # --- Run pipeline ---
     from ms1rescore.pipeline import rescore
 
     logger.info("Starting ms1rescore pipeline...")
-    _, result, _ = rescore(
+    psm_list, result_df, feature_names = rescore(
         fasta_path=args.fasta,
         maldi_mzs=maldi_mzs,
         mzml_paths=args.mzml,
@@ -479,11 +493,13 @@ def main() -> None:
         lcms_id_format=lcms_id_format,
         protein_fdr=args.protein_fdr,
         peptide_fdr=args.peptide_fdr,
+        verbose=args.verbose,
+        output_dir=args.output_dir,
     )
 
     # --- Write results ---
     logger.info(f"Writing results to {os.path.abspath(args.output_dir)}")
-    _write_results(result, args.output_dir)
+    _write_results(result_df, args.output_dir)
     logger.info("Done.")
 
 
