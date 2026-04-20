@@ -316,9 +316,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     strat_c.add_argument(
         "--lcms-id-format",
-        choices=("percolator", "mzidentml", "psm_utils"),
+        choices=("percolator", "mzidentml", "psm_utils", "msf"),
         default="percolator",
-        help="Format of the LC-MS/MS identification files.",
+        help=(
+            "Format of the LC-MS/MS identification files. "
+            "Use 'msf' to read directly from a ProteomeDiscoverer .msf file "
+            "(the same file passed to --msf can be reused)."
+        ),
     )
     strat_c.add_argument(
         "--protein-fdr",
@@ -406,18 +410,30 @@ def main() -> None:
         logger.info(f"Loading spatial features from {args.spatial_features}")
         spatial_features = pd.read_csv(args.spatial_features, sep="\t")
 
+    # --- Resolve Strategy C source ---
+    # If --lcms-peptides is not given but --msf is, use the MSF for Strategy C.
+    lcms_peptides_path = args.lcms_peptides
+    lcms_id_format = args.lcms_id_format
+    if lcms_peptides_path is None and args.msf is not None:
+        lcms_peptides_path = args.msf
+        lcms_id_format = "msf"
+        logger.info(
+            f"No --lcms-peptides provided; using --msf ({args.msf}) "
+            f"as Strategy C ID source (format='msf')."
+        )
+
     # --- Resolve digest parameters ---
-    if args.lcms_peptides:
+    if lcms_peptides_path:
         from ms1rescore.lcms_ids import parse_lcms_ids
 
         logger.info("Parsing LC-MS/MS identifications for Strategy C...")
         lcms_ids = parse_lcms_ids(
             proteins_path=args.lcms_proteins,
-            peptides_path=args.lcms_peptides,
+            peptides_path=lcms_peptides_path,
             psms_path=args.lcms_psms,
             protein_fdr=args.protein_fdr,
             peptide_fdr=args.peptide_fdr,
-            format=args.lcms_id_format,
+            format=lcms_id_format,
         )
         min_length, max_length, missed_cleavages = _infer_digest_params(
             lcms_ids,
@@ -458,9 +474,9 @@ def main() -> None:
         init_ppm_threshold=args.init_ppm_threshold,
         init_isotope_threshold=args.init_isotope_threshold,
         lcms_proteins_path=args.lcms_proteins,
-        lcms_peptides_path=args.lcms_peptides,
+        lcms_peptides_path=lcms_peptides_path,
         lcms_psms_path=args.lcms_psms,
-        lcms_id_format=args.lcms_id_format,
+        lcms_id_format=lcms_id_format,
         protein_fdr=args.protein_fdr,
         peptide_fdr=args.peptide_fdr,
     )

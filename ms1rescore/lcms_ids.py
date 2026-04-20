@@ -106,16 +106,20 @@ def parse_lcms_ids(
         mzIdentML, etc.). May be None — proteins will be derived from the
         peptide table in that case.
     peptides_path
-        Path to peptide-level results.
+        Path to peptide-level results. For ``format="msf"``, pass the
+        ``.msf`` file path here (or via the dedicated ``msf_path`` argument
+        in :func:`rescore`).
     psms_path
         Optional PSM-level file (Percolator ``_psms.tsv``) used to compute
         ``rt_mean``, ``lcms_intensity``, and ``charge`` via aggregation.
+        Ignored for ``"msf"`` and ``"mzidentml"`` formats.
     protein_fdr
         Protein FDR threshold (default 0.01).
     peptide_fdr
         Peptide FDR threshold (default 0.01).
     format
-        Input format: ``"percolator"``, ``"mzidentml"``, or ``"psm_utils"``.
+        Input format: ``"percolator"``, ``"mzidentml"``, ``"psm_utils"``, or
+        ``"msf"`` (ProteomeDiscoverer ``.msf`` SQLite database).
 
     Returns
     -------
@@ -133,9 +137,12 @@ def parse_lcms_ids(
         )
     elif format == "psm_utils":
         return _parse_psm_utils(peptides_path, protein_fdr, peptide_fdr)
+    elif format == "msf":
+        return _parse_msf(peptides_path, protein_fdr, peptide_fdr)
     else:
         raise ValueError(
-            f"Unknown format {format!r}. Choose 'percolator', 'mzidentml', or 'psm_utils'."
+            f"Unknown format {format!r}. "
+            f"Choose 'percolator', 'mzidentml', 'psm_utils', or 'msf'."
         )
 
 
@@ -436,6 +443,95 @@ def _parse_psm_utils(path: str, protein_fdr: float, peptide_fdr: float) -> LCMSI
         f"  psm_utils: {len(proteins_set)} proteins, {len(pep_df)} peptides at FDR thresholds"
     )
     return LCMSIds(proteins=proteins_set, peptides=pep_df[_PEP_COLS].reset_index(drop=True))
+
+
+# ---------------------------------------------------------------------------
+# ProteomeDiscoverer .msf parser
+# ---------------------------------------------------------------------------
+
+def _parse_msf(msf_path: str, protein_fdr: float, peptide_fdr: float) -> LCMSIds:
+    """
+    Parse peptide identifications from a ProteomeDiscoverer ``.msf`` SQLite database.
+
+    Queries ``TargetPsms`` (filtered by ``PercolatorqValue <= peptide_fdr``) joined
+    with ``TargetProteins`` for accessions, then aggregates to peptide level.
+    The protein set is derived from peptides passing the FDR threshold; PD does not
+    store a separate protein-level q-value in the ``.msf`` format.
+    ``protein_fdr`` is accepted for API consistency but is not applied separately.
+    """
+    import sqlite3
+
+    if msf_path is None:
+        raise ValueError("msf_path must be provided for format='msf'")
+
+    conn = sqlite3.connect(msf_path)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                tp.Sequence              AS sequence,
+                tp.PercolatorqValue      AS q_value,
+                tp.PercolatorSVMScore    AS score,
+                CAST(tp.Charge AS INTEGER) AS charge,
+                tp.RetentionTime         AS rt,
+                tprot.Accession          AS protein
+            FROM TargetPsms tp
+            LEFT JOIN TargetProteinsTargetPsms tptp
+                ON tp.PeptideID = tptp.TargetPsmsPeptideID
+            LEFT JOIN TargetProteins tprot
+                ON tptp.TargetProteinsUniqueSequenceID = tprot.UniqueSequenceID
+            WHERE tp.PercolatorqValue <= :fdr
+              AND tp.Sequence IS NOT NULL
+            """,
+            conn,
+            params={"fdr": peptide_fdr},
+        )
+    except Exception as exc:
+        logger.error(f"Could not query MSF file {msf_path!r}: {exc}")
+        return LCMSIds(proteins=set(), peptides=pd.DataFrame(columns=_PEP_COLS))
+    finally:
+        conn.close()
+
+    if df.empty:
+        logger.warning(
+            f"No peptides found at {peptide_fdr*100:.0f}% FDR in {msf_path!r}"
+        )
+        return LCMSIds(proteins=set(), peptides=pd.DataFrame(columns=_PEP_COLS))
+
+    df["sequence"] = df["sequence"].apply(_strip_modifications)
+    df["protein"] = (
+        df["protein"].fillna("").apply(lambda x: _normalize_accession(x) if x else "")
+    )
+    for col in ("q_value", "score", "charge", "rt"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Aggregate PSMs to peptide level
+    pep_df = (
+        df.sort_values("q_value")
+        .groupby("sequence")
+        .agg(
+            peptidoform=("sequence", "first"),
+            protein=("protein", "first"),
+            q_value=("q_value", "min"),
+            score=("score", "max"),
+            n_psms=("sequence", "count"),
+            charge=("charge", lambda x: x.mode().iloc[0] if len(x) > 0 else np.nan),
+            rt_mean=("rt", "mean"),
+        )
+        .reset_index()
+    )
+    # MSF stores no separate PEP column; leave as NaN
+    pep_df["pep"] = np.nan
+    pep_df["lcms_intensity"] = np.nan
+
+    proteins_set = {acc for acc in pep_df["protein"].unique() if acc}
+    logger.info(
+        f"  MSF: {len(proteins_set)} proteins, {len(pep_df)} peptides "
+        f"at {peptide_fdr*100:.0f}% FDR"
+    )
+    return LCMSIds(
+        proteins=proteins_set, peptides=pep_df[_PEP_COLS].reset_index(drop=True)
+    )
 
 
 # ---------------------------------------------------------------------------
