@@ -24,5 +24,8 @@ catboost = ["catboost>=1.2"]
 calibration = ["statsmodels>=0.14"]
 mobility = ["im2deep>=0.1"]
 
+[project.scripts]
+ms1rescore = "ms1rescore.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
