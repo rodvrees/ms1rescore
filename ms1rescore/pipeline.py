@@ -429,7 +429,16 @@ def rescore(
             )
 
     maldi_intensities = None
-    if ion_images is not None:
+    maldi_intensities_p90 = None
+    maldi_intensities_sum = None
+    if spatial_features is not None:
+        if "intensity_p90" in spatial_features.columns:
+            maldi_intensities_p90 = spatial_features["intensity_p90"].to_numpy(dtype=np.float32)
+        if "intensity_sum" in spatial_features.columns:
+            maldi_intensities_sum = spatial_features["intensity_sum"].to_numpy(dtype=np.float32)
+        if "mean_intensity" in spatial_features.columns:
+            maldi_intensities = spatial_features["mean_intensity"].to_numpy(dtype=np.float32)
+    elif ion_images is not None:
         maldi_intensities = np.array(
             [img[img > 0].mean() if (img > 0).any() else 0.0 for img in ion_images]
         )
@@ -438,6 +447,8 @@ def rescore(
         peptide_db,
         ppm_tolerance,
         maldi_intensities=maldi_intensities,
+        maldi_intensities_p90=maldi_intensities_p90,
+        maldi_intensities_sum=maldi_intensities_sum,
     )
     if verbose:
         logger.debug(f"Writing matched candidates to {output_dir}/debug_candidates.tsv")

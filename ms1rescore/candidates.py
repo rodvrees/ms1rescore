@@ -133,17 +133,45 @@ def match_to_maldi_features(
     peptide_db: pd.DataFrame,
     ppm_tolerance: float = 20.0,
     maldi_intensities: np.ndarray | None = None,
+    maldi_intensities_p90: np.ndarray | None = None,
+    maldi_intensities_sum: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
     Match MALDI m/z features to digest candidates within ppm tolerance.
 
     Uses Rust (ms1rescore_rs) if available for the m/z matching step.
 
+    Parameters
+    ----------
+    maldi_intensities
+        Per-feature intensity array aligned with ``maldi_mzs``.  Prefer
+        passing ``maldi_intensities_p90`` (90th-percentile of nonzero pixels)
+        rather than mean-of-nonzero, as p90 decouples intensity magnitude from
+        spatial coverage.  If only this argument is supplied it is used for
+        ``feature_intensity`` (backwards compatibility).
+    maldi_intensities_p90
+        90th-percentile intensity of nonzero pixels per feature.  Robust
+        estimate of peak intensity that is not confounded by spatial coverage
+        (``fraction_detected`` handles that separately).  Preferred over
+        mean-of-nonzero.  Computed by ``compute_spatial_features`` as
+        ``intensity_p90``.
+    maldi_intensities_sum
+        Sum of nonzero pixel intensities per feature.  Computed by
+        ``compute_spatial_features`` as ``intensity_sum``.
+
     Returns candidate table with columns from peptide_db plus:
         feature_mz, feature_idx, ppm_error, ppm_error_abs,
         protein_n_features, n_candidates
     """
     peptide_mzs = peptide_db["mh_mz"].values
+
+    def _assign_intensities(df: pd.DataFrame, idx) -> None:
+        if maldi_intensities_p90 is not None:
+            df["feature_intensity_p90"] = maldi_intensities_p90[idx]
+        if maldi_intensities_sum is not None:
+            df["feature_intensity_sum"] = maldi_intensities_sum[idx]
+        if maldi_intensities is not None:
+            df["feature_intensity"] = maldi_intensities[idx]
 
     try:
         from ms1rescore_rs import match_mz
@@ -165,8 +193,7 @@ def match_to_maldi_features(
         result["feature_idx"] = feat_idx
         result["ppm_error"] = ppm_errors
         result["ppm_error_abs"] = np.abs(ppm_errors)
-        if maldi_intensities is not None:
-            result["feature_intensity"] = maldi_intensities[feat_idx]
+        _assign_intensities(result, feat_idx)
         logger.info("  (used Rust backend for m/z matching)")
 
     except ImportError:
@@ -187,8 +214,7 @@ def match_to_maldi_features(
             candidates["feature_idx"] = i
             candidates["ppm_error"] = (mz - candidates["mh_mz"]) / candidates["mh_mz"] * 1e6
             candidates["ppm_error_abs"] = candidates["ppm_error"].abs()
-            if maldi_intensities is not None:
-                candidates["feature_intensity"] = maldi_intensities[i]
+            _assign_intensities(candidates, i)
             matches.append(candidates)
 
         if not matches:

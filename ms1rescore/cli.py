@@ -207,6 +207,81 @@ def build_parser() -> argparse.ArgumentParser:
             "(no header). Ion images will not be available."
         ),
     )
+    maldi_exc.add_argument(
+        "--maldi-raw",
+        metavar="PATH",
+        help=(
+            "Bruker .d directory (TSF format, e.g. from timsTOF fleX). "
+            "Features are detected automatically by binning centroided peaks "
+            "across all pixels. Ion images and spatial features are computed "
+            "and optionally saved (see --save-npz and --save-spatial)."
+        ),
+    )
+
+    # --- Raw extraction parameters ---
+    raw_grp = parser.add_argument_group(
+        "raw MALDI extraction (--maldi-raw only)",
+        description=(
+            "Parameters for feature detection and ion image extraction when "
+            "starting from a raw Bruker .d directory."
+        ),
+    )
+    raw_grp.add_argument(
+        "--ppm-bin",
+        type=float,
+        default=5.0,
+        metavar="FLOAT",
+        help="Peak-binning tolerance for feature detection (ppm). Default: 5.0.",
+    )
+    raw_grp.add_argument(
+        "--extraction-ppm",
+        type=float,
+        default=25.0,
+        metavar="FLOAT",
+        help=(
+            "m/z window for raw ion image extraction (ppm). Controls which raw "
+            "data points contribute to each ion image. Should be slightly wider "
+            "than the instrument's typical peak width. Default: 25.0."
+        ),
+    )
+    raw_grp.add_argument(
+        "--matching-ppm",
+        type=float,
+        default=20.0,
+        metavar="FLOAT",
+        help=(
+            "m/z window for candidate matching (ppm). Applied when linking "
+            "peptide candidates to detected MALDI features. Default: 20.0."
+        ),
+    )
+    raw_grp.add_argument(
+        "--min-fraction",
+        type=float,
+        default=0.01,
+        metavar="FLOAT",
+        help=(
+            "Minimum fraction of pixels a peak must be detected in to be "
+            "kept as a feature. Default: 0.01 (1%%)."
+        ),
+    )
+    raw_grp.add_argument(
+        "--save-npz",
+        metavar="PATH",
+        help=(
+            "Save extracted features and ion images as an NPZ file to this "
+            "path, so subsequent runs can use --maldi-npz instead of "
+            "re-extracting from raw data."
+        ),
+    )
+    raw_grp.add_argument(
+        "--save-spatial",
+        metavar="PATH",
+        help=(
+            "Save the computed spatial features TSV to this path "
+            "(columns: feature_mz, n_pixels_detected, fraction_detected, "
+            "mean_intensity, spatial_autocorrelation, intensity_cv)."
+        ),
+    )
 
     # --- Candidate generation ---
     cand = parser.add_argument_group("candidate generation")
@@ -402,20 +477,38 @@ def main() -> None:
     )
 
     # --- Load MALDI data ---
-    maldi_mzs, ion_images, ion_image_mzs = _load_maldi(args.maldi_npz, args.maldi_mzs)
-    if args.verbose:
-        logger.debug(
-            f"Outputting maldi_mz, ion_images and ion_image_mzs for debugging:"
-        )
-        # Write to disk to check the loaded data (in case of issues with the NPZ loading)
-        np.savetxt("debug_maldi_mzs.txt", maldi_mzs)
-        if ion_images is not None:
-            np.save("debug_ion_images.npy", ion_images)
-        if ion_image_mzs is not None:
-            np.savetxt("debug_ion_image_mzs.txt", ion_image_mzs)
-
-    # --- Optional spatial features ---
     spatial_features = None
+
+    if args.maldi_raw:
+        from ms1rescore.maldi_extraction import extract_maldi_data
+
+        logger.info(
+            "MALDI features detected from raw data (detect_features). "
+            "LC-MS/MS identifications will be used for candidate generation and "
+            "prior features only, not for feature selection."
+        )
+        logger.info(f"Extracting MALDI features from raw data: {args.maldi_raw}")
+        maldi_mzs, ion_images, spatial_features = extract_maldi_data(
+            args.maldi_raw,
+            ppm_bin=args.ppm_bin,
+            extraction_ppm=args.extraction_ppm,
+            matching_ppm=args.matching_ppm,
+            min_fraction=args.min_fraction,
+            output_npz=args.save_npz,
+            output_spatial_tsv=args.save_spatial,
+            output_dir=args.output_dir,
+        )
+        ion_image_mzs = maldi_mzs if ion_images is not None else None
+        logger.info(
+            f"  {len(maldi_mzs)} features extracted"
+            + (f", ion image shape: {ion_images.shape[1:]}" if ion_images is not None else "")
+        )
+    else:
+        maldi_mzs, ion_images, ion_image_mzs = _load_maldi(
+            args.maldi_npz, args.maldi_mzs
+        )
+
+    # --- Optional spatial features (explicit file overrides extracted ones) ---
     if args.spatial_features:
         logger.info(f"Loading spatial features from {args.spatial_features}")
         spatial_features = pd.read_csv(args.spatial_features, sep="\t")
@@ -447,7 +540,9 @@ def main() -> None:
         )
         if args.verbose:
             logger.debug("Writing parsed LC-MS/MS IDs to debug_lcms_ids.tsv")
-            lcms_ids.peptides.to_csv("debug_lcms_ids.tsv", sep="\t", index=False)
+            lcms_ids.peptides.to_csv(
+                f"{args.output_dir}/debug_lcms_ids.tsv", sep="\t", index=False
+            )
         min_length, max_length, missed_cleavages = _infer_digest_params(
             lcms_ids,
             missed_cleavages_override=args.missed_cleavages,

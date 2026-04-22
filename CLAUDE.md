@@ -23,7 +23,8 @@ ms1rescore/
 │   ├── candidates.py           # FASTA digest + MALDI m/z matching
 │   ├── lcms_ids.py             # Parse LC-MS/MS IDs for Strategy C candidate generation
 │   ├── lcms_evidence.py        # LC-MS/MS feature extraction
-│   ├── maldi_features.py       # MALDI-side features
+│   ├── maldi_extraction.py     # Raw MALDI extraction: feature detection, ion images, spatial features
+│   ├── maldi_features.py       # MALDI-side rescoring features
 │   ├── feature_generator.py    # Orchestration + PSMList construction
 │   └── pipeline.py             # End-to-end pipeline function
 └── ms1rescore-rs/              # Rust extension (PyO3 + rayon)
@@ -64,6 +65,38 @@ XICs in LC-MS/MS are extracted at charges 1, 2, 3, 4 for each MALDI feature's ne
 
 ## Modules
 
+### `maldi_extraction.py`
+
+Converts raw Bruker `.d`/TSF data into the NPZ format consumed by the rest of the pipeline. Requires `imzy` (`pip install ms1rescore[maldi]`).
+
+**Three-step extraction orchestrated by `extract_maldi_data(d_path, ..., feature_mzs=None)`:**
+
+1. **Feature determination** — always uses `detect_features(reader, ppm_bin=5.0, min_fraction=0.01)`. Pass `feature_mzs` only to reuse a cached feature set from a previous run; do not populate it from LC-MS/MS IDs. After ion image extraction, features with zero MALDI signal are removed.
+
+2. **`extract_ion_images(reader, feature_mzs, ppm=25.0)`** — delegates to `reader.get_ion_images(feature_mzs, ppm=ppm, fill_value=0.0)`. This is a single streaming pass (imzy internally uses `accumulate_peaks_centroid` from `ims_utils`). Returns shape `(n_features, height, width)`, float32. `extraction_ppm` (default 25.0) controls this window.
+
+3. **`compute_spatial_features(ion_images, feature_mzs, n_pixels_total)`** — computes per-feature: `fraction_detected`, `n_pixels_detected`, `mean_intensity`, `intensity_p90`, `intensity_sum`, `intensity_cv`, and Moran's I (`spatial_autocorrelation`). Moran's I is computed via `scipy.ndimage.convolve` with a queen's contiguity (8-neighbour) kernel — O(pixels) per feature.
+
+**Two ppm parameters:**
+
+- `extraction_ppm` (default 25.0, CLI `--extraction-ppm`): controls which raw data points contribute to each ion image. Slightly wider than instrument centroid accuracy to avoid clipping peak tails.
+- `matching_ppm` (default 20.0, CLI `--matching-ppm`): passed downstream for candidate-to-feature linking in `match_to_maldi_features`. Stored in `spatial_df` metadata but not used internally by `extract_maldi_data`.
+
+**Deprecated: LC-MS/MS guided extraction** (`_features_from_lcms_file_diagnostic`):
+
+The original `maldi_ion_images.npz` was created using [M+H]+ m/z values of LC-MS/MS identified peptides as the MALDI feature set (not by peak detection). This is circular for rescoring — it pre-selects features guaranteed to match LC-MS/MS candidates, making scoring trivial and ignoring ~39–61% of MALDI-detectable tryptic peptides with no LC-MS/MS counterpart. The function `_features_from_lcms_file_diagnostic` is kept for diagnostic/legacy use only. LC-MS/MS identifications should inform candidate generation (Strategy C) and prior features, not the MALDI feature set itself. The CLI no longer calls this function automatically.
+
+**imzy reader API used:**
+- `reader.n_pixels` — total measured pixels
+- `reader.spectra_iter(silent=False)` — yields `(mzs, ints)` per pixel
+- `reader.get_ion_images(mzs, ppm=..., fill_value=0.0)` → `(n_features, H, W)` float32
+- `reader.image_shape` — `(y_size, x_size)`
+- Used as context manager: `with imzy.get_reader(d_path) as reader:`
+
+The `--maldi-raw` CLI flag calls `extract_maldi_data()` and automatically passes the extracted spatial features to `rescore()` (no separate `--spatial-features` needed when starting from raw data). `--save-npz` and `--save-spatial` allow caching the output for reruns.
+
+---
+
 ### `utils.py`
 
 Shared mathematical utilities. No external state.
@@ -94,13 +127,7 @@ See the [Candidate generation strategies](#candidate-generation-strategies) sect
 
 `match_to_maldi_features()` uses `match_mz()` from `ms1rescore_rs` (binary search) or Python fallback. Returns a candidates DataFrame with one row per (peptide, MALDI feature) pair. Protein-level features (`protein_n_features`, `n_candidates`) are computed over all candidates symmetrically.
 
-Key parameter: `maldi_intensities` (numpy array aligned with `maldi_mzs`) must be passed to populate `log_maldi_intensity`. If it is `None`, `log_maldi_intensity` is 0 for all candidates. Compute it from ion images as:
-```python
-maldi_intensities = np.array([
-    img[img > 0].mean() if (img > 0).any() else 0.0
-    for img in ion_images
-])
-```
+Key parameters: `maldi_intensities`, `maldi_intensities_p90`, `maldi_intensities_sum` (each a numpy array aligned with `maldi_mzs`) populate `feature_intensity`, `feature_intensity_p90`, and `feature_intensity_sum` respectively, from which `log_maldi_intensity`, `log_maldi_intensity_p90`, and `log_maldi_intensity_sum` are derived. Prefer `intensity_p90` from `compute_spatial_features()` over mean-of-nonzero for the main intensity feature. In `pipeline.py`, these are read from `spatial_features` columns when available.
 
 ### `lcms_evidence.py`
 
@@ -343,7 +370,7 @@ pip install -e "ms1rescore/[catboost]"
 
 ## Notebooks and scripts
 
-- **`notebooks/11_symmetric_rescoring.ipynb`**: End-to-end notebook. Cells follow pipeline steps 1-9. Cell 3 computes `maldi_intensities` from ion images before calling `match_to_maldi_features`.
+- **`notebooks/04_maldi_rescoring.ipynb`**: End-to-end notebook. Cells follow pipeline steps 1-9.
 - **`scripts/visualize_ms1rescore_features.py`**: Feature visualization script. For each selected MALDI feature: summary heatmaps, feature distribution histograms, bar charts. For each of 3 selected candidates per feature (best-ppm target, best-SA target, best-ppm decoy): XIC chromatogram, MS2 mirror plot, isotope envelope comparison, ion image, mass accuracy bar, feature card.
 
 ---
@@ -362,17 +389,9 @@ rm notebooks/cache/ms2pip_predictions.pkl
 rm notebooks/cache/lcms_data.pkl
 ```
 
-### `maldi_intensities` must be passed explicitly
+### `maldi_intensities_p90` must be passed explicitly
 
-`match_to_maldi_features()` has an optional `maldi_intensities` parameter. If not passed, `log_maldi_intensity` is 0 for all candidates. Always compute and pass it:
-```python
-maldi_intensities = np.array([
-    img[img > 0].mean() if (img > 0).any() else 0.0
-    for img in ion_images
-])
-candidates = match_to_maldi_features(maldi_mzs, peptide_db, ppm_tolerance, maldi_intensities=maldi_intensities)
-```
-This applies to the notebook, the viz script, and the pipeline.
+`match_to_maldi_features()` accepts `maldi_intensities`, `maldi_intensities_p90`, and `maldi_intensities_sum`. If none are passed, all log-intensity features are 0. In `pipeline.py`, these are read from `spatial_features` columns (`intensity_p90`, `intensity_sum`, `mean_intensity`) when available. In standalone use (e.g. the viz script), pass at least `maldi_intensities` from ion images or spatial features.
 
 ### Scale
 

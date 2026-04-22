@@ -62,7 +62,8 @@ MALDI_INTRINSIC_FEATURES = [
     "acidic_residue_density",        # C12
     "n_tryptophan", "n_tyrosine",    # C15
     # --- MALDI signal ---
-    "log_maldi_intensity",
+    "log_maldi_intensity_p90", "log_maldi_intensity_sum",
+    "log_maldi_intensity",     # backwards-compatible alias for log_maldi_intensity_p90
     # --- mass defect features (A-group) ---
     "kendrick_mass_defect",          # A10 — computed in match_to_maldi_features
     "mass_defect_residual",          # A11

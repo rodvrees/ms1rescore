@@ -1,2 +1,3 @@
+- MALDI raw -> maldi_ion_images.npz extraction (was lost somewhere)
 - Move MSF parser to psm_utils
 - use psm_utils logic more

@@ -138,11 +138,22 @@ def compute_peptide_properties(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_maldi_signal_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute log_maldi_intensity from feature_intensity."""
-    if "feature_intensity" in df.columns:
-        df["log_maldi_intensity"] = np.log1p(df["feature_intensity"])
+    """Compute log-intensity features from feature_intensity columns."""
+    if "feature_intensity_p90" in df.columns:
+        df["log_maldi_intensity_p90"] = np.log1p(df["feature_intensity_p90"])
+    elif "feature_intensity" in df.columns:
+        df["log_maldi_intensity_p90"] = np.log1p(df["feature_intensity"])
     else:
-        df["log_maldi_intensity"] = 0.0
+        df["log_maldi_intensity_p90"] = 0.0
+
+    if "feature_intensity_sum" in df.columns:
+        df["log_maldi_intensity_sum"] = np.log1p(df["feature_intensity_sum"])
+    else:
+        df["log_maldi_intensity_sum"] = 0.0
+
+    # Backwards-compatible alias — maps to p90 if not already present
+    if "log_maldi_intensity" not in df.columns:
+        df["log_maldi_intensity"] = df["log_maldi_intensity_p90"]
     return df
 
 
