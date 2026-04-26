@@ -274,12 +274,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     raw_grp.add_argument(
+        "--image-batch-size",
+        type=int,
+        default=100,
+        metavar="INT",
+        help=(
+            "Features per batch for ion image extraction. Ion images are "
+            "always written to a memory-mapped file (maldi_images.bin in "
+            "--output-dir) to avoid OOM on large datasets. Default: 100."
+        ),
+    )
+    raw_grp.add_argument(
         "--save-spatial",
         metavar="PATH",
         help=(
             "Save the computed spatial features TSV to this path "
             "(columns: feature_mz, n_pixels_detected, fraction_detected, "
-            "mean_intensity, spatial_autocorrelation, intensity_cv)."
+            "mean_intensity, intensity_p90, intensity_sum, "
+            "spatial_autocorrelation, intensity_cv)."
         ),
     )
 
@@ -487,13 +499,22 @@ def main() -> None:
             "LC-MS/MS identifications will be used for candidate generation and "
             "prior features only, not for feature selection."
         )
+        # Ion images are always extracted via a memory-mapped file to prevent
+        # OOM for large datasets.  The .bin file persists in output_dir and
+        # contains the full float32 image array for debugging.
+        os.makedirs(args.output_dir, exist_ok=True)
+        _images_memmap_path = os.path.join(args.output_dir, "maldi_images.bin")
+
         logger.info(f"Extracting MALDI features from raw data: {args.maldi_raw}")
+        logger.info(f"  Ion images will be memory-mapped to: {_images_memmap_path}")
         maldi_mzs, ion_images, spatial_features = extract_maldi_data(
             args.maldi_raw,
             ppm_bin=args.ppm_bin,
             extraction_ppm=args.extraction_ppm,
             matching_ppm=args.matching_ppm,
             min_fraction=args.min_fraction,
+            images_path=_images_memmap_path,
+            image_batch_size=args.image_batch_size,
             output_npz=args.save_npz,
             output_spatial_tsv=args.save_spatial,
             output_dir=args.output_dir,

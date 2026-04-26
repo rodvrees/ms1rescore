@@ -10,6 +10,7 @@ All three are orchestrated by extract_maldi_data(), which is the public entry po
 """
 
 import logging
+import os
 
 import numpy as np
 import pandas as pd
@@ -28,19 +29,26 @@ def detect_features(
     min_fraction: float = 0.01,
 ) -> np.ndarray:
     """
-    Detect consensus m/z features by histogram-binning all centroided peaks.
+    Detect consensus m/z features by per-pixel logarithmic histogram binning.
+
+    Uses O(n_bins) memory regardless of the total number of peaks across all
+    pixels.  Each pixel's peaks are accumulated into fine bins (ppm_bin/4 wide)
+    in a single streaming pass.  A greedy merge step then re-applies the
+    ppm_bin grouping rule on the (small) set of non-empty bin centroids,
+    matching the semantics of the original collect-then-sort algorithm while
+    avoiding the large intermediate peak arrays.
 
     Parameters
     ----------
     reader
-        An imzy reader object (e.g. TSFReader).  Must support
-        ``reader.n_pixels`` and ``reader.spectra_iter(silent=False)``.
+        An imzy reader object.  Must support ``reader.n_pixels``,
+        ``reader.mz_min``, ``reader.mz_max``, and
+        ``reader.spectra_iter(silent=False)``.
     ppm_bin
-        Width of each histogram bin in ppm.  Peaks within one bin are
-        merged into a single feature.  Default 5.0 ppm.
+        Feature grouping tolerance in ppm.  Default 5.0.
     min_fraction
-        Minimum fraction of pixels a peak must be detected in to survive
-        as a feature.  Default 0.01 (1 %).
+        Minimum fraction of pixels a feature must be detected in.
+        Default 0.01 (1 %).
 
     Returns
     -------
@@ -50,57 +58,87 @@ def detect_features(
     n_pixels = reader.n_pixels
     min_count = max(1, int(min_fraction * n_pixels))
 
-    # --- Pass 1: collect all peaks into parallel arrays ---
-    mzs_list: list[np.ndarray] = []
-    ints_list: list[np.ndarray] = []
-    px_list: list[np.ndarray] = []
+    mz_ref = float(getattr(reader, "mz_min", 100.0))
+    if mz_ref <= 0:
+        mz_ref = 100.0
+    mz_top = float(getattr(reader, "mz_max", 4000.0))
 
-    for px_idx, (mzs, ints) in enumerate(reader.spectra_iter(silent=False)):
+    # Fine bins at ppm_bin/4 resolution: each real feature spans ≤4 fine bins,
+    # preventing the original ppm_bin-wide bins from splitting features at edges.
+    fine_ppm = ppm_bin / 4.0
+    fine_log_width = np.log1p(fine_ppm * 1e-6)
+    n_bins = int(np.ceil(np.log(mz_top / mz_ref) / fine_log_width)) + 2
+    log_mz_ref = np.log(mz_ref)
+
+    # Three arrays at O(n_bins × 8 bytes) — ~26 MB for a typical MALDI range.
+    bin_pixel_count = np.zeros(n_bins, dtype=np.int32)
+    bin_intensity_sum = np.zeros(n_bins, dtype=np.float64)
+    bin_mz_int_sum = np.zeros(n_bins, dtype=np.float64)
+
+    n_total_peaks = 0
+    for _px, (mzs, ints) in enumerate(reader.spectra_iter(silent=False)):
         if len(mzs) == 0:
             continue
-        mzs_list.append(mzs.astype(np.float64))
-        ints_list.append(ints.astype(np.float32))
-        px_list.append(np.full(len(mzs), px_idx, dtype=np.int32))
+        mzs_f = np.asarray(mzs, dtype=np.float64)
+        ints_f = np.asarray(ints, dtype=np.float64)
+        valid = mzs_f > 0
+        if not valid.all():
+            mzs_f = mzs_f[valid]
+            ints_f = ints_f[valid]
+        if len(mzs_f) == 0:
+            continue
 
-    if not mzs_list:
+        n_total_peaks += len(mzs_f)
+        bin_idx = np.floor((np.log(mzs_f) - log_mz_ref) / fine_log_width).astype(np.int32)
+        np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
+
+        # unique_bins: distinct bins hit this pixel; inverse: maps each peak → position in unique_bins.
+        # bincount on inverse is O(n_peaks), not O(n_bins) — avoids 1M-element array per pixel.
+        unique_bins, inverse = np.unique(bin_idx, return_inverse=True)
+        n_uniq = len(unique_bins)
+
+        bin_pixel_count[unique_bins] += 1
+        bin_intensity_sum[unique_bins] += np.bincount(inverse, weights=ints_f, minlength=n_uniq)
+        bin_mz_int_sum[unique_bins] += np.bincount(inverse, weights=mzs_f * ints_f, minlength=n_uniq)
+
+    logger.info(
+        f"  Processed {n_total_peaks:,} peaks from {n_pixels:,} pixels "
+        f"({n_total_peaks / max(n_pixels, 1):.0f} peaks/pixel average)"
+    )
+
+    # Candidate bins: any bin that received at least one pixel contribution.
+    cand_idx = np.where(bin_pixel_count > 0)[0]
+    if len(cand_idx) == 0:
         logger.warning("No peaks found in any pixel — returning empty feature list.")
         return np.array([], dtype=np.float64)
 
-    all_mzs = np.concatenate(mzs_list)
-    all_ints = np.concatenate(ints_list)
-    all_pxs = np.concatenate(px_list)
-
-    logger.info(
-        f"  Collected {len(all_mzs):,} peaks from {n_pixels:,} pixels "
-        f"({len(all_mzs)/n_pixels:.0f} peaks/pixel average)"
+    cand_int = bin_intensity_sum[cand_idx]
+    cand_mz_int = bin_mz_int_sum[cand_idx]
+    cand_cnt = bin_pixel_count[cand_idx]
+    cand_mzs = np.where(
+        cand_int > 0,
+        cand_mz_int / cand_int,
+        mz_ref * np.exp((cand_idx + 0.5) * fine_log_width),
     )
 
-    # --- Pass 2: sort by m/z and greedy-bin ---
-    order = np.argsort(all_mzs, kind="stable")
-    all_mzs = all_mzs[order]
-    all_ints = all_ints[order]
-    all_pxs = all_pxs[order]
-
+    # Greedy merge: group candidate-bin centroids within ppm_bin of each other
+    # (same rule as the original algorithm).  Centroided spectra have at most
+    # one peak per feature per pixel, so pixel counts sum without double-counting.
     feature_mzs: list[float] = []
-    n = len(all_mzs)
+    n = len(cand_mzs)
     i = 0
     while i < n:
-        anchor = all_mzs[i]
+        anchor = cand_mzs[i]
         j = i + 1
-        # extend group while within ppm_bin of the anchor (first peak in group)
-        while j < n and (all_mzs[j] - anchor) / anchor * 1e6 <= ppm_bin:
+        while j < n and (cand_mzs[j] - anchor) / anchor * 1e6 <= ppm_bin:
             j += 1
 
-        n_unique = len(np.unique(all_pxs[i:j]))
-        if n_unique >= min_count:
-            weights = all_ints[i:j].astype(np.float64)
-            w_sum = weights.sum()
-            if w_sum > 0:
-                feat_mz = float(np.dot(all_mzs[i:j], weights) / w_sum)
-            else:
-                feat_mz = float(all_mzs[i:j].mean())
-            feature_mzs.append(feat_mz)
-
+        if int(cand_cnt[i:j].sum()) >= min_count:
+            grp_int = cand_int[i:j].sum()
+            grp_mz_int = cand_mz_int[i:j].sum()
+            feature_mzs.append(
+                float(grp_mz_int / grp_int) if grp_int > 0 else float(cand_mzs[i:j].mean())
+            )
         i = j
 
     result = np.array(feature_mzs, dtype=np.float64)
@@ -566,20 +604,26 @@ def extract_maldi_data(
         spatial_df = spatial_df[detected_mask].reset_index(drop=True)
 
     if output_npz is not None:
-        npz_path = f"{output_dir}/{output_npz}" if output_dir else output_npz
+        if output_dir and not os.path.isabs(str(output_npz)):
+            npz_path = os.path.join(output_dir, output_npz)
+        else:
+            npz_path = output_npz
+        os.makedirs(os.path.dirname(os.path.abspath(npz_path)), exist_ok=True)
         np.savez_compressed(
             npz_path,
             mzs=feature_mzs,
-            images=ion_images,
+            images=np.asarray(ion_images),
             x_coords=x_coords,
             y_coords=y_coords,
         )
         logger.info(f"  Saved NPZ → {npz_path}")
 
     if output_spatial_tsv is not None:
-        tsv_path = (
-            f"{output_dir}/{output_spatial_tsv}" if output_dir else output_spatial_tsv
-        )
+        if output_dir and not os.path.isabs(str(output_spatial_tsv)):
+            tsv_path = os.path.join(output_dir, output_spatial_tsv)
+        else:
+            tsv_path = output_spatial_tsv
+        os.makedirs(os.path.dirname(os.path.abspath(tsv_path)), exist_ok=True)
         spatial_df.to_csv(tsv_path, sep="\t", index=False)
         logger.info(f"  Saved spatial features → {tsv_path}")
 
