@@ -176,14 +176,35 @@ WHERE PercolatorqValue <= 0.01 AND RetentionTime IS NOT NULL
 
 MALDI-side features. All functions take the candidates DataFrame and return it with new columns added.
 
-#### `compute_colocalization_features()`
+#### Ion-image colocalization and spatial autocorrelation
 
-Pre-computes a correlation cache to avoid redundant `pearsonr` calls:
-1. Pre-flatten all ion images once: `flat[mz] = image.flatten().astype(float)`
-2. For each unique protein, compute `np.corrcoef(flat_a, flat_b)[0,1]` for all (mz_a, mz_b) pairs once; store in `corr_cache[(mz_a, mz_b)]`
-3. Candidate loop does O(1) dict lookup
+All four ion-image feature functions are performance-critical. Their design:
 
-Without caching: ~707K `pearsonr` calls on 49K-pixel arrays. With caching: ~1,398² unique pairs (most shared by many candidates).
+**`_pearson_r_matrix(ion_images, ion_image_mzs)`** — shared helper. Stacks all valid (non-constant) ion images into a `(n_valid, n_pixels)` float32 matrix and computes the full `(n_valid, n_valid)` Pearson correlation matrix in a single BLAS `dgemm` call via `np.corrcoef`. Called once by `feature_generator.compute_all_features` and passed as `_corr_cache` to all three colocalization functions to avoid 3× redundant BLAS work.
+
+**`compute_colocalization_features()`** — within-protein Pearson correlations:
+1. `_pearson_r_matrix` → full corr matrix (shared with other functions)
+2. Pandas self-join on `protein` to enumerate all within-protein feature pairs (O(Σ k²) rows where k = features per protein, typically small)
+3. Vectorized `corr_matrix[idx_a, idx_b]` lookup on the join result
+4. `groupby(['feature_mz', 'protein']).agg(mean/max/median/count)` → merge back onto candidates
+
+**`compute_isotopologue_colocalization()`** and **`compute_adduct_colocalization()`** — both use `_find_partner_indices` (vectorized `searchsorted` + nearest-neighbour check) to locate M+1/M+2 or Na/K/CHCA adduct images for all features simultaneously, then slice the shared corr matrix.
+
+**`compute_spatial_autocorrelation_full()`** — Moran's I and Geary's C:
+- Replaces per-feature `scipy.signal.convolve2d` with `_neighbor_sum_batch`: batched numpy 8-neighbour sum using zero-padded slicing, no scipy dependency.
+- Processes features in chunks of `chunk_size=200` (caps peak RAM at ~150 MB per chunk for a 49 K-pixel image at float32).
+- Chunks dispatched to a `ThreadPoolExecutor` — numpy releases the GIL for large array ops, so threads run in parallel.
+- Uses float32 throughout; only final reduction sums accumulate in float64.
+
+**Benchmark at 1398 features, 220×225 px (49,500 pixels), realistic candidate set:**
+
+| Step | Time |
+|---|---|
+| `_pearson_r_matrix` (shared, once) | ~1.4 s |
+| `compute_colocalization_features` | ~0.03 s |
+| `compute_isotopologue_colocalization` | ~0.01 s |
+| `compute_adduct_colocalization` | ~0.01 s |
+| `compute_spatial_autocorrelation_full` | ~0.8 s |
 
 #### `compute_theoretical_isotope_features()`
 
@@ -336,8 +357,21 @@ Built with PyO3 + rayon. Exposed functions:
 | `extract_xics_batch(ms1_rts, ms1_mz_arrays, ms1_int_arrays, target_mzs, ppm)` | xic.rs | Parallel XIC extraction for multiple target m/z values across all MS1 scans |
 | `extract_ms1_envelopes_batch(ms1_mz_arrays, ms1_int_arrays, scan_indices, target_mzs, charge, n_peaks, ppm)` | isotope.rs | MS1 isotope envelope extraction at specified scans |
 | `spectral_angles_batch(pred_mzs, pred_ints, obs_mzs, obs_ints, fragment_tol_da)` | spectral.rs | Batch spectral angle; requires ≥3 matched fragments, else returns 0.0 |
+| `compute_ionization_features(sequences)` | features.rs | Returns (n_R, n_K, n_H, n_F, n_W, n_Y, gravy, pi) — 8 arrays; parallel rayon |
+| `compute_property_features(sequences)` | features.rs | Returns (n_D, n_E, n_C, n_P, n_M, n_W, n_Y, seq_len, nterm_code, pi) — 10 arrays; parallel rayon |
+| `count_missed_cleavages_batch(sequences)` | features.rs | K/R not followed by P, excluding last residue; parallel rayon |
 
 All functions gracefully fall back to Python equivalents if the Rust extension is not importable. The Python code checks `from ms1rescore_rs import <function>` inside try/except blocks.
+
+**Peptide sequence feature performance** (707K rows, 395K unique sequences):
+
+| Function | Before (Python) | After (Rust rayon) | Speedup |
+|---|---|---|---|
+| `compute_peptide_properties` | 0.62 s | 0.50 s | 1.2× |
+| `compute_maldi_ionization_features` | 0.80 s | 0.34 s | 2.3× |
+| `compute_peptide_property_features` | 1.34 s | 0.43 s | 3.1× |
+
+pI values from Rust are bit-for-bit identical to the Python bisection implementation.
 
 ### Building the Rust extension
 

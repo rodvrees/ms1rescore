@@ -290,85 +290,131 @@ def compute_spatial_features(
     return df
 
 
+def _pearson_r_matrix(
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Compute the full (n_valid × n_valid) Pearson correlation matrix in one
+    BLAS call.
+
+    Returns
+    -------
+    corr_matrix : (n_valid, n_valid) float64
+    valid_mz_arr : (n_valid,) float64 — m/z values of non-constant images
+    mz_to_idx : dict mapping float(mz) → row/col index into corr_matrix
+    """
+    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+    n_feat = len(mz_arr)
+    n_pix = ion_images.shape[1] * ion_images.shape[2]
+    flat_all = ion_images.reshape(n_feat, n_pix).astype(np.float32)
+
+    stds = flat_all.std(axis=1)
+    valid_mask = stds > 1e-10
+    valid_mz_arr = mz_arr[valid_mask]
+    flat_valid = flat_all[valid_mask].astype(np.float64)  # (n_valid, n_pix)
+
+    corr_matrix = np.corrcoef(flat_valid)  # single BLAS dgemm; (n_valid, n_valid)
+    mz_to_idx = {float(mz): i for i, mz in enumerate(valid_mz_arr)}
+    return corr_matrix, valid_mz_arr, mz_to_idx
+
+
+def _find_partner_indices(
+    source_mzs: np.ndarray,
+    targets: np.ndarray,
+    ppm_tol: float,
+) -> np.ndarray:
+    """
+    Vectorized nearest-neighbour lookup on a sorted m/z array.
+
+    Returns an integer array of the same length as *targets*.  Each entry is
+    the index into *source_mzs* of the closest value within *ppm_tol* ppm,
+    or -1 if no such value exists.
+    """
+    idx = np.searchsorted(source_mzs, targets)
+    n = len(source_mzs)
+    idx_lo = np.clip(idx - 1, 0, n - 1)
+    idx_hi = np.clip(idx,     0, n - 1)
+    ppm_lo = np.abs(source_mzs[idx_lo] - targets) / targets * 1e6
+    ppm_hi = np.abs(source_mzs[idx_hi] - targets) / targets * 1e6
+    best_idx = np.where(ppm_lo <= ppm_hi, idx_lo, idx_hi)
+    within = np.minimum(ppm_lo, ppm_hi) <= ppm_tol
+    return np.where(within, best_idx, -1).astype(np.intp)
+
+
 def compute_colocalization_features(
     df: pd.DataFrame,
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
+    _corr_cache: tuple | None = None,
 ) -> pd.DataFrame:
     """Compute protein co-localization features from MALDI ion images.
 
-    Pre-computes a correlation cache keyed by (mz_a, mz_b) so that
-    Pearson r is computed once per unique feature pair, not per candidate.
+    Builds the full (n_valid_features × n_valid_features) Pearson correlation
+    matrix in a single BLAS dgemm call, then uses a pandas self-join on protein
+    to enumerate all within-protein feature pairs and aggregates with groupby —
+    no Python loop over features or candidates.
+
+    Pass ``_corr_cache`` (the return value of ``_pearson_r_matrix``) to reuse a
+    correlation matrix already computed for the same ion images, avoiding 3×
+    redundant BLAS calls when all three colocalization functions are called
+    together (see ``feature_generator.compute_all_features``).
     """
-    mz_to_idx = {mz: i for i, mz in enumerate(ion_image_mzs)}
+    if _corr_cache is not None:
+        corr_matrix, valid_mz_arr, mz_to_idx = _corr_cache
+    else:
+        corr_matrix, valid_mz_arr, mz_to_idx = _pearson_r_matrix(ion_images, ion_image_mzs)
+    valid_mzs = set(mz_to_idx.keys())
 
-    # Pre-flatten all ion images once
-    flat_images = {}
-    valid_mzs = set()
-    for mz, idx in mz_to_idx.items():
-        flat = ion_images[idx].flatten().astype(np.float64)
-        if flat.std() > 0:
-            flat_images[mz] = flat
-            valid_mzs.add(mz)
-
-    # Collect all (mz_a, mz_b) pairs that share a protein
-    protein_to_mzs = (
-        df.groupby("protein")["feature_mz"]
-        .apply(lambda x: list(x.unique()))
-        .to_dict()
+    # Unique (feature_mz, protein) pairs that have a valid ion image
+    base = (
+        df[["feature_mz", "protein"]]
+        .drop_duplicates()
+        .assign(corr_idx=lambda d: d["feature_mz"].map(lambda m: mz_to_idx.get(float(m))))
     )
-    pairs_needed = set()
-    for mzs in protein_to_mzs.values():
-        mzs_valid = [mz for mz in mzs if mz in valid_mzs]
-        for i, a in enumerate(mzs_valid):
-            for b in mzs_valid[i + 1 :]:
-                pairs_needed.add((a, b))
+    base = base[base["corr_idx"].notna()].copy()
+    base["corr_idx"] = base["corr_idx"].astype(int)
 
-    # Compute Pearson r once per unique pair
-    corr_cache = {}
-    for a, b in pairs_needed:
-        r = float(np.corrcoef(flat_images[a], flat_images[b])[0, 1])
-        corr_cache[(a, b)] = r
-        corr_cache[(b, a)] = r
-
-    logger.info(
-        f"Co-localization: pre-computed {len(pairs_needed)} unique feature-pair correlations"
+    # Self-join on protein to get all within-protein feature-feature pairs
+    pairs = base.merge(
+        base.rename(columns={"feature_mz": "partner_mz", "corr_idx": "partner_idx"}),
+        on="protein",
     )
+    pairs = pairs[pairs["feature_mz"] != pairs["partner_mz"]]
 
-    # Look up per candidate (fast dict lookups, no recomputation)
-    n = len(df)
-    mean_scores = np.zeros(n)
-    max_scores = np.zeros(n)
-    median_scores = np.zeros(n)
-    n_partners = np.zeros(n)
-
-    for i, (_, row) in enumerate(df.iterrows()):
-        this_mz = row["feature_mz"]
-        if this_mz not in valid_mzs:
-            continue
-
-        other_mzs = [
-            mz
-            for mz in protein_to_mzs.get(row["protein"], [])
-            if mz != this_mz and mz in valid_mzs
+    if len(pairs) > 0:
+        # Vectorized correlation lookup
+        pairs = pairs.copy()
+        pairs["r"] = corr_matrix[
+            pairs["corr_idx"].to_numpy(dtype=int),
+            pairs["partner_idx"].to_numpy(dtype=int),
         ]
-        if not other_mzs:
-            continue
+        agg = (
+            pairs.groupby(["feature_mz", "protein"])["r"]
+            .agg(
+                protein_colocalization="mean",
+                protein_colocalization_max="max",
+                protein_colocalization_median="median",
+                protein_colocalization_n_partners="count",
+            )
+            .reset_index()
+        )
+        df = df.merge(agg, on=["feature_mz", "protein"], how="left")
+    else:
+        for col in ["protein_colocalization", "protein_colocalization_max",
+                    "protein_colocalization_median", "protein_colocalization_n_partners"]:
+            df[col] = 0.0
 
-        correlations = [corr_cache[(this_mz, mz)] for mz in other_mzs if (this_mz, mz) in corr_cache]
-        if correlations:
-            mean_scores[i] = float(np.mean(correlations))
-            max_scores[i] = float(np.max(correlations))
-            median_scores[i] = float(np.median(correlations))
-            n_partners[i] = len(correlations)
+    for col in ["protein_colocalization", "protein_colocalization_max",
+                "protein_colocalization_median", "protein_colocalization_n_partners"]:
+        df[col] = df[col].fillna(0.0)
 
-    df["protein_colocalization"] = mean_scores
-    df["protein_colocalization_max"] = max_scores
-    df["protein_colocalization_median"] = median_scores
-    df["protein_colocalization_n_partners"] = n_partners
-
-    n_scored = np.count_nonzero(mean_scores)
-    logger.info(f"Co-localization: {n_scored}/{n} candidates scored")
+    n_scored = int((df["protein_colocalization"] != 0).sum())
+    logger.info(
+        f"Co-localization: {len(valid_mzs)} valid features, "
+        f"{len(pairs) if len(pairs) > 0 else 0} within-protein pairs, "
+        f"{n_scored}/{len(df)} candidates scored"
+    )
     return df
 
 
@@ -882,13 +928,14 @@ def compute_isotopologue_colocalization(
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
     ppm_tolerance: float = 10.0,
+    _corr_cache: tuple | None = None,
 ) -> pd.DataFrame:
     """
     Pearson r between the M0 ion image and the M+1 / M+2 ion images (E1).
 
-    For each MALDI feature at m/z M, looks up ion images at M + NEUTRON and
-    M + 2*NEUTRON within ``ppm_tolerance``. The correlation is a per-feature
-    scalar broadcast to all candidates.
+    Builds the full feature correlation matrix once via a single BLAS call,
+    then uses vectorized searchsorted to locate M+1/M+2 partners.  No per-
+    feature corrcoef calls or Python loops over features.
 
     Features added
     --------------
@@ -896,61 +943,39 @@ def compute_isotopologue_colocalization(
     isotope_image_colocalization_m2     Pearson r(M0, M+2)
     isotope_image_colocalization_mean   mean of available correlations
     """
-    mz_arr = np.asarray(ion_image_mzs, dtype=float)
+    if _corr_cache is not None:
+        corr_matrix, valid_mz_arr, mz_to_idx = _corr_cache
+    else:
+        corr_matrix, valid_mz_arr, mz_to_idx = _pearson_r_matrix(ion_images, ion_image_mzs)
+    n_valid = len(valid_mz_arr)
 
-    # Pre-flatten and cache only images with non-zero variance
-    flat_cache: dict[float, np.ndarray] = {}
-    for i, mz in enumerate(mz_arr):
-        flat = ion_images[i].flatten().astype(np.float64)
-        if flat.std() > 1e-10:
-            flat_cache[float(mz)] = flat
+    # Vectorized partner lookup: all features at once
+    self_idx = np.arange(n_valid, dtype=np.intp)
+    m1_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + NEUTRON,         ppm_tolerance)
+    m2_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + 2.0 * NEUTRON,  ppm_tolerance)
 
-    r_m1_map: dict[float, float] = {}
-    r_m2_map: dict[float, float] = {}
-    r_mean_map: dict[float, float] = {}
+    r_m1_arr   = np.where(m1_idx >= 0, corr_matrix[self_idx, np.clip(m1_idx, 0, n_valid - 1)], np.nan)
+    r_m2_arr   = np.where(m2_idx >= 0, corr_matrix[self_idx, np.clip(m2_idx, 0, n_valid - 1)], np.nan)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        r_mean_arr = np.nanmean(np.stack([r_m1_arr, r_m2_arr], axis=1), axis=1)
 
-    for feat_mz in df["feature_mz"].unique():
-        feat_mz_f = float(feat_mz)
-        if feat_mz_f not in flat_cache:
-            continue
-        flat_m0 = flat_cache[feat_mz_f]
-
-        def _find_key(target: float) -> float | None:
-            ppm = np.abs(mz_arr - target) / target * 1e6
-            idx = int(np.argmin(ppm))
-            return float(mz_arr[idx]) if ppm[idx] <= ppm_tolerance else None
-
-        rs: list[float] = []
-        r_m1 = float("nan")
-        r_m2 = float("nan")
-
-        key_m1 = _find_key(feat_mz_f + NEUTRON)
-        if key_m1 is not None and key_m1 in flat_cache:
-            r_m1 = float(np.corrcoef(flat_m0, flat_cache[key_m1])[0, 1])
-            rs.append(r_m1)
-
-        key_m2 = _find_key(feat_mz_f + 2.0 * NEUTRON)
-        if key_m2 is not None and key_m2 in flat_cache:
-            r_m2 = float(np.corrcoef(flat_m0, flat_cache[key_m2])[0, 1])
-            rs.append(r_m2)
-
-        r_m1_map[feat_mz_f] = r_m1
-        r_m2_map[feat_mz_f] = r_m2
-        r_mean_map[feat_mz_f] = float(np.nanmean(rs)) if rs else float("nan")
+    r_m1_map   = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_m1_arr)}
+    r_m2_map   = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_m2_arr)}
+    r_mean_map = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_mean_arr)}
 
     for col, mapping in [
-        ("isotope_image_colocalization_m1", r_m1_map),
-        ("isotope_image_colocalization_m2", r_m2_map),
+        ("isotope_image_colocalization_m1",   r_m1_map),
+        ("isotope_image_colocalization_m2",   r_m2_map),
         ("isotope_image_colocalization_mean", r_mean_map),
     ]:
         df[col] = df["feature_mz"].map(mapping)
         valid = df[col].dropna()
         df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
 
-    logger.info(
-        f"Isotopologue colocalization (E1): {sum(not np.isnan(v) for v in r_m1_map.values())} "
-        f"features with M+1 image"
-    )
+    n_m1 = int((m1_idx >= 0).sum())
+    logger.info(f"Isotopologue colocalization (E1): {n_m1}/{n_valid} features with M+1 image")
     return df
 
 
@@ -963,9 +988,13 @@ def compute_adduct_colocalization(
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
     ppm_tolerance: float = 10.0,
+    _corr_cache: tuple | None = None,
 ) -> pd.DataFrame:
     """
     Pearson r between the M0 ion image and Na/K/CHCA adduct ion images (E2).
+
+    Builds the full feature correlation matrix once, then uses vectorized
+    searchsorted to locate adduct partners for all features simultaneously.
 
     Features added
     --------------
@@ -973,33 +1002,23 @@ def compute_adduct_colocalization(
     adduct_colocalization_k     Pearson r with [M+K]+ image
     adduct_colocalization_chca  Pearson r with [M+CHCA+H-H2O]+ image
     """
-    mz_arr = np.asarray(ion_image_mzs, dtype=float)
+    if _corr_cache is not None:
+        corr_matrix, valid_mz_arr, mz_to_idx = _corr_cache
+    else:
+        corr_matrix, valid_mz_arr, mz_to_idx = _pearson_r_matrix(ion_images, ion_image_mzs)
+    n_valid = len(valid_mz_arr)
+    self_idx = np.arange(n_valid, dtype=np.intp)
 
-    flat_cache: dict[float, np.ndarray] = {}
-    for i, mz in enumerate(mz_arr):
-        flat = ion_images[i].flatten().astype(np.float64)
-        if flat.std() > 1e-10:
-            flat_cache[float(mz)] = flat
-
-    results: dict[str, dict[float, float]] = {name: {} for name in _ADDUCT_DELTAS}
-
-    for feat_mz in df["feature_mz"].unique():
-        feat_mz_f = float(feat_mz)
-        if feat_mz_f not in flat_cache:
-            continue
-        flat_m0 = flat_cache[feat_mz_f]
-
-        for adduct_name, delta in _ADDUCT_DELTAS.items():
-            target = feat_mz_f + delta
-            ppm = np.abs(mz_arr - target) / target * 1e6
-            idx = int(np.argmin(ppm))
-            if ppm[idx] <= ppm_tolerance and float(mz_arr[idx]) in flat_cache:
-                r = float(np.corrcoef(flat_m0, flat_cache[float(mz_arr[idx])])[0, 1])
-                results[adduct_name][feat_mz_f] = r
-
-    for adduct_name in _ADDUCT_DELTAS:
+    for adduct_name, delta in _ADDUCT_DELTAS.items():
+        partner_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + delta, ppm_tolerance)
+        r_arr = np.where(
+            partner_idx >= 0,
+            corr_matrix[self_idx, np.clip(partner_idx, 0, n_valid - 1)],
+            np.nan,
+        )
+        mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
         col = f"adduct_colocalization_{adduct_name}"
-        df[col] = df["feature_mz"].map(results[adduct_name])
+        df[col] = df["feature_mz"].map(mapping)
         valid = df[col].dropna()
         df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
 
@@ -1010,95 +1029,161 @@ def compute_adduct_colocalization(
 # E5/E6 — Moran's I and Geary's C (full spatial autocorrelation)
 # ---------------------------------------------------------------------------
 
+def _neighbor_sum_batch(imgs: np.ndarray) -> np.ndarray:
+    """
+    Queen's-contiguity (8-neighbour) sum for a batch of images.
+
+    Parameters
+    ----------
+    imgs : (n, H, W) float64 — zero-boundary padding assumed.
+
+    Returns
+    -------
+    (n, H, W) float64 — for each pixel, sum of its up-to-8 neighbours.
+    """
+    _, H, W = imgs.shape
+    pad = np.pad(imgs, ((0, 0), (1, 1), (1, 1)), mode="constant", constant_values=0.0)
+    result = (
+        pad[:, 0:H,   0:W  ]
+        + pad[:, 0:H,   1:W+1]
+        + pad[:, 0:H,   2:W+2]
+        + pad[:, 1:H+1, 0:W  ]
+        + pad[:, 1:H+1, 2:W+2]
+        + pad[:, 2:H+2, 0:W  ]
+        + pad[:, 2:H+2, 1:W+1]
+        + pad[:, 2:H+2, 2:W+2]
+    )
+    return result
+
+
+def _morans_gearys_chunk(
+    chunk_images: np.ndarray,
+    neighbor_counts: np.ndarray,
+    N: int,
+    W_sum: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Moran's I and Geary's C for a batch of images.
+
+    Module-level so ``ThreadPoolExecutor`` can pickle it.  Uses float32
+    throughout (except final sums, which accumulate in float64) to halve
+    memory bandwidth vs float64 arrays.
+
+    Parameters
+    ----------
+    chunk_images : (c, H, W) float32
+    neighbor_counts : (H, W) float32 — precomputed queen-contiguity degree map
+    N : int — total number of pixels (H * W)
+    W_sum : float — sum of all edge weights
+
+    Returns
+    -------
+    morans : (c,) float64
+    gearys : (c,) float64
+    """
+    imgs = chunk_images.astype(np.float32)
+    x_bar = imgs.mean(axis=(1, 2), keepdims=True)
+    z = imgs - x_bar
+    z_sq = (z * z).sum(axis=(1, 2), dtype=np.float64)
+
+    ok = z_sq > 1e-12
+    morans = np.zeros(len(imgs), dtype=np.float64)
+    gearys = np.ones(len(imgs), dtype=np.float64)
+
+    if not ok.any():
+        return morans, gearys
+
+    Wz = _neighbor_sum_batch(z)
+    numerators_m = (z * Wz).sum(axis=(1, 2), dtype=np.float64)
+    morans = np.where(ok, (N / W_sum) * numerators_m / np.where(ok, z_sq, 1.0), 0.0)
+
+    Wx = _neighbor_sum_batch(imgs)
+    xTDx = (imgs * imgs * neighbor_counts).sum(axis=(1, 2), dtype=np.float64)
+    xTWx = (imgs * Wx).sum(axis=(1, 2), dtype=np.float64)
+    gearys = np.where(
+        ok,
+        ((N - 1) / W_sum) * (xTDx - xTWx) / np.where(ok, z_sq, 1.0),
+        1.0,
+    )
+    return morans, gearys
+
+
 def compute_spatial_autocorrelation_full(
     df: pd.DataFrame,
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
+    chunk_size: int = 200,
+    n_workers: int | None = None,
 ) -> pd.DataFrame:
     """
     Compute Moran's I and Geary's C for each MALDI feature ion image (E5/E6).
 
-    Uses queen contiguity (8-neighbour) weights computed via 2-D convolution
-    with a 3×3 kernel — avoids building a large sparse matrix. Results are
-    per-feature scalars broadcast to all candidates.
+    Replaces the per-feature scipy.signal.convolve2d loop with a batched
+    numpy 8-neighbour sum over all features simultaneously.  Features are
+    processed in chunks of ``chunk_size`` and chunks are dispatched to a
+    thread pool (numpy releases the GIL for large array ops, so threads run
+    in parallel without pickling overhead).
 
     Features added
     --------------
     spatial_morans_i    Moran's I (positive = clustered, negative = dispersed)
     spatial_gearys_c    Geary's C (< 1 clustered, ≈ 1 random, > 1 dispersed)
-
-    Requires scipy. Silently skips if not installed.
     """
-    try:
-        from scipy.signal import convolve2d
-    except ImportError:
-        logger.debug("scipy not installed — skipping Moran's I / Geary's C (E5/E6)")
-        return df
-
     if ion_images is None or len(ion_images) == 0:
         return df
 
     _, height, width = ion_images.shape
     N = height * width
 
-    # Queen neighbourhood kernel (3×3, centre = 0)
-    kernel = np.ones((3, 3), dtype=float)
-    kernel[1, 1] = 0.0
-
-    # Neighbour counts per pixel (precomputed — same for all images)
-    neighbor_counts = convolve2d(
-        np.ones((height, width), dtype=float),
-        kernel,
-        mode="same",
-        boundary="fill",
-        fillvalue=0,
-    ).flatten()
+    # Precompute neighbour counts per pixel — same for all features.
+    ones = np.ones((1, height, width), dtype=np.float32)
+    neighbor_counts = _neighbor_sum_batch(ones)[0]  # (H, W) float32
     W_sum = float(neighbor_counts.sum())
 
-    mz_arr = np.asarray(ion_image_mzs, dtype=float)
-    mz_to_idx = {float(mz): i for i, mz in enumerate(mz_arr)}
+    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+    mz_to_img_idx = {float(mz): i for i, mz in enumerate(mz_arr)}
 
-    morans_map: dict[float, float] = {}
-    gearys_map: dict[float, float] = {}
+    unique_feat_mzs = df["feature_mz"].unique()
+    feat_img_indices = np.array(
+        [mz_to_img_idx[float(mz)] for mz in unique_feat_mzs if float(mz) in mz_to_img_idx],
+        dtype=np.intp,
+    )
+    feat_mzs_used = np.array(
+        [float(mz) for mz in unique_feat_mzs if float(mz) in mz_to_img_idx],
+        dtype=np.float64,
+    )
+    n_feat = len(feat_img_indices)
 
-    for feat_mz in df["feature_mz"].unique():
-        feat_mz_f = float(feat_mz)
-        idx = mz_to_idx.get(feat_mz_f)
-        if idx is None:
-            continue
+    import os
+    from concurrent.futures import ThreadPoolExecutor
 
-        img = ion_images[idx].astype(float)
-        x = img.flatten()
-        x_bar = float(x.mean())
-        z = x - x_bar
-        z_sq_sum = float(z @ z)
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
 
-        if z_sq_sum < 1e-12 or W_sum < 1.0:
-            morans_map[feat_mz_f] = 0.0
-            gearys_map[feat_mz_f] = 1.0
-            continue
+    morans_vals = np.zeros(n_feat, dtype=np.float64)
+    gearys_vals = np.ones(n_feat, dtype=np.float64)
 
-        # Σⱼ wᵢⱼ zⱼ for each pixel i
-        Wz = convolve2d(
-            z.reshape(height, width), kernel, mode="same", boundary="fill", fillvalue=0
-        ).flatten()
+    # Build chunk list
+    chunks = [
+        (start, min(start + chunk_size, n_feat))
+        for start in range(0, n_feat, chunk_size)
+    ]
 
-        # Moran's I = (N / W) * (z^T W z) / (z^T z)
-        morans_map[feat_mz_f] = float((N / W_sum) * (z @ Wz) / z_sq_sum)
+    def _process_chunk(start_end):
+        start, end = start_end
+        chunk_imgs = ion_images[feat_img_indices[start:end]]
+        return start, end, _morans_gearys_chunk(chunk_imgs, neighbor_counts, N, W_sum)
 
-        # Geary's C = ((N-1) / W) * (x^T(D-W)x) / (z^T z)
-        # where (D-W)x = row_sums * x - W*x
-        Wx = convolve2d(
-            x.reshape(height, width), kernel, mode="same", boundary="fill", fillvalue=0
-        ).flatten()
-        xTDx = float(np.dot(x ** 2, neighbor_counts))
-        xTWx = float(x @ Wx)
-        gearys_map[feat_mz_f] = float(((N - 1) / W_sum) * (xTDx - xTWx) / z_sq_sum)
+    with ThreadPoolExecutor(max_workers=min(n_workers, len(chunks))) as pool:
+        for start, end, (m, g) in pool.map(_process_chunk, chunks):
+            morans_vals[start:end] = m
+            gearys_vals[start:end] = g
+
+    morans_map = dict(zip(feat_mzs_used, morans_vals))
+    gearys_map = dict(zip(feat_mzs_used, gearys_vals))
 
     df["spatial_morans_i"] = df["feature_mz"].map(morans_map).fillna(0.0)
     df["spatial_gearys_c"] = df["feature_mz"].map(gearys_map).fillna(1.0)
 
-    logger.info(
-        f"Spatial autocorrelation (E5/E6): computed for {len(morans_map)} features"
-    )
+    logger.info(f"Spatial autocorrelation (E5/E6): computed for {n_feat} features")
     return df

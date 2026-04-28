@@ -12,6 +12,7 @@ import pandas as pd
 from psm_utils import PSM, PSMList, Peptidoform
 
 from ms1rescore.maldi_features import (
+    _pearson_r_matrix,
     compute_adduct_colocalization,
     compute_calibrated_ppm_features,
     compute_candidate_ambiguity_features,
@@ -316,6 +317,7 @@ def compute_all_features(
 
     # --- B: IM2Deep CCS features (optional) ---
     if observed_ccs_per_feature is not None:
+        logger.debug("Computing IM2Deep CCS features (B-group) using observed CCS values")
         df = compute_im2deep_features(
             df,
             observed_ccs_per_feature=observed_ccs_per_feature,
@@ -325,17 +327,23 @@ def compute_all_features(
 
     # --- Spatial (optional) ---
     if spatial_features is not None:
+        logger.debug("Computing spatial features (A3/A4) using pre-computed spatial_features DataFrame")
         df = compute_spatial_features(df, spatial_features)
 
     # --- Ion-image-based features (optional) ---
     if ion_images is not None and ion_image_mzs is not None:
-        df = compute_colocalization_features(df, ion_images, ion_image_mzs)
-        df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs)  # E1
-        df = compute_adduct_colocalization(df, ion_images, ion_image_mzs)        # E2
-        df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs) # E5/E6
+        logger.debug("Computing ion-image-based features (co-localization, full spatial autocorrelation, etc.) using ion_images and ion_image_mzs")
+        # Compute the full Pearson correlation matrix once (single BLAS call) and
+        # share it across all three colocalization functions to avoid 3× redundant work.
+        corr_cache = _pearson_r_matrix(ion_images, ion_image_mzs)
+        df = compute_colocalization_features(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)
+        df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)  # E1
+        df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)        # E2
+        df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs)                         # E5/E6
 
     # --- Envelope similarity MALDI vs LC-MS/MS (optional) ---
     if maldi_envelopes is not None and lcms_envelopes is not None:
+        logger.debug("Computing envelope similarity features (MALDI vs LC-MS/MS) using pre-computed envelopes")
         df = compute_envelope_similarity(df, maldi_envelopes, lcms_envelopes)
 
     return df
