@@ -270,14 +270,16 @@ def compute_all_features(
 
     # --- LC-MS/MS mzML evidence (pre-computed per candidate) ---
     if lcms_evidence is not None:
-        for feat in _LCMS_MZML_FEATURES:
-            df[feat] = df.index.map(
-                lambda idx: lcms_evidence.get(idx, {}).get(feat, 0.0)
-            )
+        # Build a DataFrame from the evidence dict and join on candidate index —
+        # avoids a Python lambda over 707K rows × n_features.
+        ev_df = pd.DataFrame.from_dict(lcms_evidence, orient="index", dtype=float)
+        ev_df = ev_df.reindex(columns=_LCMS_MZML_FEATURES)
+        df = df.join(ev_df, how="left")
+        df[_LCMS_MZML_FEATURES] = df[_LCMS_MZML_FEATURES].fillna(0.0)
         for feat in ["lcms_rt_residual", "lcms_ms1_isotope_cosine"]:
-            valid = df[feat].dropna()
-            fill = valid.median() if len(valid) > 0 else 0.0
-            df[feat] = df[feat].fillna(fill)
+            valid = df[feat].replace(0.0, np.nan).dropna()
+            fill = float(valid.median()) if len(valid) > 0 else 0.0
+            df[feat] = df[feat].replace(0.0, fill)
     else:
         for feat in _LCMS_MZML_FEATURES:
             df[feat] = 0.0
@@ -309,6 +311,7 @@ def compute_all_features(
 
     # --- A3: LOWESS ppm calibration (optional) ---
     if pixel_coords is not None:
+        logger.debug("Computing LOWESS ppm calibration features (A3) using pixel coordinates")
         df = compute_calibrated_ppm_features(df, maldi_mzs=maldi_mzs, pixel_coords=pixel_coords)
 
     # --- B: IM2Deep CCS features (optional) ---

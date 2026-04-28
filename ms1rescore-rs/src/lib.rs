@@ -1,4 +1,5 @@
 mod digest;
+mod features;
 mod isotope;
 mod spectral;
 mod xic;
@@ -109,6 +110,42 @@ fn match_mz(
     digest::match_mz_batch(&maldi_mzs, &peptide_mzs, ppm_tolerance)
 }
 
+/// Compute ionization features for unique peptide sequences (parallel).
+///
+/// Args:
+///     sequences: List of unique peptide sequences.
+///
+/// Returns:
+///     (n_R, n_K, n_H, n_F, n_W, n_Y, gravy, peptide_pi) — 8 arrays aligned with input.
+#[pyfunction]
+fn compute_ionization_features(
+    sequences: Vec<String>,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f64>, Vec<f64>) {
+    features::ionization_features_batch(&sequences)
+}
+
+/// Compute property features for unique peptide sequences (parallel).
+///
+/// Args:
+///     sequences: List of unique peptide sequences.
+///
+/// Returns:
+///     (n_D, n_E, n_C, n_P, n_M, n_W, n_Y, seq_len, nterm_code, peptide_pi) — 10 arrays.
+///     nterm_code: ASCII code of first residue as i32 (0 for empty sequence).
+#[pyfunction]
+fn compute_property_features(
+    sequences: Vec<String>,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f64>) {
+    features::property_features_batch(&sequences)
+}
+
+/// Count missed cleavages (K/R not followed by P, excluding last residue) for
+/// a list of sequences in parallel.
+#[pyfunction]
+fn count_missed_cleavages_batch(sequences: Vec<String>) -> Vec<i32> {
+    features::missed_cleavages_batch(&sequences)
+}
+
 #[pymodule]
 fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_xics_batch, m)?)?;
@@ -116,5 +153,8 @@ fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_ms1_envelopes_batch, m)?)?;
     m.add_function(wrap_pyfunction!(compute_peptide_masses, m)?)?;
     m.add_function(wrap_pyfunction!(match_mz, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_ionization_features, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_property_features, m)?)?;
+    m.add_function(wrap_pyfunction!(count_missed_cleavages_batch, m)?)?;
     Ok(())
 }
