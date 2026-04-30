@@ -18,22 +18,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _make_peak_config(args):
-    """Build an ``MSIPeakConfig`` from parsed CLI arguments."""
-    from ms1rescore.maldi_extraction import MSIPeakConfig
-
-    return MSIPeakConfig(
-        sg_window=args.sg_window,
-        sg_polyorder=args.sg_polyorder,
-        peak_prominence=args.peak_prominence,
-        ppm_bin=args.ppm_bin,
-        min_fraction=args.min_fraction,
-        extraction_ppm=args.extraction_ppm,
-        min_intensity=args.min_intensity,
-        visualize=args.msi_visualize,
-    )
-
-
 def _load_maldi(
     npz_path: str | None,
     mzs_path: str | None,
@@ -237,19 +221,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--maldi-imzml",
         metavar="PATH",
         help=(
-            "imzML file (.imzML + .ibd). Peak picking, cross-spectrum "
-            "alignment, and ion image assembly are performed automatically. "
-            "Profile data is smoothed with Savitzky-Golay before peak picking; "
-            "centroid data is used as-is."
+            "imzML file (.imzML + .ibd). SCiLS Lab-style interval-based "
+            "feature extraction is performed automatically. Ion images and "
+            "spatial features are computed and optionally saved."
         ),
     )
 
-    # --- Raw / imzML extraction parameters ---
+    # --- Raw extraction parameters ---
     raw_grp = parser.add_argument_group(
-        "raw MALDI extraction (--maldi-raw and --maldi-imzml)",
+        "raw MALDI extraction (--maldi-raw only)",
         description=(
             "Parameters for feature detection and ion image extraction when "
-            "starting from raw data (Bruker .d or imzML)."
+            "starting from a raw Bruker .d directory."
         ),
     )
     raw_grp.add_argument(
@@ -307,58 +290,6 @@ def build_parser() -> argparse.ArgumentParser:
             "(columns: feature_mz, n_pixels_detected, fraction_detected, "
             "mean_intensity, intensity_p90, intensity_sum, "
             "spatial_autocorrelation, intensity_cv)."
-        ),
-    )
-
-    # --- MSI peak picking parameters ---
-    peak_grp = parser.add_argument_group(
-        "MSI peak picking (profile-mode --maldi-raw and --maldi-imzml)",
-        description=(
-            "Savitzky-Golay smoothing and peak detection parameters, applied "
-            "per spectrum when the data is in profile mode. Ignored for "
-            "centroid-mode Bruker .d files (default for timsTOF)."
-        ),
-    )
-    peak_grp.add_argument(
-        "--sg-window",
-        type=int,
-        default=11,
-        metavar="INT",
-        help="Savitzky-Golay window length (must be odd and ≥ 3). Default: 11.",
-    )
-    peak_grp.add_argument(
-        "--sg-polyorder",
-        type=int,
-        default=3,
-        metavar="INT",
-        help="Savitzky-Golay polynomial order. Default: 3.",
-    )
-    peak_grp.add_argument(
-        "--peak-prominence",
-        type=float,
-        default=0.01,
-        metavar="FLOAT",
-        help=(
-            "Minimum peak prominence as a fraction of the local maximum "
-            "intensity. Default: 0.01 (1%%)."
-        ),
-    )
-    peak_grp.add_argument(
-        "--min-intensity",
-        type=float,
-        default=0.0,
-        metavar="FLOAT",
-        help=(
-            "Per-pixel intensity floor; peaks below this threshold are "
-            "discarded before ion image assembly. Default: 0.0 (keep all)."
-        ),
-    )
-    peak_grp.add_argument(
-        "--msi-visualize",
-        action="store_true",
-        help=(
-            "Save diagnostic PNG plots (m/z histogram, spatial stats "
-            "distributions, ion image mosaic) to the output directory."
         ),
     )
 
@@ -571,7 +502,6 @@ def main() -> None:
             "prior features only, not for feature selection."
         )
         logger.info(f"Extracting MALDI features from raw data: {args.maldi_raw}")
-        cfg = _make_peak_config(args)
         maldi_mzs, ion_images, spatial_features = extract_maldi_data(
             args.maldi_raw,
             ppm_bin=args.ppm_bin,
@@ -582,7 +512,6 @@ def main() -> None:
             output_spatial_tsv=args.save_spatial,
             output_dir=args.output_dir,
             verbose=args.verbose,
-            config=cfg,
         )
         ion_image_mzs = maldi_mzs if ion_images is not None else None
         logger.info(
@@ -590,27 +519,26 @@ def main() -> None:
             + (f", ion image shape: {ion_images.shape[1:]}" if ion_images is not None else "")
         )
     elif args.maldi_imzml:
-        from ms1rescore.maldi_extraction import extract_imzml_data
+        from ms1rescore.maldi_imzml import SCiLSConfig, extract_scils_features
 
         logger.info(
-            "MALDI features extracted from imzML data. "
+            "MALDI features extracted from imzML data (SCiLS Lab-style interval extraction). "
             "LC-MS/MS identifications will be used for candidate generation and "
             "prior features only, not for feature selection."
         )
         logger.info(f"Extracting MALDI features from imzML: {args.maldi_imzml}")
-        cfg = _make_peak_config(args)
-        maldi_mzs, ion_images, spatial_features = extract_imzml_data(
+        cfg = SCiLSConfig()
+        intervals, intensity_matrix, pixel_coords = extract_scils_features(
             args.maldi_imzml,
             config=cfg,
-            output_npz=getattr(args, "save_npz", None),
-            output_spatial_tsv=getattr(args, "save_spatial", None),
             output_dir=args.output_dir,
-            verbose=args.verbose,
+            visualize=False,
         )
-        ion_image_mzs = maldi_mzs
-        logger.info(
-            f"  {len(maldi_mzs)} features extracted, ion image shape: {ion_images.shape[1:]}"
-        )
+        maldi_mzs = np.array([apex for _, _, apex in intervals])
+        ion_images = None
+        ion_image_mzs = None
+        spatial_features = None
+        logger.info(f"  {len(maldi_mzs)} intervals extracted")
     else:
         maldi_mzs, ion_images, ion_image_mzs = _load_maldi(
             args.maldi_npz, args.maldi_mzs
