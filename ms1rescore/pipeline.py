@@ -377,7 +377,7 @@ def rescore(
         if verbose:
             logger.debug("Writing parsed LC-MS/MS IDs to debug_lcms_ids.tsv")
             lcms_ids.peptides.to_csv(
-                f"{output_dir}/debug_lcms_ids.tsv", sep="\t", index=False
+                f"{output_dir}/5_debug_lcms_ids.tsv", sep="\t", index=False
             )
         peptide_db = digest_identified_proteins(
             fasta_path,
@@ -388,10 +388,10 @@ def rescore(
         )
         if verbose:
             logger.debug(
-                f"Writing digested peptide database from identified proteins to {output_dir}/debug_peptide_db.tsv"
+                f"Writing digested peptide database from identified proteins to {output_dir}/6_debug_peptide_db.tsv"
             )
             pd.DataFrame(peptide_db).to_csv(
-                f"{output_dir}/debug_peptide_db.tsv", sep="\t", index=False
+                f"{output_dir}/6_debug_peptide_db.tsv", sep="\t", index=False
             )
         if len(peptide_db) == 0:
             logger.warning(
@@ -406,10 +406,10 @@ def rescore(
             )
             if verbose:
                 logger.debug(
-                    f"Writing digested peptide database from full FASTA to {output_dir}/debug_peptide_db_full.tsv"
+                    f"Writing digested peptide database from full FASTA to {output_dir}/7_debug_peptide_db_full.tsv"
                 )
                 pd.DataFrame(peptide_db).to_csv(
-                    f"{output_dir}/debug_peptide_db_full.tsv", sep="\t", index=False
+                    f"{output_dir}/7_debug_peptide_db_full.tsv", sep="\t", index=False
                 )
     else:
         logger.info("Step 1: Strategy A — digesting full FASTA...")
@@ -422,10 +422,10 @@ def rescore(
         )
         if verbose:
             logger.debug(
-                f"Writing digested peptide database from full FASTA to {output_dir}/debug_peptide_db_full.tsv"
+                f"Writing digested peptide database from full FASTA to {output_dir}/8_debug_peptide_db_full.tsv"
             )
             pd.DataFrame(peptide_db).to_csv(
-                f"{output_dir}/debug_peptide_db_full.tsv", sep="\t", index=False
+                f"{output_dir}/8_debug_peptide_db_full.tsv", sep="\t", index=False
             )
 
     maldi_intensities = None
@@ -451,8 +451,8 @@ def rescore(
         maldi_intensities_sum=maldi_intensities_sum,
     )
     if verbose:
-        logger.debug(f"Writing matched candidates to {output_dir}/debug_candidates.tsv")
-        candidates.to_csv(f"{output_dir}/debug_candidates.tsv", sep="\t", index=False)
+        logger.debug(f"Writing matched candidates to {output_dir}/9_debug_candidates.tsv")
+        candidates.to_csv(f"{output_dir}/9_debug_candidates.tsv", sep="\t", index=False)
 
     if len(candidates) == 0:
         raise ValueError("No candidates matched any MALDI features")
@@ -468,8 +468,8 @@ def rescore(
     lcms_data = load_lcms_data(mzml_paths, cache_path=_cache("lcms_data.pkl"))
     # Write to file in human-readable format for debugging (in case of issues with the LC-MS/MS loading)
     if verbose:
-        logger.debug(f"Writing LC-MS/MS data to {output_dir}/debug_lcms_data.pkl")
-        with open(f"{output_dir}/debug_lcms_data.pkl", "wb") as f:
+        logger.debug(f"Writing LC-MS/MS data to {output_dir}/10_debug_lcms_data.pkl")
+        with open(f"{output_dir}/10_debug_lcms_data.pkl", "wb") as f:
             pickle.dump(lcms_data, f)
 
     # --- Step 3: MS2PIP predictions ---
@@ -533,10 +533,10 @@ def rescore(
 
     if verbose:
         logger.debug(
-            f"Writing LC-MS/MS evidence to {output_dir}/debug_lcms_evidence.tsv"
+            f"Writing LC-MS/MS evidence to {output_dir}/11_debug_lcms_evidence.tsv"
         )
         pd.DataFrame(lcms_evidence).to_csv(
-            f"{output_dir}/debug_lcms_evidence.tsv", sep="\t", index=False
+            f"{output_dir}/11_debug_lcms_evidence.tsv", sep="\t", index=False
         )
 
     # --- Step 6: Extract LC-MS/MS envelopes from XIC best scans ---
@@ -548,8 +548,8 @@ def rescore(
         unique_feature_mzs = candidates["feature_mz"].unique()
         xic_cache = extract_all_xics(unique_feature_mzs, lcms_data, ppm_tolerance)
         if verbose:
-            logger.debug(f"Writing extracted XICs to {output_dir}/debug_xic_cache.pkl")
-            with open(f"{output_dir}/debug_xic_cache.pkl", "wb") as f:
+            logger.debug(f"Writing extracted XICs to {output_dir}/12_debug_xic_cache.pkl")
+            with open(f"{output_dir}/12_debug_xic_cache.pkl", "wb") as f:
                 pickle.dump(xic_cache, f)
         lcms_envelopes_xic = {}
         for mz in unique_feature_mzs:
@@ -576,8 +576,8 @@ def rescore(
         lcms_envelopes=lcms_envelopes_xic,
     )
     if verbose:
-        logger.debug(f"Writing computed features to {output_dir}/debug_features.tsv")
-        features_df.to_csv(f"{output_dir}/debug_features.tsv", sep="\t", index=False)
+        logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
+        features_df.to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
@@ -597,10 +597,10 @@ def rescore(
     psm_list = candidates_to_psm_list(features_df)
     if verbose:
         logger.debug(
-            f"Writing PSM list to {output_dir}/debug_psm_list.pkl for mokapot input"
+            f"Writing PSM list to {output_dir}/14_debug_psm_list.pkl for mokapot input"
         )
         psm_list_df = psm_list.to_dataframe()
-        psm_list_df.to_csv(f"{output_dir}/debug_psm_list.tsv", sep="\t", index=False)
+        psm_list_df.to_csv(f"{output_dir}/14_debug_psm_list.tsv", sep="\t", index=False)
 
     populate_psm_features(psm_list, features_df, feature_names)
 
@@ -616,11 +616,11 @@ def rescore(
         populate_psm_features(psm_list, features_df, intrinsic_present)
         if verbose:
             logger.debug(
-                f"Writing PSM list with intrinsic features to {output_dir}/debug_psm_list_after_intrinsic.pkl for mokapot input"
+                f"Writing PSM list with intrinsic features to {output_dir}/14_debug_psm_list_after_intrinsic.pkl for mokapot input"
             )
             psm_list_intrinsic_df = psm_list.to_dataframe()
             psm_list_intrinsic_df.to_csv(
-                f"{output_dir}/debug_psm_list_after_intrinsic.tsv",
+                f"{output_dir}/14_debug_psm_list_after_intrinsic.tsv",
                 sep="\t",
                 index=False,
             )
@@ -629,12 +629,12 @@ def rescore(
         )
         if verbose:
             logger.debug(
-                f"Writing mokapot confidence object and scores to {output_dir}/debug_mokapot_conf.pkl"
+                f"Writing mokapot confidence object and scores to {output_dir}/15_debug_mokapot_conf.pkl"
             )
-            with open(f"{output_dir}/debug_mokapot_conf.pkl", "wb") as f:
+            with open(f"{output_dir}/15_debug_mokapot_conf.pkl", "wb") as f:
                 pickle.dump(conf_obj, f)
             # all_scores may be None if score extraction fails; write an empty array in that case for debugging
-            with open(f"{output_dir}/debug_mokapot_scores.pkl", "wb") as f:
+            with open(f"{output_dir}/15_debug_mokapot_scores.pkl", "wb") as f:
                 pickle.dump(all_scores if all_scores is not None else np.array([]), f)
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
@@ -701,9 +701,9 @@ def rescore(
         )
         if verbose:
             logger.debug(
-                f"Writing CatBoost scores to {output_dir}/debug_catboost_scores.pkl"
+                f"Writing CatBoost scores to {output_dir}/16_debug_catboost_scores.pkl"
             )
-            with open(f"{output_dir}/debug_catboost_scores.pkl", "wb") as f:
+            with open(f"{output_dir}/16_debug_catboost_scores.pkl", "wb") as f:
                 pickle.dump(scores, f)
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
@@ -711,9 +711,9 @@ def rescore(
 
         if verbose:
             logger.debug(
-                f"Writing CatBoost q-values to {output_dir}/debug_catboost_qvalues.pkl"
+                f"Writing CatBoost q-values to {output_dir}/16_debug_catboost_qvalues.pkl"
             )
-            with open(f"{output_dir}/debug_catboost_qvalues.pkl", "wb") as f:
+            with open(f"{output_dir}/16_debug_catboost_qvalues.pkl", "wb") as f:
                 pickle.dump(q_values, f)
 
         # LC-MS/MS prior reweight
@@ -723,9 +723,9 @@ def rescore(
 
         if verbose:
             logger.debug(
-                f"Writing reweighted CatBoost q-values to {output_dir}/debug_catboost_reweighted_qvalues.pkl"
+                f"Writing reweighted CatBoost q-values to {output_dir}/16_debug_catboost_reweighted_qvalues.pkl"
             )
-            with open(f"{output_dir}/debug_catboost_reweighted_qvalues.pkl", "wb") as f:
+            with open(f"{output_dir}/16_debug_catboost_reweighted_qvalues.pkl", "wb") as f:
                 pickle.dump(reweighted_q, f)
 
         result_df = pd.DataFrame(

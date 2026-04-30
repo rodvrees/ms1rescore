@@ -11,72 +11,124 @@ All three are orchestrated by extract_maldi_data(), which is the public entry po
 
 import logging
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from scipy.signal import find_peaks, savgol_filter
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Feature detection
+# Peak picking configuration
 # ---------------------------------------------------------------------------
 
 
-def detect_features(
-    reader,
-    ppm_bin: float = 5.0,
-    min_fraction: float = 0.01,
+@dataclass
+class MSIPeakConfig:
+    """
+    Configuration for per-spectrum peak picking and cross-spectrum alignment.
+
+    Used by both the Bruker .d path (profile mode) and the imzML path.
+    Centroid data does not require peak picking; pass ``config=None`` to
+    ``detect_features`` for centroid Bruker data (the default).
+    """
+
+    # Savitzky-Golay smoothing (profile mode only)
+    sg_window: int = 11
+    sg_polyorder: int = 3
+    # Minimum peak prominence as a fraction of the local maximum intensity
+    peak_prominence: float = 0.01
+
+    # Cross-spectrum alignment (same semantics as detect_features params)
+    ppm_bin: float = 5.0
+    min_fraction: float = 0.01
+
+    # Ion image assembly
+    extraction_ppm: float = 25.0
+    # Per-pixel intensity floor; peaks below this are ignored (0 = keep all)
+    min_intensity: float = 0.0
+
+    # If True, save diagnostic PNG plots alongside extracted outputs
+    visualize: bool = False
+
+
+def _pick_peaks_spectrum(
+    mzs: np.ndarray,
+    ints: np.ndarray,
+    config: MSIPeakConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Pick peaks from a single profile-mode spectrum.
+
+    Applies Savitzky-Golay smoothing then ``scipy.signal.find_peaks`` with a
+    prominence threshold.  Returns ``(peak_mzs, peak_ints)`` at the original
+    (unsmoothed) intensity values so that intensities are not biased by
+    smoothing.
+    """
+    smoothed = savgol_filter(ints, config.sg_window, config.sg_polyorder)
+    smoothed = np.maximum(smoothed, 0.0)
+    max_int = float(smoothed.max())
+    prom = config.peak_prominence * max_int if max_int > 0 else 0.0
+    peaks, _ = find_peaks(smoothed, prominence=prom)
+    if len(peaks) == 0:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+    return mzs[peaks], ints[peaks]
+
+
+# ---------------------------------------------------------------------------
+# Shared histogram accumulation (used by both Bruker and imzML paths)
+# ---------------------------------------------------------------------------
+
+
+def _histogram_accumulate(
+    peak_iter,
+    n_pixels: int,
+    ppm_bin: float,
+    min_fraction: float,
+    mz_ref: float,
+    mz_top: float,
 ) -> np.ndarray:
     """
-    Detect consensus m/z features by per-pixel logarithmic histogram binning.
+    Logarithmic histogram binning + greedy merge for feature detection.
 
-    Uses O(n_bins) memory regardless of the total number of peaks across all
-    pixels.  Each pixel's peaks are accumulated into fine bins (ppm_bin/4 wide)
-    in a single streaming pass.  A greedy merge step then re-applies the
-    ppm_bin grouping rule on the (small) set of non-empty bin centroids,
-    matching the semantics of the original collect-then-sort algorithm while
-    avoiding the large intermediate peak arrays.
+    Accepts any iterable of ``(mzs, ints)`` pairs (one per pixel).  Uses
+    O(n_bins) memory regardless of total peak count.
 
     Parameters
     ----------
-    reader
-        An imzy reader object.  Must support ``reader.n_pixels``,
-        ``reader.mz_min``, ``reader.mz_max``, and
-        ``reader.spectra_iter(silent=False)``.
+    peak_iter
+        Iterable of ``(mzs_arr, ints_arr)`` pairs.  Arrays need not be
+        float64; conversion is done internally.
+    n_pixels
+        Total number of pixels (used only for logging and min_count).
     ppm_bin
-        Feature grouping tolerance in ppm.  Default 5.0.
+        Feature grouping tolerance in ppm.
     min_fraction
         Minimum fraction of pixels a feature must be detected in.
-        Default 0.01 (1 %).
-
-    Returns
-    -------
-    np.ndarray
-        Sorted 1D float64 array of feature m/z values.
+    mz_ref, mz_top
+        m/z range for the histogram bins.
     """
-    n_pixels = reader.n_pixels
     min_count = max(1, int(min_fraction * n_pixels))
-
-    mz_ref = float(getattr(reader, "mz_min", 100.0))
     if mz_ref <= 0:
         mz_ref = 100.0
-    mz_top = float(getattr(reader, "mz_max", 4000.0))
 
     # Fine bins at ppm_bin/4 resolution: each real feature spans ≤4 fine bins,
-    # preventing the original ppm_bin-wide bins from splitting features at edges.
+    # preventing the ppm_bin-wide bins from splitting features at boundaries.
     fine_ppm = ppm_bin / 4.0
     fine_log_width = np.log1p(fine_ppm * 1e-6)
     n_bins = int(np.ceil(np.log(mz_top / mz_ref) / fine_log_width)) + 2
     log_mz_ref = np.log(mz_ref)
 
-    # Three arrays at O(n_bins × 8 bytes) — ~26 MB for a typical MALDI range.
     bin_pixel_count = np.zeros(n_bins, dtype=np.int32)
     bin_intensity_sum = np.zeros(n_bins, dtype=np.float64)
     bin_mz_int_sum = np.zeros(n_bins, dtype=np.float64)
 
     n_total_peaks = 0
-    for _px, (mzs, ints) in enumerate(reader.spectra_iter(silent=False)):
+    n_pixels_seen = 0
+    for mzs, ints in peak_iter:
+        n_pixels_seen += 1
         if len(mzs) == 0:
             continue
         mzs_f = np.asarray(mzs, dtype=np.float64)
@@ -92,8 +144,8 @@ def detect_features(
         bin_idx = np.floor((np.log(mzs_f) - log_mz_ref) / fine_log_width).astype(np.int32)
         np.clip(bin_idx, 0, n_bins - 1, out=bin_idx)
 
-        # unique_bins: distinct bins hit this pixel; inverse: maps each peak → position in unique_bins.
-        # bincount on inverse is O(n_peaks), not O(n_bins) — avoids 1M-element array per pixel.
+        # unique_bins: distinct bins hit this pixel; inverse maps each peak →
+        # position in unique_bins. bincount on inverse is O(n_peaks), not O(n_bins).
         unique_bins, inverse = np.unique(bin_idx, return_inverse=True)
         n_uniq = len(unique_bins)
 
@@ -102,11 +154,10 @@ def detect_features(
         bin_mz_int_sum[unique_bins] += np.bincount(inverse, weights=mzs_f * ints_f, minlength=n_uniq)
 
     logger.info(
-        f"  Processed {n_total_peaks:,} peaks from {n_pixels:,} pixels "
-        f"({n_total_peaks / max(n_pixels, 1):.0f} peaks/pixel average)"
+        f"  Processed {n_total_peaks:,} peaks from {n_pixels_seen:,} pixels "
+        f"({n_total_peaks / max(n_pixels_seen, 1):.0f} peaks/pixel average)"
     )
 
-    # Candidate bins: any bin that received at least one pixel contribution.
     cand_idx = np.where(bin_pixel_count > 0)[0]
     if len(cand_idx) == 0:
         logger.warning("No peaks found in any pixel — returning empty feature list.")
@@ -121,9 +172,7 @@ def detect_features(
         mz_ref * np.exp((cand_idx + 0.5) * fine_log_width),
     )
 
-    # Greedy merge: group candidate-bin centroids within ppm_bin of each other
-    # (same rule as the original algorithm).  Centroided spectra have at most
-    # one peak per feature per pixel, so pixel counts sum without double-counting.
+    # Greedy merge: group candidate-bin centroids within ppm_bin of each other.
     feature_mzs: list[float] = []
     n = len(cand_mzs)
     i = 0
@@ -147,6 +196,77 @@ def detect_features(
         f"(ppm_bin={ppm_bin}, min_fraction={min_fraction})"
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Feature detection
+# ---------------------------------------------------------------------------
+
+
+def detect_features(
+    reader,
+    ppm_bin: float = 5.0,
+    min_fraction: float = 0.01,
+    config: MSIPeakConfig | None = None,
+) -> np.ndarray:
+    """
+    Detect consensus m/z features across all pixels.
+
+    For centroid data (``reader.is_centroid = True``, the default for Bruker
+    TSF), peaks are already picked by the instrument; pass ``config=None``.
+
+    For profile data (``reader.is_centroid = False``), per-spectrum
+    Savitzky-Golay smoothing + ``find_peaks`` is applied before histogram
+    binning.  Pass an ``MSIPeakConfig`` instance to enable this.  Without a
+    config, profile data will accumulate the dense m/z axis directly and
+    produce many spurious feature bins.
+
+    Parameters
+    ----------
+    reader
+        An imzy reader object with ``n_pixels``, ``mz_min``, ``mz_max``,
+        ``is_centroid``, and ``spectra_iter(silent=False)``.
+    ppm_bin
+        Feature grouping tolerance in ppm.  Default 5.0.
+    min_fraction
+        Minimum fraction of pixels a feature must be detected in.
+        Default 0.01 (1 %).
+    config
+        Peak picking configuration.  Required for profile-mode data.
+        Ignored (``None``) for centroid data.
+
+    Returns
+    -------
+    np.ndarray
+        Sorted 1D float64 array of feature m/z values.
+    """
+    n_pixels = reader.n_pixels
+    is_profile = not getattr(reader, "is_centroid", True)
+
+    if is_profile and config is None:
+        logger.warning(
+            "Profile-mode data detected but no MSIPeakConfig provided. "
+            "Feature detection will accumulate the dense m/z axis directly, "
+            "which may produce spurious feature bins. "
+            "Pass config=MSIPeakConfig() to enable per-spectrum peak picking."
+        )
+
+    mz_ref = float(getattr(reader, "mz_min", 100.0))
+    if mz_ref <= 0:
+        mz_ref = 100.0
+    mz_top = float(getattr(reader, "mz_max", 4000.0))
+
+    def _iter():
+        for _px, (mzs, ints) in enumerate(reader.spectra_iter(silent=False)):
+            if is_profile and config is not None:
+                mzs, ints = _pick_peaks_spectrum(
+                    np.asarray(mzs, dtype=np.float64),
+                    np.asarray(ints, dtype=np.float64),
+                    config,
+                )
+            yield mzs, ints
+
+    return _histogram_accumulate(_iter(), n_pixels, ppm_bin, min_fraction, mz_ref, mz_top)
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +810,8 @@ def extract_maldi_data(
     output_npz: str | None = None,
     output_spatial_tsv: str | None = None,
     output_dir: str | None = None,
+    verbose: bool = False,
+    config: MSIPeakConfig | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Extract MALDI features, ion images, and spatial statistics from a raw
@@ -776,8 +898,15 @@ def extract_maldi_data(
         else:
             logger.info("Step 1/3: Detecting features...")
             feature_mzs = detect_features(
-                reader, ppm_bin=ppm_bin, min_fraction=min_fraction
+                reader, ppm_bin=ppm_bin, min_fraction=min_fraction, config=config
             )
+            if verbose:
+                logger.info(f"  Detected feature m/z values:\n  {feature_mzs}")
+                # Save detected features to a text file for debugging.
+                if output_dir:
+                    features_txt = os.path.join(output_dir, "1_detected_features.txt")
+                    np.savetxt(features_txt, feature_mzs, fmt="%.6f")
+                    logger.info(f"  Saved detected features → {features_txt}")
 
         if len(feature_mzs) == 0:
             raise ValueError(
@@ -791,12 +920,28 @@ def extract_maldi_data(
 
         logger.info("Step 2/3: Extracting ion images...")
         if images_path is None:
+            logger.debug("  No images_path given, extracting full ion image array in RAM.")
             # Default: single pass, full array in RAM.
             ion_images = extract_ion_images(reader, feature_mzs, ppm=extraction_ppm)
+            if verbose:
+                logger.info(f"  Ion images shape: {ion_images.shape}, dtype: {ion_images.dtype}")
+                # Save to disk
+                if output_dir:
+                    images_npy = os.path.join(output_dir, "2_ion_images.npy")
+                    np.save(images_npy, ion_images)
+                    logger.info(f"  Saved ion images → {images_npy}")
+                    
             logger.info("Step 3/3: Computing spatial features...")
             spatial_df = compute_spatial_features(
                 ion_images, feature_mzs, reader.n_pixels
             )
+            if verbose:
+                logger.info(f"  Spatial features DataFrame:\n{spatial_df.head()}")
+                # Save to disk
+                if output_dir:
+                    spatial_csv = os.path.join(output_dir, "3_spatial_features.csv")
+                    spatial_df.to_csv(spatial_csv, index=False)
+                    logger.info(f"  Saved spatial features → {spatial_csv}")
         else:
             # Memory-efficient: write to disk in batches, never hold full array in RAM.
             n_features = len(feature_mzs)
@@ -863,6 +1008,298 @@ def extract_maldi_data(
             tsv_path = os.path.join(output_dir, output_spatial_tsv)
         else:
             tsv_path = output_spatial_tsv
+        os.makedirs(os.path.dirname(os.path.abspath(tsv_path)), exist_ok=True)
+        spatial_df.to_csv(tsv_path, sep="\t", index=False)
+        logger.info(f"  Saved spatial features → {tsv_path}")
+
+    return feature_mzs, ion_images, spatial_df
+
+
+# ---------------------------------------------------------------------------
+# imzML extraction
+# ---------------------------------------------------------------------------
+
+
+def _detect_imzml_mode(parser) -> str:
+    """
+    Return 'profile' or 'centroid' for an ``ImzMLParser`` instance.
+
+    Uses ``parser.spectrum_mode`` when available; falls back to a heuristic
+    based on the median gap between adjacent m/z points in the first spectrum.
+    """
+    mode = getattr(parser, "spectrum_mode", None)
+    if mode in ("profile", "centroid"):
+        return mode
+    mzs, _ = parser.getspectrum(0)
+    mzs_arr = np.asarray(mzs, dtype=np.float64)
+    if len(mzs_arr) > 1:
+        median_gap = float(np.median(np.diff(mzs_arr)))
+        return "centroid" if median_gap > 0.01 else "profile"
+    return "centroid"
+
+
+def _build_ion_images_imzml(
+    parser,
+    feature_mzs: np.ndarray,
+    config: MSIPeakConfig,
+    H: int,
+    W: int,
+) -> np.ndarray:
+    """
+    Assemble a ``(n_features, H, W)`` float32 ion image array from an imzML file.
+
+    Uses vectorised ``searchsorted`` to assign each peak to its nearest feature
+    window in O(n_peaks log n_features) per pixel — no inner Python loop over
+    features.  ``parser.getspectrum(i)`` seeks the ibd binary file for each
+    pixel, so this is a sequential streaming pass.
+
+    Parameters
+    ----------
+    parser
+        Open ``ImzMLParser`` instance.
+    feature_mzs
+        Sorted 1D float64 array of consensus feature m/z values.
+    config
+        Extraction parameters (``extraction_ppm``, ``min_intensity``).
+    H, W
+        Image height and width in pixels (from ``imzmldict``).
+    """
+    n_feat = len(feature_mzs)
+    images = np.zeros((n_feat, H, W), dtype=np.float32)
+    pf = config.extraction_ppm * 1e-6
+    mzs_lo = feature_mzs * (1.0 - pf)
+    mzs_hi = feature_mzs * (1.0 + pf)
+
+    for i, (x, y, _) in enumerate(parser.coordinates):
+        px, py = x - 1, y - 1          # 1-based → 0-based
+        mzs, ints = parser.getspectrum(i)
+        mzs = np.asarray(mzs, dtype=np.float64)
+        ints = np.asarray(ints, dtype=np.float32)
+        if config.min_intensity > 0:
+            keep = ints >= config.min_intensity
+            mzs = mzs[keep]
+            ints = ints[keep]
+        if len(mzs) == 0:
+            continue
+        # For each peak find the leftmost feature window that covers it.
+        fi = np.searchsorted(mzs_hi, mzs, side="left")
+        valid = (fi < n_feat) & (mzs >= mzs_lo[fi])
+        if valid.any():
+            np.add.at(images[:, py, px], fi[valid], ints[valid])
+
+    return images
+
+
+def _visualize_msi_diagnostics(
+    feature_mzs: np.ndarray,
+    ion_images: np.ndarray,
+    spatial_df: "pd.DataFrame",
+    output_dir: str | None,
+) -> None:
+    """
+    Save three diagnostic PNG files for a completed MSI extraction.
+
+    1. Histogram of consensus feature m/z values.
+    2. ``fraction_detected`` and ``spatial_autocorrelation`` distributions.
+    3. Ion image mosaic of the first 9 features.
+
+    Files are written to ``output_dir`` (or the current directory if None).
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    out = output_dir or "."
+    os.makedirs(out, exist_ok=True)
+
+    # Figure 1: m/z histogram
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(feature_mzs, bins=100, color="steelblue", edgecolor="none")
+    ax.set_xlabel("m/z"); ax.set_ylabel("Count")
+    ax.set_title(f"Feature m/z distribution ({len(feature_mzs)} features)")
+    plt.tight_layout()
+    fig.savefig(os.path.join(out, "msi_feature_mz_hist.png"), dpi=120)
+    plt.close(fig)
+
+    # Figure 2: spatial stats distributions
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    for ax, col, label in zip(
+        axes,
+        ["fraction_detected", "spatial_autocorrelation"],
+        ["Fraction detected", "Moran's I"],
+    ):
+        if col in spatial_df.columns:
+            ax.hist(spatial_df[col].dropna(), bins=60, color="steelblue", edgecolor="none")
+            ax.set_xlabel(label); ax.set_ylabel("Count")
+    plt.tight_layout()
+    fig.savefig(os.path.join(out, "msi_spatial_stats.png"), dpi=120)
+    plt.close(fig)
+
+    # Figure 3: ion image mosaic (first 9 features)
+    n_show = min(9, len(ion_images))
+    fig, axes = plt.subplots(3, 3, figsize=(10, 9))
+    for idx, ax in enumerate(axes.flat):
+        if idx < n_show:
+            img = ion_images[idx]
+            vmax = float(img.max()) or 1.0
+            ax.imshow(img, cmap="hot", aspect="equal",
+                      norm=mcolors.PowerNorm(gamma=0.5, vmin=0, vmax=vmax))
+            ax.set_title(f"m/z {feature_mzs[idx]:.4f}", fontsize=8)
+        ax.axis("off")
+    plt.tight_layout()
+    fig.savefig(os.path.join(out, "msi_ion_image_mosaic.png"), dpi=120)
+    plt.close(fig)
+
+    logger.info(f"  Diagnostic plots saved to {os.path.abspath(out)}/msi_*.png")
+
+
+def extract_imzml_data(
+    imzml_path: str,
+    config: MSIPeakConfig | None = None,
+    output_npz: str | None = None,
+    output_spatial_tsv: str | None = None,
+    output_dir: str | None = None,
+    verbose: bool = False,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """
+    Extract MSI features, ion images, and spatial statistics from an imzML file.
+
+    Two ibd passes are made:
+
+    - **Pass 1** (peak lists): reads every spectrum once via
+      ``parser.getspectrum(i)``.  For profile data, applies per-spectrum
+      Savitzky-Golay smoothing + ``find_peaks`` (``_pick_peaks_spectrum``).
+      The resulting peak lists are fed into ``_histogram_accumulate`` to produce
+      the consensus feature list.
+    - **Pass 2** (ion images): reads every spectrum again and assembles the
+      ``(n_features, H, W)`` float32 ion image array.
+
+    A second pass is required because the consensus feature list is not known
+    until after the first pass.
+
+    Parameters
+    ----------
+    imzml_path
+        Path to the ``.imzML`` file (the ``.ibd`` binary is found automatically).
+    config
+        Peak picking and extraction configuration.  ``None`` uses all defaults.
+    output_npz
+        If given, save ``{mzs, images}`` as a compressed NPZ to this path.
+    output_spatial_tsv
+        If given, save the spatial features DataFrame as a TSV to this path.
+    output_dir
+        Directory for verbose debug outputs and diagnostic plots.
+    verbose
+        Log extra detail and save intermediate arrays.
+
+    Returns
+    -------
+    (feature_mzs, ion_images, spatial_df)
+        ``feature_mzs`` — sorted 1D float64, shape ``(n_features,)``
+        ``ion_images``  — float32 array, shape ``(n_features, H, W)``
+        ``spatial_df``  — DataFrame with per-feature spatial statistics
+    """
+    try:
+        from pyimzml.ImzMLParser import ImzMLParser
+    except ImportError as exc:
+        raise ImportError(
+            "pyimzml is required for imzML extraction. "
+            "Install with: pip install ms1rescore[maldi]"
+        ) from exc
+
+    if config is None:
+        config = MSIPeakConfig()
+
+    logger.info(f"Opening imzML dataset: {imzml_path}")
+    with ImzMLParser(imzml_path) as parser:
+        W = int(parser.imzmldict["max count of pixels x"])
+        H = int(parser.imzmldict["max count of pixels y"])
+        n_pixels = len(parser.coordinates)
+        mode = _detect_imzml_mode(parser)
+        logger.info(
+            f"  {n_pixels:,} pixels, image shape {H}×{W}, spectrum mode: {mode}"
+        )
+
+        # --- Pass 1: peak picking + histogram alignment ---
+        logger.info("Step 1/3: Detecting features (pass 1 over ibd)...")
+        peak_lists: list[tuple[np.ndarray, np.ndarray]] = []
+        for i in range(n_pixels):
+            mzs_raw, ints_raw = parser.getspectrum(i)
+            mzs = np.asarray(mzs_raw, dtype=np.float64)
+            ints = np.asarray(ints_raw, dtype=np.float64)
+            if mode == "profile":
+                mzs, ints = _pick_peaks_spectrum(mzs, ints, config)
+            peak_lists.append((mzs, ints))
+
+        all_lo = [pl[0][0]  for pl in peak_lists if len(pl[0]) > 0]
+        all_hi = [pl[0][-1] for pl in peak_lists if len(pl[0]) > 0]
+        mz_ref = float(min(all_lo)) if all_lo else 100.0
+        mz_top = float(max(all_hi)) if all_hi else 4000.0
+
+        feature_mzs = _histogram_accumulate(
+            iter(peak_lists),
+            n_pixels=n_pixels,
+            ppm_bin=config.ppm_bin,
+            min_fraction=config.min_fraction,
+            mz_ref=mz_ref,
+            mz_top=mz_top,
+        )
+        del peak_lists
+        logger.info(f"  {len(feature_mzs)} features detected")
+
+        if verbose and output_dir:
+            feat_txt = os.path.join(output_dir, "1_detected_features_imzml.txt")
+            np.savetxt(feat_txt, feature_mzs, fmt="%.6f")
+            logger.info(f"  Saved detected features → {feat_txt}")
+
+        if len(feature_mzs) == 0:
+            raise ValueError(
+                f"No features detected from {imzml_path!r}. "
+                "Try lowering min_fraction or peak_prominence in MSIPeakConfig."
+            )
+
+        # --- Pass 2: ion image assembly ---
+        logger.info("Step 2/3: Assembling ion images (pass 2 over ibd)...")
+        ion_images = _build_ion_images_imzml(parser, feature_mzs, config, H, W)
+        if verbose and output_dir:
+            img_npy = os.path.join(output_dir, "2_ion_images_imzml.npy")
+            np.save(img_npy, ion_images)
+            logger.info(f"  Saved ion images → {img_npy}")
+
+    # --- Step 3: spatial features ---
+    logger.info("Step 3/3: Computing spatial features...")
+    spatial_df = compute_spatial_features(ion_images, feature_mzs, n_pixels)
+
+    # Drop features with zero MALDI signal
+    detected_mask = spatial_df["n_pixels_detected"].to_numpy() > 0
+    if not detected_mask.all():
+        n_removed = int((~detected_mask).sum())
+        logger.info(
+            f"  Dropping {n_removed} features with zero MALDI signal "
+            f"({detected_mask.sum()} features retained)."
+        )
+        feature_mzs = feature_mzs[detected_mask]
+        ion_images = ion_images[detected_mask]
+        spatial_df = spatial_df[detected_mask].reset_index(drop=True)
+
+    if config.visualize:
+        _visualize_msi_diagnostics(feature_mzs, ion_images, spatial_df, output_dir)
+
+    if output_npz is not None:
+        npz_path = (
+            os.path.join(output_dir, output_npz)
+            if output_dir and not os.path.isabs(str(output_npz))
+            else output_npz
+        )
+        os.makedirs(os.path.dirname(os.path.abspath(npz_path)), exist_ok=True)
+        np.savez_compressed(npz_path, mzs=feature_mzs, images=ion_images)
+        logger.info(f"  Saved NPZ → {npz_path}")
+
+    if output_spatial_tsv is not None:
+        tsv_path = (
+            os.path.join(output_dir, output_spatial_tsv)
+            if output_dir and not os.path.isabs(str(output_spatial_tsv))
+            else output_spatial_tsv
+        )
         os.makedirs(os.path.dirname(os.path.abspath(tsv_path)), exist_ok=True)
         spatial_df.to_csv(tsv_path, sep="\t", index=False)
         logger.info(f"  Saved spatial features → {tsv_path}")

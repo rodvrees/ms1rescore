@@ -295,26 +295,43 @@ def _pearson_r_matrix(
     ion_image_mzs: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
-    Compute the full (n_valid × n_valid) Pearson correlation matrix in one
-    BLAS call.
+    Compute the full (n_valid × n_valid) Pearson correlation matrix.
+
+    Uses a manual float32 normalise + BLAS sgemm instead of ``np.corrcoef``
+    which unconditionally upcasts to float64, allocating ~2× as much memory.
+    For 1398 features × 49 K pixels the saving is ~550 MB at peak.
 
     Returns
     -------
-    corr_matrix : (n_valid, n_valid) float64
+    corr_matrix : (n_valid, n_valid) float32
     valid_mz_arr : (n_valid,) float64 — m/z values of non-constant images
     mz_to_idx : dict mapping float(mz) → row/col index into corr_matrix
     """
     mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
     n_feat = len(mz_arr)
     n_pix = ion_images.shape[1] * ion_images.shape[2]
-    flat_all = ion_images.reshape(n_feat, n_pix).astype(np.float32)
+
+    # Reshape to (n_feat, n_pix); view if already C-contiguous, else copy.
+    flat_all = ion_images.reshape(n_feat, n_pix)
 
     stds = flat_all.std(axis=1)
     valid_mask = stds > 1e-10
     valid_mz_arr = mz_arr[valid_mask]
-    flat_valid = flat_all[valid_mask].astype(np.float64)  # (n_valid, n_pix)
 
-    corr_matrix = np.corrcoef(flat_valid)  # single BLAS dgemm; (n_valid, n_valid)
+    # float32 copy of valid rows only — explicitly freed below.
+    X = flat_all[valid_mask].astype(np.float32, copy=True)
+    del flat_all  # release reshape view
+
+    # Centre and L2-normalise in-place (no extra allocations).
+    X -= X.mean(axis=1, keepdims=True)
+    norms = np.sqrt((X * X).sum(axis=1, keepdims=True))
+    X /= np.where(norms > 1e-10, norms, 1.0)
+    del norms
+
+    # BLAS sgemm: (n_valid, n_pix) @ (n_pix, n_valid) → (n_valid, n_valid) float32
+    corr_matrix = X @ X.T
+    del X  # free ~(n_valid × n_pix × 4) bytes immediately
+
     mz_to_idx = {float(mz): i for i, mz in enumerate(valid_mz_arr)}
     return corr_matrix, valid_mz_arr, mz_to_idx
 

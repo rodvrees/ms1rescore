@@ -67,33 +67,86 @@ XICs in LC-MS/MS are extracted at charges 1, 2, 3, 4 for each MALDI feature's ne
 
 ### `maldi_extraction.py`
 
-Converts raw Bruker `.d`/TSF data into the NPZ format consumed by the rest of the pipeline. Requires `imzy` (`pip install ms1rescore[maldi]`).
+Converts raw MALDI data into the NPZ format consumed by the rest of the pipeline. Supports two raw formats:
 
-**Three-step extraction orchestrated by `extract_maldi_data(d_path, ..., feature_mzs=None)`:**
+- **Bruker `.d`/TSF** via `imzy` — `extract_maldi_data()`, CLI flag `--maldi-raw`
+- **imzML + ibd** via `pyimzml` — `extract_imzml_data()`, CLI flag `--maldi-imzml`
 
-1. **Feature determination** — always uses `detect_features(reader, ppm_bin=5.0, min_fraction=0.01)`. Pass `feature_mzs` only to reuse a cached feature set from a previous run; do not populate it from LC-MS/MS IDs. After ion image extraction, features with zero MALDI signal are removed.
+Install: `pip install ms1rescore[maldi]` (installs both `imzy` and `pyimzml`).
 
-2. **`extract_ion_images(reader, feature_mzs, ppm=25.0)`** — delegates to `reader.get_ion_images(feature_mzs, ppm=ppm, fill_value=0.0)`. This is a single streaming pass (imzy internally uses `accumulate_peaks_centroid` from `ims_utils`). Returns shape `(n_features, height, width)`, float32. `extraction_ppm` (default 25.0) controls this window.
+#### `MSIPeakConfig` dataclass
 
-3. **`compute_spatial_features(ion_images, feature_mzs, n_pixels_total)`** — computes per-feature: `fraction_detected`, `n_pixels_detected`, `mean_intensity`, `intensity_p90`, `intensity_sum`, `intensity_cv`, and Moran's I (`spatial_autocorrelation`). Moran's I is computed via `scipy.ndimage.convolve` with a queen's contiguity (8-neighbour) kernel — O(pixels) per feature.
+Shared configuration for per-spectrum peak picking and cross-spectrum alignment. Used by both extraction paths.
 
-**Two ppm parameters:**
+```python
+MSIPeakConfig(
+    sg_window=11,        # Savitzky-Golay window (profile mode only, must be odd)
+    sg_polyorder=3,      # SG polynomial order
+    peak_prominence=0.01, # min prominence fraction of local max
+    ppm_bin=5.0,         # feature grouping tolerance (ppm)
+    min_fraction=0.01,   # min pixel fraction for a feature to be kept
+    extraction_ppm=25.0, # ion image assembly window (ppm)
+    min_intensity=0.0,   # per-pixel intensity floor
+    visualize=False,     # save diagnostic PNG plots
+)
+```
 
-- `extraction_ppm` (default 25.0, CLI `--extraction-ppm`): controls which raw data points contribute to each ion image. Slightly wider than instrument centroid accuracy to avoid clipping peak tails.
-- `matching_ppm` (default 20.0, CLI `--matching-ppm`): passed downstream for candidate-to-feature linking in `match_to_maldi_features`. Stored in `spatial_df` metadata but not used internally by `extract_maldi_data`.
+#### Shared internals
+
+**`_pick_peaks_spectrum(mzs, ints, config)`** — per-spectrum profile peak picker. Applies Savitzky-Golay smoothing (`scipy.signal.savgol_filter`) then `find_peaks` with a prominence threshold. Returns `(peak_mzs, peak_ints)` at original unsmoothed intensities.
+
+**`_histogram_accumulate(peak_iter, n_pixels, ppm_bin, min_fraction, mz_ref, mz_top)`** — shared histogram binning + greedy merge used by both `detect_features()` (Bruker path) and `_align_peaks_imzml()` (imzML path). Accepts any iterable of `(mzs, ints)` pairs. O(n_bins) memory.
+
+#### Bruker `.d` path — `extract_maldi_data(d_path, ..., config=None)`
+
+Three-step extraction orchestrated by `extract_maldi_data()`:
+
+1. **Feature detection** — `detect_features(reader, ppm_bin, min_fraction, config)`. For centroid data (`reader.is_centroid = True`, the default for timsTOF), pass `config=None` (peaks already picked). For profile data, pass an `MSIPeakConfig` instance to enable per-spectrum SG + find_peaks before histogram accumulation. Without a config on profile data, a warning is emitted and the dense m/z axis is accumulated directly (produces spurious bins).
+
+2. **`extract_ion_images(reader, feature_mzs, ppm=25.0)`** — tries fast extraction paths first (`_extract_centroid_fast` for Bruker TSF, `_extract_profile_fast` cumsum trick for profile), then falls back to `reader.get_ion_images()`. Returns `(n_features, H, W)` float32.
+
+3. **`compute_spatial_features(ion_images, feature_mzs, n_pixels_total)`** — computes per-feature: `fraction_detected`, `n_pixels_detected`, `mean_intensity`, `intensity_p90`, `intensity_sum`, `intensity_cv`, Moran's I (`spatial_autocorrelation`).
+
+**imzy reader API used:**
+- `reader.n_pixels`, `reader.is_centroid`, `reader.mz_min`, `reader.mz_max`
+- `reader.spectra_iter(silent=False)` — yields `(mzs, ints)` per pixel
+- `reader.get_ion_images(mzs, ppm=..., fill_value=0.0)` → `(n_features, H, W)` float32
+- Used as context manager: `with imzy.get_reader(d_path) as reader:`
+
+#### imzML path — `extract_imzml_data(imzml_path, config, ...)`
+
+Two-pass extraction:
+
+- **Pass 1** (peak lists + alignment): calls `parser.getspectrum(i)` for each pixel; applies `_pick_peaks_spectrum` if mode is profile; feeds all peak lists into `_histogram_accumulate` to produce the consensus feature list.
+- **Pass 2** (ion images): calls `parser.getspectrum(i)` again and assembles the `(n_features, H, W)` float32 array via vectorised `searchsorted` per pixel (`_build_ion_images_imzml`).
+
+A second pass is unavoidable — the consensus feature list is not known until after pass 1. For ≤50K pixels the two passes together complete in seconds to minutes.
+
+**pyimzml reader API used:**
+- `parser.coordinates` — list of (x, y, z) 1-based tuples
+- `parser.imzmldict["max count of pixels x/y"]`
+- `parser.spectrum_mode` — `'profile'` | `'centroid'` | `None`
+- `parser.getspectrum(i)` — seeks ibd file, returns `(mzs, ints)` arrays
+
+**Two ppm parameters (both paths):**
+
+- `extraction_ppm` (default 25.0, CLI `--extraction-ppm`): ion image assembly window. Slightly wider than instrument centroid accuracy to avoid clipping peak tails.
+- `matching_ppm` (default 20.0, CLI `--matching-ppm`): downstream candidate-to-feature linking in `match_to_maldi_features`. Not used internally by the extraction functions.
 
 **Deprecated: LC-MS/MS guided extraction** (`_features_from_lcms_file_diagnostic`):
 
-The original `maldi_ion_images.npz` was created using [M+H]+ m/z values of LC-MS/MS identified peptides as the MALDI feature set (not by peak detection). This is circular for rescoring — it pre-selects features guaranteed to match LC-MS/MS candidates, making scoring trivial and ignoring ~39–61% of MALDI-detectable tryptic peptides with no LC-MS/MS counterpart. The function `_features_from_lcms_file_diagnostic` is kept for diagnostic/legacy use only. LC-MS/MS identifications should inform candidate generation (Strategy C) and prior features, not the MALDI feature set itself. The CLI no longer calls this function automatically.
+Kept for diagnostic/legacy use only. Do not use for rescoring — it pre-selects features guaranteed to match LC-MS/MS candidates, making scoring trivial.
 
-**imzy reader API used:**
-- `reader.n_pixels` — total measured pixels
-- `reader.spectra_iter(silent=False)` — yields `(mzs, ints)` per pixel
-- `reader.get_ion_images(mzs, ppm=..., fill_value=0.0)` → `(n_features, H, W)` float32
-- `reader.image_shape` — `(y_size, x_size)`
-- Used as context manager: `with imzy.get_reader(d_path) as reader:`
+#### CLI flags
 
-The `--maldi-raw` CLI flag calls `extract_maldi_data()` and automatically passes the extracted spatial features to `rescore()` (no separate `--spatial-features` needed when starting from raw data). `--save-npz` and `--save-spatial` allow caching the output for reruns.
+| Flag | Format | Peak picking | Ion images | Spatial features |
+|---|---|---|---|---|
+| `--maldi-npz PATH` | NumPy NPZ | No | Yes (if `"images"` key) | No |
+| `--maldi-mzs PATH` | Plain text m/z list | No | No | No |
+| `--maldi-raw PATH` | Bruker `.d` | Yes, if profile + config | Yes | Yes |
+| `--maldi-imzml PATH` | imzML + ibd | Yes, if profile | Yes | Yes |
+
+Peak-picking parameters (`--sg-window`, `--sg-polyorder`, `--peak-prominence`, `--min-intensity`, `--msi-visualize`) apply to both `--maldi-raw` and `--maldi-imzml`. Both flags automatically pass extracted spatial features to `rescore()` (no separate `--spatial-features` needed). `--save-npz` and `--save-spatial` cache the output for reruns.
 
 ---
 
