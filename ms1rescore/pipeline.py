@@ -535,8 +535,8 @@ def rescore(
         logger.debug(
             f"Writing LC-MS/MS evidence to {output_dir}/11_debug_lcms_evidence.tsv"
         )
-        pd.DataFrame(lcms_evidence).to_csv(
-            f"{output_dir}/11_debug_lcms_evidence.tsv", sep="\t", index=False
+        pd.DataFrame(lcms_evidence).T.to_csv(
+            f"{output_dir}/11_debug_lcms_evidence.tsv", sep="\t", index=True
         )
 
     # --- Step 6: Extract LC-MS/MS envelopes from XIC best scans ---

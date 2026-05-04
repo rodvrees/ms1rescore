@@ -613,11 +613,10 @@ def compute_lcms_evidence(
     if len(xic_ints) > 0:
         result["lcms_xic_max_intensity"] = float(np.log1p(xic_ints.max()))
 
-        # Noise threshold: 5th percentile of non-zero intensities
         nonzero = xic_ints[xic_ints > 0]
         if len(nonzero) > 0:
             noise = np.percentile(nonzero, 5)
-            result["lcms_xic_n_scans"] = int((xic_ints > noise).sum())
+            result["lcms_xic_n_scans"] = int((xic_ints > 0.1 * xic_ints.max()).sum())
             result["lcms_xic_snr"] = float(xic_ints.max() / noise) if noise > 0 else 0.0
 
             # Best scan for RT and isotope extraction
@@ -718,7 +717,7 @@ def compute_all_lcms_evidence(
             nonzero = best_ints[best_ints > 0]
             if len(nonzero) > 0:
                 noise = np.percentile(nonzero, 5)
-                fd["lcms_xic_n_scans"] = int((best_ints > noise).sum())
+                fd["lcms_xic_n_scans"] = int((best_ints > 0.1 * best_ints.max()).sum())
                 fd["lcms_xic_snr"] = float(best_ints.max() / noise) if noise > 0 else 0.0
                 best_idx = np.argmax(best_ints)
                 fd["best_xic_rt"] = float(best_rts[best_idx])

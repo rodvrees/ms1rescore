@@ -181,9 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--mzml",
         "-l",
         required=True,
-        nargs="+",
+        action="append",
         metavar="PATH",
-        help="One or more LC-MS/MS mzML file paths.",
+        help="LC-MS/MS mzML file path. Repeat for multiple files: -l a.mzML -l b.mzML",
     )
 
     # --- MALDI input (mutually exclusive, one required) ---
