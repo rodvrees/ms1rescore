@@ -154,7 +154,7 @@ def detect_features(
 # ---------------------------------------------------------------------------
 
 
-def _build_profile_mean_spectrum(reader) -> tuple[np.ndarray, np.ndarray]:
+def _build_profile_mean_spectrum(reader, normalize_rms: bool = False, normalize_tic: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Return (mz_grid, mean_intensities) for aligned profile data.
 
     All pixels must share the same m/z axis (verified upstream via
@@ -166,6 +166,14 @@ def _build_profile_mean_spectrum(reader) -> tuple[np.ndarray, np.ndarray]:
     for mzs, ints in reader.spectra_iter(silent=False):
         mzs = np.asarray(mzs, dtype=np.float64)
         ints = np.asarray(ints, dtype=np.float64)
+        if normalize_rms:
+            rms = float(np.sqrt(np.mean(ints ** 2)))
+            if rms > 0.0:
+                ints = ints / rms
+        elif normalize_tic:
+            tic = float(ints.sum())
+            if tic > 0.0:
+                ints = ints / tic
         if mz_grid is None:
             mz_grid = mzs
             acc = ints.copy()
@@ -588,119 +596,6 @@ def _deduplicate_mzs(mzs: np.ndarray, merge_ppm: float = 1.0) -> np.ndarray:
             groups.append([float(mz)])
     return np.array([np.mean(g) for g in groups], dtype=np.float64)
 
-
-def _features_from_lcms_file_diagnostic(
-    path: str,
-    format: str = "percolator",
-    peptide_fdr: float = 0.01,
-    mz_min: float = 750.0,
-    mz_max: float = 2900.0,
-) -> np.ndarray:
-    """
-    DIAGNOSTIC / LEGACY MODE ONLY. Do not use for rescoring.
-
-    Defines MALDI features from LC-MS/MS-identified peptide m/z values.
-    This is circular for rescoring: it pre-selects features that are
-    guaranteed to match LC-MS/MS candidates, making the rescoring trivial
-    and producing results that do not generalise to unidentified MALDI features.
-
-    Use detect_features() for all rescoring workflows. LC-MS/MS identifications
-    should inform candidate generation (Strategy C in candidates.py) and prior
-    features (LCMS_PRIOR_FEATURES), not the MALDI feature set itself.
-
-    Reads pre-computed masses directly from the file so that peptide
-    modifications are correctly accounted for.  m/z values are deduplicated
-    with a 1 ppm tolerance and filtered to the MALDI acquisition range.
-
-    Parameters
-    ----------
-    path
-        Path to the LC-MS/MS ID file.
-    format
-        File format: ``"percolator"`` (TSV), ``"msf"`` (ProteomeDiscoverer
-        ``.msf`` SQLite), or ``"mzidentml"``.
-    peptide_fdr
-        Peptide-level FDR threshold; rows above this threshold are ignored.
-    mz_min, mz_max
-        MALDI acquisition m/z range; features outside are dropped.
-
-    Returns
-    -------
-    np.ndarray
-        Sorted 1D float64 array of unique [M+H]+ m/z values.
-    """
-    mh_mzs: np.ndarray
-
-    if format == "percolator":
-        df = pd.read_csv(path, sep="\t")
-        qcol = _find_col(df, "q-value", "qvalue", "q_value", "percolatorqvalue")
-        if qcol is not None:
-            df = df[df[qcol].astype(float) <= peptide_fdr]
-
-        mzcol = _find_col(df, "mh_mz", "mh+", "mhovermass")
-        masscol = _find_col(df, "mass") if mzcol is None else None
-
-        if mzcol is not None:
-            mh_mzs = df[mzcol].dropna().to_numpy(dtype=np.float64)
-        elif masscol is not None:
-            mh_mzs = df[masscol].dropna().to_numpy(dtype=np.float64) + _PROTON
-        else:
-            raise ValueError(
-                f"Could not find MH_mz or Mass column in {path!r}. "
-                f"Columns present: {list(df.columns)}"
-            )
-
-    elif format == "msf":
-        import sqlite3
-
-        conn = sqlite3.connect(path)
-        try:
-            rows = conn.execute(
-                "SELECT Mass FROM TargetPsms WHERE PercolatorqValue <= ? AND Mass IS NOT NULL",
-                (peptide_fdr,),
-            ).fetchall()
-        finally:
-            conn.close()
-        if not rows:
-            raise ValueError(f"No PSMs at FDR {peptide_fdr} in {path!r}")
-        mh_mzs = np.array([r[0] for r in rows], dtype=np.float64) + _PROTON
-
-    elif format == "mzidentml":
-        try:
-            from pyteomics import mzid as _mzid
-        except ImportError as exc:
-            raise ImportError("pyteomics required for mzIdentML") from exc
-        mh_list = []
-        with _mzid.MzIdentML(path) as mzid:
-            for sir in mzid:
-                for sii in sir.get("SpectrumIdentificationItem", []):
-                    qval = np.nan
-                    for cv in sii.get("cvParam", []):
-                        if cv.get("accession") == "MS:1002354":
-                            qval = float(cv.get("value", np.nan))
-                    if not np.isnan(qval) and qval <= peptide_fdr:
-                        mz = sii.get("experimentalMassToCharge", np.nan)
-                        charge = sii.get("chargeState", 1) or 1
-                        if not np.isnan(mz):
-                            mh_list.append(float(mz) * charge - (charge - 1) * _PROTON)
-        mh_mzs = np.array(mh_list, dtype=np.float64)
-
-    else:
-        raise ValueError(
-            f"Unknown format {format!r} for features_from_lcms_file. "
-            "Use 'percolator', 'msf', or 'mzidentml'."
-        )
-
-    mh_mzs = _deduplicate_mzs(mh_mzs, merge_ppm=1.0)
-    mask = (mh_mzs >= mz_min) & (mh_mzs <= mz_max)
-    result = mh_mzs[mask]
-    logger.info(
-        f"  {len(result)} LC-MS/MS-guided features in [{mz_min:.0f}, {mz_max:.0f}] Da "
-        f"({int((~mask).sum())} outside range dropped, {len(mh_mzs)} unique before filter)"
-    )
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
@@ -713,6 +608,19 @@ def extract_maldi_data(
     matching_ppm: float = 20.0,
     min_fraction: float = 0.01,
     peak_prominence: float = 0.01,
+    smoothing_window: int = 7,
+    smoothing_polyorder: int = 2,
+    ppm_tolerance: float = 10.0,
+    min_interval_width_ppm: float = 2.0,
+    normalize_rms: bool = False,
+    baseline_correction: bool = False,
+    baseline_window_ppm: float = 500.0,
+    calibrant_mzs: list | None = None,
+    calibrant_tol_ppm: float = 200.0,
+    deisotope: bool = False,
+    deisotope_tol_da: float = 0.05,
+    filter_mass_defect: bool = False,
+    mass_defect_halfwidth: float = 0.5,
     feature_mzs: np.ndarray | None = None,
     images_path: str | None = None,
     image_batch_size: int = 100,
@@ -808,14 +716,38 @@ def extract_maldi_data(
                 "Step 1/3: Profile data detected — building mean spectrum for "
                 "SCiLS-style interval detection..."
             )
-            from ms1rescore.maldi_imzml import SCiLSConfig, _detect_intervals
+            from ms1rescore.maldi_imzml import (
+                SCiLSConfig, _detect_intervals,
+                _recalibrate_intervals, _deisotope_intervals, _filter_mass_defect,
+            )
 
             scils_cfg = SCiLSConfig(
                 min_pixel_fraction=min_fraction,
                 peak_prominence=peak_prominence,
+                smoothing_window=smoothing_window,
+                smoothing_polyorder=smoothing_polyorder,
+                ppm_tolerance=ppm_tolerance,
+                min_interval_width_ppm=min_interval_width_ppm,
+                normalize_rms=normalize_rms,
+                baseline_correction=baseline_correction,
+                baseline_window_ppm=baseline_window_ppm,
+                calibrant_mzs=calibrant_mzs or [],
+                calibrant_tol_ppm=calibrant_tol_ppm,
+                deisotope=deisotope,
+                deisotope_tol_da=deisotope_tol_da,
+                filter_mass_defect=filter_mass_defect,
+                mass_defect_halfwidth=mass_defect_halfwidth,
             )
-            mz_grid, mean_ints = _build_profile_mean_spectrum(reader)
+            mz_grid, mean_ints = _build_profile_mean_spectrum(
+                reader, normalize_rms=normalize_rms, normalize_tic=not normalize_rms
+            )
             intervals = _detect_intervals(mz_grid, mean_ints, scils_cfg)
+            if calibrant_mzs:
+                intervals = _recalibrate_intervals(intervals, calibrant_mzs, calibrant_tol_ppm)
+            if deisotope:
+                intervals = _deisotope_intervals(intervals, deisotope_tol_da)
+            if filter_mass_defect:
+                intervals = _filter_mass_defect(intervals, mass_defect_halfwidth)
             feature_mzs = np.array(
                 [iv[2] for iv in intervals], dtype=np.float64
             )

@@ -38,8 +38,21 @@ class SCiLSConfig:
     min_pixel_fraction: float = 0.01     # min fraction of pixels with signal
     min_interval_width_ppm: float = 2.0  # minimum interval full-width (ppm)
     normalize_tic: bool = True           # TIC-normalize per pixel before integration
+    normalize_rms: bool = False          # RMS-normalize per pixel (alternative to TIC; takes priority)
     use_apex: bool = False               # False = sum intensities; True = apex intensity
     mz_grid_resolution: float = 0.001   # Da, for mean spectrum accumulation
+    # Baseline correction (applied to mean spectrum before peak detection)
+    baseline_correction: bool = False
+    baseline_window_ppm: float = 500.0   # rolling-minimum window half-width (ppm)
+    # Internal standard recalibration (applied to detected apices)
+    calibrant_mzs: list = field(default_factory=list)  # theoretical m/z of calibrants
+    calibrant_tol_ppm: float = 200.0     # search window to find each calibrant
+    # Deisotoping (remove M+1/M+2 peaks at z=1 spacing)
+    deisotope: bool = False
+    deisotope_tol_da: float = 0.05       # tolerance around 1.003355 Da
+    # Senko mass defect filter (peptide corridor)
+    filter_mass_defect: bool = False
+    mass_defect_halfwidth: float = 0.5   # half-width of corridor; 0.5 = all pass
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +113,7 @@ def _build_mean_spectrum(
         )
 
     if aligned:
-        return _build_mean_spectrum_aligned(parser, mzs0, n_pixels)
+        return _build_mean_spectrum_aligned(parser, mzs0, n_pixels, config)
 
     # Scan all pixels for true m/z range
     for i in range(n_pixels):
@@ -122,6 +135,14 @@ def _build_mean_spectrum(
         ints = np.asarray(ints, dtype=np.float64)
         if len(mzs) == 0:
             continue
+        if config.normalize_rms:
+            rms = float(np.sqrt(np.mean(ints ** 2)))
+            if rms > 0.0:
+                ints = ints / rms
+        elif config.normalize_tic:
+            tic = float(ints.sum())
+            if tic > 0.0:
+                ints = ints / tic
         indices = np.round((mzs - mz_min) / res).astype(np.intp)
         valid = (indices >= 0) & (indices < n_bins)
         np.add.at(grid_sum, indices[valid], ints[valid])
@@ -131,14 +152,159 @@ def _build_mean_spectrum(
 
 
 def _build_mean_spectrum_aligned(
-    parser, mzs0: np.ndarray, n_pixels: int
+    parser, mzs0: np.ndarray, n_pixels: int, config: SCiLSConfig
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fast path: all spectra share the same m/z axis — just sum intensity arrays."""
     acc = np.zeros(len(mzs0), dtype=np.float64)
     for i in range(n_pixels):
         _, ints = parser.getspectrum(i)
-        acc += np.asarray(ints, dtype=np.float64)
+        ints = np.asarray(ints, dtype=np.float64)
+        if config.normalize_rms:
+            rms = float(np.sqrt(np.mean(ints ** 2)))
+            if rms > 0.0:
+                ints = ints / rms
+        elif config.normalize_tic:
+            tic = float(ints.sum())
+            if tic > 0.0:
+                ints = ints / tic
+        acc += ints
     return mzs0, (acc / n_pixels).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Pre-processing helpers for mean spectrum
+# ---------------------------------------------------------------------------
+
+
+def _subtract_baseline(
+    mz_grid: np.ndarray, ints: np.ndarray, window_ppm: float
+) -> np.ndarray:
+    """Rolling-minimum baseline subtraction on the mean spectrum.
+
+    Uses a fixed window width (in points) computed at the median m/z — a valid
+    approximation for the typical 750–2900 Da MALDI range at 500 ppm.
+    """
+    from scipy.ndimage import gaussian_filter1d, minimum_filter1d
+
+    resolution = float(mz_grid[1] - mz_grid[0])
+    median_mz = float(np.median(mz_grid))
+    half_pts = max(1, int(round(median_mz * window_ppm * 1e-6 / resolution)))
+    ints_f64 = ints.astype(np.float64)
+    baseline = minimum_filter1d(ints_f64, size=2 * half_pts + 1)
+    baseline_smooth = gaussian_filter1d(baseline, sigma=float(half_pts))
+    return np.maximum(ints_f64 - baseline_smooth, 0.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Post-detection interval processing helpers
+# ---------------------------------------------------------------------------
+
+
+def _recalibrate_intervals(
+    intervals: list[tuple[float, float, float]],
+    calibrant_mzs: list[float],
+    tol_ppm: float,
+) -> list[tuple[float, float, float]]:
+    """Linear ppm recalibration using internal standard m/z values.
+
+    Finds each calibrant among the detected apices (within tol_ppm), fits a
+    linear model of ppm_offset vs m/z, and applies the correction to all
+    interval apices and boundaries. Requires ≥1 calibrant to be found.
+    """
+    if not intervals or not calibrant_mzs:
+        return intervals
+
+    apices = np.array([iv[2] for iv in intervals])
+    found_theo: list[float] = []
+    found_obs: list[float] = []
+
+    for theo in calibrant_mzs:
+        diffs_ppm = np.abs(apices - theo) / theo * 1e6
+        idx = int(np.argmin(diffs_ppm))
+        if diffs_ppm[idx] <= tol_ppm:
+            found_theo.append(theo)
+            found_obs.append(float(apices[idx]))
+
+    if len(found_theo) == 0:
+        logger.warning("Recalibration: no calibrants found within %.0f ppm — skipping.", tol_ppm)
+        return intervals
+
+    offsets_ppm = [(obs - theo) / theo * 1e6 for obs, theo in zip(found_obs, found_theo)]
+
+    if len(found_theo) >= 2:
+        coeffs = np.polyfit(found_theo, offsets_ppm, deg=1)
+        logger.info(
+            "Recalibration: %d/%d calibrants found; linear fit slope=%.4g intercept=%.4g ppm",
+            len(found_theo), len(calibrant_mzs), coeffs[0], coeffs[1],
+        )
+    else:
+        # Single calibrant: constant shift
+        coeffs = np.array([0.0, offsets_ppm[0]])
+        logger.info(
+            "Recalibration: 1/%d calibrant found; constant shift=%.3g ppm",
+            len(calibrant_mzs), offsets_ppm[0],
+        )
+
+    recal: list[tuple[float, float, float]] = []
+    for mz_lo, mz_hi, mz_apex in intervals:
+        correction_ppm = float(np.polyval(coeffs, mz_apex))
+        scale = 1.0 / (1.0 + correction_ppm * 1e-6)
+        recal.append((mz_lo * scale, mz_hi * scale, mz_apex * scale))
+    return recal
+
+
+def _deisotope_intervals(
+    intervals: list[tuple[float, float, float]],
+    tol_da: float,
+) -> list[tuple[float, float, float]]:
+    """Remove M+1 and M+2 isotope peaks (z=1, spacing 1.003355 Da).
+
+    Sorts by apex ascending. A peak is flagged as an isotope peak when its
+    apex is within tol_da of exactly 1× or 2× the neutron mass above any
+    earlier (lower m/z) apex. Only the monoisotopic peak is retained.
+    """
+    NEUTRON = 1.003355
+    if not intervals:
+        return intervals
+
+    sorted_ivs = sorted(intervals, key=lambda iv: iv[2])
+    apices = np.array([iv[2] for iv in sorted_ivs])
+    is_isotope = np.zeros(len(apices), dtype=bool)
+
+    for i in range(1, len(apices)):
+        for k in (1, 2):
+            target = apices[i] - k * NEUTRON
+            diffs = np.abs(apices[:i] - target)
+            if diffs.min() <= tol_da:
+                is_isotope[i] = True
+                break
+
+    return [iv for iv, flag in zip(sorted_ivs, is_isotope) if not flag]
+
+
+def _filter_mass_defect(
+    intervals: list[tuple[float, float, float]],
+    halfwidth: float,
+) -> list[tuple[float, float, float]]:
+    """Senko-plot peptide corridor mass defect filter.
+
+    Retains only intervals whose mass defect (neutral mass − nominal mass)
+    falls within halfwidth of the empirical peptide corridor:
+      expected_defect = nominal_mass × −0.000491 + 0.1
+
+    With halfwidth=0.5 (default), all peaks pass — effectively disabled.
+    Set halfwidth≈0.15–0.20 to filter out lipids and matrix clusters.
+    """
+    PROTON = 1.007276
+    kept: list[tuple[float, float, float]] = []
+    for mz_lo, mz_hi, mz_apex in intervals:
+        neutral = mz_apex - PROTON
+        nominal = round(neutral)
+        defect = neutral - nominal
+        expected = nominal * (-0.000491) + 0.1
+        if abs(defect - expected) <= halfwidth:
+            kept.append((mz_lo, mz_hi, mz_apex))
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +328,12 @@ def _detect_intervals(
     if len(mz_grid) < config.smoothing_window:
         return []
 
+    working = mean_ints
+    if config.baseline_correction:
+        working = _subtract_baseline(mz_grid, working, config.baseline_window_ppm)
+
     smoothed = savgol_filter(
-        mean_ints.astype(np.float64),
+        working.astype(np.float64),
         config.smoothing_window,
         config.smoothing_polyorder,
     )
@@ -246,7 +416,11 @@ def _integrate_pixel(
 
     ints = ints.astype(np.float32)
 
-    if config.normalize_tic:
+    if config.normalize_rms:
+        rms = float(np.sqrt(np.mean(ints.astype(np.float64) ** 2)))
+        if rms > 0.0:
+            ints = ints / rms
+    elif config.normalize_tic:
         tic = float(np.sum(ints))
         if tic > 0.0:
             ints = ints / tic
@@ -460,6 +634,20 @@ def extract_scils_features(
         # Detect intervals from mean spectrum
         intervals = _detect_intervals(mz_grid, mean_ints, config)
         logger.info(f"  {len(intervals)} intervals detected from mean spectrum")
+
+        if config.calibrant_mzs:
+            intervals = _recalibrate_intervals(intervals, config.calibrant_mzs, config.calibrant_tol_ppm)
+            logger.info(f"  {len(intervals)} intervals after recalibration")
+
+        if config.deisotope:
+            n_before = len(intervals)
+            intervals = _deisotope_intervals(intervals, config.deisotope_tol_da)
+            logger.info(f"  {len(intervals)}/{n_before} intervals after deisotoping")
+
+        if config.filter_mass_defect:
+            n_before = len(intervals)
+            intervals = _filter_mass_defect(intervals, config.mass_defect_halfwidth)
+            logger.info(f"  {len(intervals)}/{n_before} intervals after mass defect filter")
 
         if len(intervals) == 0:
             return [], np.zeros((n_pixels, 0), dtype=np.float32), []

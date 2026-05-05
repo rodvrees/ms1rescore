@@ -106,29 +106,84 @@ Install: `pip install ms1rescore[maldi]` (installs `pyimzml`).
 
 #### Algorithm
 
-1. **Build mean spectrum** across all pixels on a common m/z grid (`mz_grid_resolution` Da resolution). Fast path for aligned profile data (all spectra share the same m/z axis): direct array sum. General path: `np.add.at` with grid index = `round((mz - mz_min) / resolution)`, O(n_peaks) per pixel.
+1. **Build mean spectrum** across all pixels on a common m/z grid (`mz_grid_resolution` Da resolution). Fast path for aligned profile data (all spectra share the same m/z axis): direct array sum. General path: `np.add.at` with grid index = `round((mz - mz_min) / resolution)`, O(n_peaks) per pixel. Each pixel spectrum is optionally RMS- or TIC-normalized before accumulation so every pixel contributes equally.
 
-2. **Detect intervals** on the mean spectrum: Savitzky-Golay smooth → `find_peaks` → valley-to-valley boundaries. For each detected peak, left boundary = last valley before the peak, right boundary = first valley after the peak. Fallback to `mz_apex ± ppm_tolerance × mz_apex × 1e-6` when no flanking valley exists (isolated edge peak). Intervals narrower than `min_interval_width_ppm` are symmetrically expanded.
+2. **Baseline correction** (optional, `baseline_correction=True`): rolling-minimum filter (`scipy.ndimage.minimum_filter1d`) + Gaussian smoothing of the baseline estimate, subtracted from the mean spectrum before peak detection. Window width in points computed at median m/z from `baseline_window_ppm`.
 
-3. **Integrate pixels** over intervals. TIC normalization (if `normalize_tic=True`) is applied to the full pixel spectrum before interval integration, so interval intensities are comparable across pixels. Per interval: sum all intensities within `[mz_start, mz_end]` (`use_apex=False`) or take the apex intensity (`use_apex=True`).
+3. **Detect intervals** on the (optionally baseline-corrected) mean spectrum: Savitzky-Golay smooth → `find_peaks` → valley-to-valley boundaries. For each detected peak, left boundary = last valley before the peak, right boundary = first valley after the peak. Fallback to `mz_apex ± ppm_tolerance × mz_apex × 1e-6` when no flanking valley exists (isolated edge peak). Intervals narrower than `min_interval_width_ppm` are symmetrically expanded.
 
-4. **Filter intervals**: keep intervals where mean intensity ≥ `min_intensity` AND pixel fraction with non-zero signal ≥ `min_pixel_fraction`.
+4. **Recalibration** (optional, `calibrant_mzs` non-empty): for each calibrant m/z, find the nearest detected apex within `calibrant_tol_ppm`; fit a linear ppm offset vs m/z model; apply correction to all interval apices and boundaries.
+
+5. **Deisotoping** (optional, `deisotope=True`): remove M+1 and M+2 isotope peaks at z=1 spacing (1.003355 Da ± `deisotope_tol_da`), retaining only monoisotopic apices.
+
+6. **Mass defect filter** (optional, `filter_mass_defect=True`): Senko-plot peptide corridor. For each [M+H]+ apex: `neutral = apex − 1.007276`, `defect = neutral − round(neutral)`, `expected = round(neutral) × −0.000491 + 0.1`. Keep if `|defect − expected| ≤ mass_defect_halfwidth`. Default halfwidth 0.5 passes all peaks; use 0.15–0.20 to filter lipids and matrix clusters.
+
+7. **Integrate pixels** over intervals. RMS normalization (if `normalize_rms=True`, takes priority) or TIC normalization (if `normalize_tic=True`) is applied to each pixel spectrum before interval integration. Per interval: sum all intensities within `[mz_start, mz_end]` (`use_apex=False`) or take the apex intensity (`use_apex=True`).
+
+8. **Filter intervals**: keep intervals where mean intensity ≥ `min_intensity` AND pixel fraction with non-zero signal ≥ `min_pixel_fraction`.
 
 #### `SCiLSConfig` dataclass
 
 ```python
 SCiLSConfig(
-    ppm_tolerance=10.0,          # fallback interval half-width (ppm)
+    ppm_tolerance=10.0,           # fallback interval half-width (ppm)
     smoothing_window=7,
     smoothing_polyorder=2,
+    peak_prominence=0.01,         # min peak prominence as fraction of mean-spectrum max
     min_intensity=0.0,
     min_pixel_fraction=0.01,
     min_interval_width_ppm=2.0,
-    normalize_tic=True,
-    use_apex=False,              # False = sum; True = apex intensity
-    mz_grid_resolution=0.001,   # Da, for mean spectrum grid
+    normalize_tic=True,           # TIC-normalize per pixel (default)
+    normalize_rms=False,          # RMS-normalize per pixel (takes priority over TIC; matches SCiLS default)
+    use_apex=False,               # False = sum; True = apex intensity
+    mz_grid_resolution=0.001,    # Da, for mean spectrum grid
+    # Baseline correction
+    baseline_correction=False,
+    baseline_window_ppm=500.0,
+    # Recalibration
+    calibrant_mzs=[],             # theoretical m/z of internal standards
+    calibrant_tol_ppm=200.0,
+    # Deisotoping
+    deisotope=False,
+    deisotope_tol_da=0.05,
+    # Senko mass defect filter
+    filter_mass_defect=False,
+    mass_defect_halfwidth=0.5,    # 0.5 = all pass; 0.15–0.20 = meaningful peptide filter
 )
 ```
+
+#### Published pipeline replication (PXD056528 CHCA dataset)
+
+The paper describes: SCiLS RMS normalization → mMass baseline correction → peak picking at 4% relative threshold → deisotoping → recalibration with trypsin autolysis peaks (842.51, 870.54, 1045.56 Da) → Senko mass defect filter → spatial filter (fraction of pixels).
+
+```bash
+ms1rescore \
+  -f data/PXD056528/uniprot_human_reviewed.fasta \
+  -l data/PXD056528/231212_AG_11.mzML \
+  -l data/PXD056528/231212_AG_12.mzML \
+  -l data/PXD056528/231212_AG_21.mzML \
+  --maldi-raw data/PXD056528/MALDI_MSI/20221013_SingleCells_CHCA.d \
+  --msf data/PXD056528/240125_AG_DDA.msf \
+  --model svm \
+  --normalize-rms \
+  --baseline-correction \
+  --peak-prominence 0.04 \
+  --calibrant-mzs 842.51 870.54 1045.56 \
+  --deisotope \
+  --filter-mass-defect --mass-defect-halfwidth 0.2 \
+  --min-fraction 0.01 \
+  --smoothing-window 11 --smoothing-polyorder 2 \
+  --output-dir results/replicated_pipeline/ \
+  --extra-fasta data/contaminants.fasta \
+  -v
+```
+
+**Parameter notes:**
+- `--normalize-rms`: matches SCiLS Lab default (RMS, not TIC). Takes priority over the default TIC normalization.
+- `--peak-prominence 0.04`: matches the paper's "4% relative intensity threshold".
+- `--calibrant-mzs`: trypsin autolysis peaks used as internal mass standards. `--calibrant-tol-ppm` defaults to 200 ppm (wide enough to find them before recalibration).
+- `--mass-defect-halfwidth 0.2`: tighter than the 0.5 default; filters lipids/matrix clusters outside the peptide corridor.
+- `--smoothing-window 11 --smoothing-polyorder 2`: best config from parameter sweep on this dataset (17/22 GT features matched).
 
 #### `extract_scils_features(imzml_path, config, output_dir, visualize)`
 

@@ -304,6 +304,124 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     raw_grp.add_argument(
+        "--smoothing-window",
+        type=int,
+        default=11,
+        metavar="INT",
+        help=(
+            "Savitzky-Golay smoothing window length (odd integer ≥ 3) applied to "
+            "the mean spectrum before peak detection (profile mode only). "
+            "Larger values smooth more but can shift peak apices. Default: 11."
+        ),
+    )
+    raw_grp.add_argument(
+        "--smoothing-polyorder",
+        type=int,
+        default=2,
+        metavar="INT",
+        help=(
+            "Savitzky-Golay polynomial order for mean-spectrum smoothing "
+            "(must be < --smoothing-window). Default: 2."
+        ),
+    )
+    raw_grp.add_argument(
+        "--interval-ppm-tolerance",
+        type=float,
+        default=10.0,
+        metavar="FLOAT",
+        help=(
+            "Fallback interval half-width (ppm) used when no valley flanks a "
+            "detected peak in the mean spectrum (profile mode only). Default: 5.0."
+        ),
+    )
+    raw_grp.add_argument(
+        "--min-interval-width-ppm",
+        type=float,
+        default=2.0,
+        metavar="FLOAT",
+        help=(
+            "Minimum interval full-width (ppm). Intervals narrower than this are "
+            "symmetrically expanded around the apex (profile mode only). Default: 1.0."
+        ),
+    )
+    raw_grp.add_argument(
+        "--normalize-rms",
+        action="store_true",
+        help=(
+            "RMS-normalize each pixel spectrum before mean spectrum accumulation "
+            "(profile mode only). Takes priority over the default TIC normalization. "
+            "Matches the SCiLS Lab default normalization."
+        ),
+    )
+    raw_grp.add_argument(
+        "--baseline-correction",
+        action="store_true",
+        help=(
+            "Apply rolling-minimum baseline subtraction to the mean spectrum before "
+            "peak detection (profile mode only)."
+        ),
+    )
+    raw_grp.add_argument(
+        "--baseline-window-ppm",
+        type=float,
+        default=500.0,
+        metavar="FLOAT",
+        help="Half-width (ppm) of the rolling-minimum baseline window. Default: 500.0.",
+    )
+    raw_grp.add_argument(
+        "--calibrant-mzs",
+        type=float,
+        nargs="*",
+        default=None,
+        metavar="MZ",
+        help=(
+            "Theoretical m/z values of internal calibrants (e.g. trypsin autolysis "
+            "peaks). When provided, detected apices are used to fit a linear ppm "
+            "correction and all intervals are recalibrated (profile mode only). "
+            "Example: --calibrant-mzs 842.51 870.54 1045.56"
+        ),
+    )
+    raw_grp.add_argument(
+        "--calibrant-tol-ppm",
+        type=float,
+        default=200.0,
+        metavar="FLOAT",
+        help="Search window (ppm) for matching detected apices to calibrant m/z. Default: 200.0.",
+    )
+    raw_grp.add_argument(
+        "--deisotope",
+        action="store_true",
+        help=(
+            "Remove M+1 and M+2 isotope peaks (z=1 spacing, 1.003355 Da) after "
+            "interval detection, retaining only monoisotopic peaks (profile mode only)."
+        ),
+    )
+    raw_grp.add_argument(
+        "--deisotope-tol-da",
+        type=float,
+        default=0.05,
+        metavar="FLOAT",
+        help="Tolerance (Da) around the 1.003355 Da isotope spacing. Default: 0.05.",
+    )
+    raw_grp.add_argument(
+        "--filter-mass-defect",
+        action="store_true",
+        help=(
+            "Apply Senko-plot peptide corridor mass defect filter after interval "
+            "detection (profile mode only). Removes lipids and matrix clusters."
+        ),
+    )
+    raw_grp.add_argument(
+        "--mass-defect-halfwidth",
+        type=float,
+        default=0.5,
+        metavar="FLOAT",
+        help=(
+            "Half-width of the mass defect corridor. Default 0.5 passes all peaks "
+            "(effectively disabled). Use 0.15–0.20 for a meaningful peptide filter."
+        ),
+    )
+    raw_grp.add_argument(
         "--save-npz",
         metavar="PATH",
         help=(
@@ -540,6 +658,19 @@ def main() -> None:
             matching_ppm=args.matching_ppm,
             min_fraction=args.min_fraction,
             peak_prominence=args.peak_prominence,
+            smoothing_window=args.smoothing_window,
+            smoothing_polyorder=args.smoothing_polyorder,
+            ppm_tolerance=args.interval_ppm_tolerance,
+            min_interval_width_ppm=args.min_interval_width_ppm,
+            normalize_rms=args.normalize_rms,
+            baseline_correction=args.baseline_correction,
+            baseline_window_ppm=args.baseline_window_ppm,
+            calibrant_mzs=args.calibrant_mzs,
+            calibrant_tol_ppm=args.calibrant_tol_ppm,
+            deisotope=args.deisotope,
+            deisotope_tol_da=args.deisotope_tol_da,
+            filter_mass_defect=args.filter_mass_defect,
+            mass_defect_halfwidth=args.mass_defect_halfwidth,
             output_npz=args.save_npz,
             output_spatial_tsv=args.save_spatial,
             output_dir=args.output_dir,
@@ -559,7 +690,23 @@ def main() -> None:
             "prior features only, not for feature selection."
         )
         logger.info(f"Extracting MALDI features from imzML: {args.maldi_imzml}")
-        cfg = SCiLSConfig()
+        cfg = SCiLSConfig(
+            min_pixel_fraction=args.min_fraction,
+            peak_prominence=args.peak_prominence,
+            smoothing_window=args.smoothing_window,
+            smoothing_polyorder=args.smoothing_polyorder,
+            ppm_tolerance=args.interval_ppm_tolerance,
+            min_interval_width_ppm=args.min_interval_width_ppm,
+            normalize_rms=args.normalize_rms,
+            baseline_correction=args.baseline_correction,
+            baseline_window_ppm=args.baseline_window_ppm,
+            calibrant_mzs=args.calibrant_mzs or [],
+            calibrant_tol_ppm=args.calibrant_tol_ppm,
+            deisotope=args.deisotope,
+            deisotope_tol_da=args.deisotope_tol_da,
+            filter_mass_defect=args.filter_mass_defect,
+            mass_defect_halfwidth=args.mass_defect_halfwidth,
+        )
         intervals, intensity_matrix, pixel_coords = extract_scils_features(
             args.maldi_imzml,
             config=cfg,
