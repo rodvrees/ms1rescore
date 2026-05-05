@@ -137,14 +137,15 @@ def _write_results(
 ) -> None:
     """Write rescoring results to TSV files in ``output_dir``.
 
-    Both SVM and CatBoost backends return a DataFrame with an ``is_decoy``
-    column. Only target PSMs are written.
+    Writes all candidates (targets and decoys) with q-value annotation.
+    No hard filtering is applied — downstream consumers can filter by
+    ``q_value``, ``is_tdc_winner``, and ``is_decoy`` as needed.
     """
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, "ms1rescore_psms.tsv")
-    targets = result[~result["is_decoy"]].copy()
-    targets.to_csv(out_path, sep="\t", index=False)
-    logger.info(f"  Wrote {len(targets)} target PSMs → {out_path}")
+    result.to_csv(out_path, sep="\t", index=False)
+    n_winners = result.get("is_tdc_winner", result["is_decoy"].apply(lambda x: not x)).sum()
+    logger.info(f"  Wrote {len(result)} candidates ({n_winners} TDC winners) → {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +275,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     raw_grp.add_argument(
+        "--peak-prominence",
+        type=float,
+        default=0.01,
+        metavar="FLOAT",
+        help=(
+            "Minimum peak prominence for SCiLS-style feature detection on profile "
+            "data, as a fraction of the mean-spectrum maximum. Lower values detect "
+            "more (weaker) features; higher values are more conservative. "
+            "Default: 0.01. Typical range: 0.001–0.05."
+        ),
+    )
+    raw_grp.add_argument(
         "--save-npz",
         metavar="PATH",
         help=(
@@ -339,13 +352,14 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp = parser.add_argument_group("rescoring")
     rescore_grp.add_argument(
         "--model",
-        choices=("svm", "catboost"),
+        choices=("svm", "catboost", "generative"),
         default="svm",
         help=(
             "Rescoring backend. 'svm': mokapot PercolatorModel trained on "
             "MALDI-intrinsic features (default). 'catboost': semi-supervised "
             "CatBoostRanker with pseudo-label iteration (requires "
-            "pip install ms1rescore[catboost])."
+            "pip install ms1rescore[catboost]). 'generative': probabilistic "
+            "generative scorer, no training required."
         ),
     )
     rescore_grp.add_argument(
@@ -508,6 +522,7 @@ def main() -> None:
             extraction_ppm=args.extraction_ppm,
             matching_ppm=args.matching_ppm,
             min_fraction=args.min_fraction,
+            peak_prominence=args.peak_prominence,
             output_npz=args.save_npz,
             output_spatial_tsv=args.save_spatial,
             output_dir=args.output_dir,
@@ -630,6 +645,9 @@ def main() -> None:
 
     # --- Write results ---
     logger.info(f"Writing results to {os.path.abspath(args.output_dir)}")
+    if args.verbose:
+        logger.debug("Writing complete result DataFrame to debug_result_df.tsv")
+        result_df.to_csv(f"{args.output_dir}/5_debug_result_df.tsv", sep="\t", index=False)
     _write_results(result_df, args.output_dir)
     logger.info("Done.")
 

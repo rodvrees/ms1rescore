@@ -712,6 +712,7 @@ def extract_maldi_data(
     extraction_ppm: float = 25.0,
     matching_ppm: float = 20.0,
     min_fraction: float = 0.01,
+    peak_prominence: float = 0.01,
     feature_mzs: np.ndarray | None = None,
     images_path: str | None = None,
     image_batch_size: int = 100,
@@ -811,6 +812,7 @@ def extract_maldi_data(
 
             scils_cfg = SCiLSConfig(
                 min_pixel_fraction=min_fraction,
+                peak_prominence=peak_prominence,
             )
             mz_grid, mean_ints = _build_profile_mean_spectrum(reader)
             intervals = _detect_intervals(mz_grid, mean_ints, scils_cfg)

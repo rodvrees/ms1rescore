@@ -103,19 +103,34 @@ def _rescore_svm(
 
     lin = convert_psm_list(psm_list, feature_names=intrinsic_feature_names)
     model = PercolatorModel(train_fdr=train_fdr, max_iter=10)
-    result = brew(lin, model=model)
-    conf_obj = result[0] if isinstance(result, tuple) else result
+    result = brew(lin, model=model, test_fdr=0.05)
+    # brew always returns (confidence, [fold_models])
+    conf_obj, trained_models = result if isinstance(result, tuple) else (result, [])
 
     # Score ALL candidates (targets + decoys) for TDC reweighting.
-    # PercolatorModel trains a LinearSVC; access the fitted estimator directly.
-    present = [f for f in intrinsic_feature_names if f in features_df.columns]
-    X_all = features_df[present].fillna(0.0).values.astype(float)
+    # brew trains k fold models; average their scores across folds for stability.
     all_scores = None
     try:
-        all_scores = model.estimator_.decision_function(X_all)
-    except AttributeError:
+        from mokapot.model import _get_scores
+        fold_scores = []
+        for fm in trained_models:
+            if not fm.is_trained:
+                continue
+            # convert_psm_list prefixes feature names with "feature:"
+            raw_names = [f.removeprefix("feature:") for f in fm.features]
+            present_raw = [f for f in raw_names if f in features_df.columns]
+            if not present_raw:
+                continue
+            X_all = features_df[present_raw].fillna(0.0).values.astype(float)
+            X_scaled = fm.scaler.transform(X_all)
+            fold_scores.append(_get_scores(fm.estimator, X_scaled))
+        if fold_scores:
+            all_scores = np.mean(fold_scores, axis=0)
+        else:
+            logger.warning("No trained fold models found — LC-MS/MS prior reweighting will be skipped.")
+    except Exception as exc:
         logger.warning(
-            "Could not extract SVM scores via model.estimator_. "
+            f"Could not extract SVM scores ({exc}). "
             "LC-MS/MS prior reweighting will be skipped."
         )
     return conf_obj, all_scores
@@ -230,6 +245,49 @@ def _rescore_catboost(
     return scores
 
 
+def _feature_level_tdc(
+    features_df: pd.DataFrame,
+    scores: np.ndarray,
+    feature_col: str = "feature_mz",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-feature TDC q-values.
+
+    For each MALDI feature the winner is the highest-scoring candidate
+    regardless of target/decoy status. TDC is applied over features ranked
+    by their winning score. Q-values are propagated to all candidates at
+    each feature (non-winners inherit their feature's q-value so the full
+    candidate table remains annotated).
+
+    Returns
+    -------
+    q_values : np.ndarray, shape (n_candidates,)
+    is_tdc_winner : np.ndarray[bool], shape (n_candidates,)
+    """
+    df = pd.DataFrame({"_score": scores, "_feat": features_df[feature_col].values})
+    df["_is_decoy"] = features_df["is_decoy"].values.astype(bool)
+
+    winner_pos = df.groupby("_feat")["_score"].idxmax()
+    winner_scores = df.loc[winner_pos, "_score"].values
+    winner_is_decoy = df.loc[winner_pos, "_is_decoy"].values
+
+    order = np.argsort(-winner_scores)
+    n_target_cum = np.cumsum(~winner_is_decoy[order]).astype(float)
+    n_decoy_cum = np.cumsum(winner_is_decoy[order]).astype(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fdr = np.where(n_target_cum > 0, n_decoy_cum / n_target_cum, 1.0)
+    qval_sorted = np.minimum.accumulate(fdr[::-1])[::-1].clip(max=1.0)
+    feat_qvals = np.empty_like(qval_sorted)
+    feat_qvals[order] = qval_sorted
+
+    feat_to_qval = pd.Series(feat_qvals, index=winner_pos.index)
+    q_values = df["_feat"].map(feat_to_qval).values
+
+    is_tdc_winner = np.zeros(len(df), dtype=bool)
+    is_tdc_winner[winner_pos.values] = True
+
+    return q_values, is_tdc_winner
+
+
 def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     """
     Compute per-candidate target-decoy q-values.
@@ -271,6 +329,7 @@ def rescore(
     min_length: int = 7,
     max_length: int = 30,
     model: str = "svm",
+    compute_generative: bool = True,
     init_ppm_threshold: float = 2.0,
     init_isotope_threshold: float = 0.7,
     lcms_proteins_path: str | None = None,
@@ -316,10 +375,16 @@ def rescore(
     max_length
         Maximum peptide length.
     model
-        Rescoring backend: "svm" (mokapot PercolatorModel, default) or
-        "catboost" (semi-supervised CatBoostRanker). Both backends use only
-        MALDI_INTRINSIC_FEATURES for training. LC-MS/MS evidence is applied
-        as a multiplicative prior after scoring.
+        Rescoring backend: "svm" (mokapot PercolatorModel, default),
+        "catboost" (semi-supervised CatBoostRanker), or "generative"
+        (probabilistic generative scorer, no training). SVM and CatBoost use
+        only MALDI_INTRINSIC_FEATURES for training. LC-MS/MS evidence is
+        applied as a multiplicative prior after scoring.
+    compute_generative
+        When True and model is "svm" or "catboost", run the generative scorer
+        first and add its ranking features (generative_score,
+        generative_score_rank, generative_score_gap, generative_score_z) to
+        MALDI_INTRINSIC_FEATURES before training. Default True.
     init_ppm_threshold
         CatBoost only: ppm_error_abs threshold for the initial positive seed.
     init_isotope_threshold
@@ -579,10 +644,29 @@ def rescore(
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
         features_df.to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
+    # --- Step 7b: Generative scoring (optional pre-step) ---
+    has_generative = False
+    if (model in ("svm", "catboost") and compute_generative) or model == "generative":
+        from ms1rescore.probabilistic_scorer import run_generative_scoring
+
+        logger.info("Step 7b: Running generative scorer...")
+        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
+        features_df = run_generative_scoring(features_df, feature_col=feature_col)
+        has_generative = True
+        if verbose:
+            logger.debug(
+                f"Writing features with generative scores to "
+                f"{output_dir}/13b_debug_features_generative.tsv"
+            )
+            features_df.to_csv(
+                f"{output_dir}/13b_debug_features_generative.tsv", sep="\t", index=False
+            )
+
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
         has_ion_images=ion_images is not None,
         has_envelopes=maldi_envelopes is not None and lcms_envelopes_xic is not None,
+        has_generative=has_generative,
     )
     logger.debug(f"Selected feature names: {feature_names}")
 
@@ -591,6 +675,53 @@ def rescore(
         f for f in MALDI_INTRINSIC_FEATURES if f in features_df.columns
     ]
     lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
+
+    # --- Generative-only backend: return without training ---
+    if model == "generative":
+        from ms1rescore.probabilistic_scorer import estimate_fdr as _gen_fdr
+
+        logger.info("Step 9: Generative backend — margin-based TDC FDR...")
+        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
+
+        # Base q-values already computed by run_generative_scoring (margin-based)
+        q_values = features_df["generative_q_value"].values
+        gen_scores = features_df["generative_score"].values
+
+        # Reweighted: apply LC-MS/MS prior to raw scores, re-run margin TDC
+        lcms_prior = compute_lcms_prior(features_df, lcms_present)
+        reweighted_scores = gen_scores * lcms_prior
+        rw_df = features_df.copy()
+        rw_df["_rw_score"] = reweighted_scores
+        rw_df = _gen_fdr(rw_df, score_col="_rw_score", feature_col=feature_col)
+        reweighted_q = rw_df["generative_q_value"].values
+
+        is_decoy = features_df["is_decoy"].values.astype(bool)
+        result_df = pd.DataFrame(
+            {
+                "peptide": features_df["peptide"].values,
+                "feature_idx": features_df.get(
+                    "feature_idx", pd.Series(range(len(features_df)))
+                ).values,
+                "is_decoy": is_decoy,
+                "generative_score": gen_scores,
+                "Delta_m": features_df.get("Delta_m", pd.Series(np.nan, index=features_df.index)).values,
+                "q_value": q_values,
+                "reweighted_score": reweighted_scores,
+                "reweighted_q_value": reweighted_q,
+                "is_tdc_winner": features_df.get("is_tdc_winner", pd.Series(False, index=features_df.index)).values,
+            }
+        )
+
+        for fdr_threshold in [0.01, 0.05, 0.10]:
+            n = (result_df["is_tdc_winner"] & (result_df["q_value"] <= fdr_threshold)).sum()
+            n_rw = (result_df["is_tdc_winner"] & (result_df["reweighted_q_value"] <= fdr_threshold)).sum()
+            logger.info(
+                f"  At {fdr_threshold*100:.0f}% FDR: {n} winners (base), "
+                f"{n_rw} winners (reweighted)"
+            )
+
+        psm_list = candidates_to_psm_list(features_df)
+        return psm_list, result_df, feature_names
 
     # --- Step 8: Build PSMList ---
     logger.info("Step 8: Building PSMList...")
@@ -639,54 +770,44 @@ def rescore(
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
         lcms_prior = compute_lcms_prior(features_df, lcms_present)
+        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
 
         if all_scores is not None:
-            q_values = _tdc_qvalues(all_scores, is_decoy)
+            q_values, is_winner = _feature_level_tdc(features_df, all_scores, feature_col)
             reweighted_scores = all_scores * lcms_prior
-            reweighted_q = _tdc_qvalues(reweighted_scores, is_decoy)
+            reweighted_q, _ = _feature_level_tdc(features_df, reweighted_scores, feature_col)
         else:
-            # Fallback: fill from mokapot's target-only q-values; reweighting skipped
             logger.warning(
-                "SVM score extraction failed — reweighted_q_value will equal q_value."
+                "SVM score extraction failed — q_value and reweighted_q_value will be NaN."
             )
-            q_values = np.ones(len(features_df))
+            all_scores = np.zeros(len(features_df))
             reweighted_scores = np.zeros(len(features_df))
-            reweighted_q = np.ones(len(features_df))
-            conf = conf_obj.confidence_estimates
-            psm_conf = conf["psms"]
-            score_col = next(
-                (c for c in psm_conf.columns if "score" in c.lower()), None
-            )
-            qval_col = next(
-                (c for c in psm_conf.columns if "q-value" in c.lower()), None
-            )
-            if score_col and qval_col:
-                q_values[~is_decoy] = psm_conf[qval_col].values[: (~is_decoy).sum()]
+            q_values = np.full(len(features_df), np.nan)
+            reweighted_q = np.full(len(features_df), np.nan)
+            is_winner = np.zeros(len(features_df), dtype=bool)
 
         result_df = pd.DataFrame(
             {
                 "peptide": features_df["peptide"].values,
+                "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
                 "feature_idx": features_df.get(
                     "feature_idx", pd.Series(range(len(features_df)))
                 ).values,
                 "is_decoy": is_decoy,
-                "svm_score": (
-                    all_scores if all_scores is not None else np.zeros(len(features_df))
-                ),
+                "svm_score": all_scores,
                 "q_value": q_values,
+                "is_tdc_winner": is_winner,
                 "reweighted_score": reweighted_scores,
                 "reweighted_q_value": reweighted_q,
             }
         )
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = ((result_df["q_value"] <= fdr_threshold) & ~is_decoy).sum()
-            n_rw = (
-                (result_df["reweighted_q_value"] <= fdr_threshold) & ~is_decoy
-            ).sum()
+            n = (is_winner & ~is_decoy & (q_values <= fdr_threshold)).sum()
+            n_rw = (is_winner & ~is_decoy & (reweighted_q <= fdr_threshold)).sum()
             logger.info(
-                f"  At {fdr_threshold*100:.0f}% FDR: {n} targets (base), "
-                f"{n_rw} targets (reweighted)"
+                f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
+                f"{n_rw} target features (reweighted)"
             )
 
         return psm_list, result_df, feature_names
@@ -707,52 +828,39 @@ def rescore(
                 pickle.dump(scores, f)
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
-        q_values = _tdc_qvalues(scores, is_decoy)
-
-        if verbose:
-            logger.debug(
-                f"Writing CatBoost q-values to {output_dir}/16_debug_catboost_qvalues.pkl"
-            )
-            with open(f"{output_dir}/16_debug_catboost_qvalues.pkl", "wb") as f:
-                pickle.dump(q_values, f)
+        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
+        q_values, is_winner = _feature_level_tdc(features_df, scores, feature_col)
 
         # LC-MS/MS prior reweight
         lcms_prior = compute_lcms_prior(features_df, lcms_present)
         reweighted_scores = scores * lcms_prior
-        reweighted_q = _tdc_qvalues(reweighted_scores, is_decoy)
-
-        if verbose:
-            logger.debug(
-                f"Writing reweighted CatBoost q-values to {output_dir}/16_debug_catboost_reweighted_qvalues.pkl"
-            )
-            with open(f"{output_dir}/16_debug_catboost_reweighted_qvalues.pkl", "wb") as f:
-                pickle.dump(reweighted_q, f)
+        reweighted_q, _ = _feature_level_tdc(features_df, reweighted_scores, feature_col)
 
         result_df = pd.DataFrame(
             {
                 "peptide": features_df["peptide"].values,
+                "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
                 "feature_idx": features_df.get(
                     "feature_idx", pd.Series(range(len(features_df)))
                 ).values,
                 "is_decoy": is_decoy,
                 "catboost_score": scores,
                 "q_value": q_values,
+                "is_tdc_winner": is_winner,
                 "reweighted_score": reweighted_scores,
                 "reweighted_q_value": reweighted_q,
             }
         )
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = ((result_df["q_value"] <= fdr_threshold) & ~is_decoy).sum()
-            n_rw = (
-                (result_df["reweighted_q_value"] <= fdr_threshold) & ~is_decoy
-            ).sum()
+            n = (is_winner & ~is_decoy & (q_values <= fdr_threshold)).sum()
+            n_rw = (is_winner & ~is_decoy & (reweighted_q <= fdr_threshold)).sum()
             logger.info(
-                f"  At {fdr_threshold*100:.0f}% FDR: {n} targets (base), "
-                f"{n_rw} targets (reweighted)"
+                f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
+                f"{n_rw} target features (reweighted)"
             )
 
         return psm_list, result_df, feature_names
 
     else:
-        raise ValueError(f"Unknown model '{model}'. Choose 'svm' or 'catboost'.")
+        raise ValueError(f"Unknown model '{model}'. Choose 'svm', 'catboost', or 'generative'.")

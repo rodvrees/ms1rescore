@@ -75,6 +75,9 @@ MALDI_INTRINSIC_FEATURES = [
     "theo_has_sulfur", "averagine_deviation", "averagine_deviation_sulfur",
     "theo_m1_ratio_diff", "theo_m2_ratio_diff",
     "monoisotopic_confidence",       # A8
+    # --- generative model outputs (optional — requires run_generative_scoring) ---
+    "generative_score", "generative_score_rank",
+    "generative_score_gap", "generative_score_z",
     # --- ionization priors ---
     "n_arginine", "n_basic_residues", "n_phenylalanine", "n_aromatic",
     "gravy_score", "charge_proxy",
@@ -153,6 +156,10 @@ _ADDUCT_COLOC_FEATS = frozenset([
     "adduct_colocalization_na", "adduct_colocalization_k", "adduct_colocalization_chca",
 ])
 _MORANS_FEATS = frozenset(["spatial_morans_i", "spatial_gearys_c"])
+_GENERATIVE_FEATS = frozenset([
+    "generative_score", "generative_score_rank",
+    "generative_score_gap", "generative_score_z",
+])
 
 
 def get_feature_names(
@@ -161,6 +168,7 @@ def get_feature_names(
     has_envelopes: bool = False,
     has_pixel_coords: bool = False,
     has_ccs: bool = False,
+    has_generative: bool = False,
 ) -> list[str]:
     """Return the full list of feature names based on available data.
 
@@ -178,6 +186,7 @@ def get_feature_names(
         and (f not in _ENVELOPE_FEATS or has_envelopes)
         and (f not in _PIXEL_FEATS or has_pixel_coords)
         and (f not in _CCS_FEATS or has_ccs)
+        and (f not in _GENERATIVE_FEATS or has_generative)
     ]
     return intrinsic + LCMS_PRIOR_FEATURES
 
@@ -198,7 +207,7 @@ def candidates_to_psm_list(candidates_df: pd.DataFrame) -> PSMList:
             protein_list=[str(getattr(row, "protein", ""))],
             precursor_mz=float(getattr(row, "feature_mz", getattr(row, "mh_mz", 0))),
             score=float(-getattr(row, "ppm_error_abs", 0)),
-            metadata={c: getattr(row, c) for c in meta_cols},
+            metadata={c: str(getattr(row, c)) for c in meta_cols},
         )
         psms.append(psm)
 

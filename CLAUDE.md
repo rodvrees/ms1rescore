@@ -404,7 +404,18 @@ P12345  →  P12345
 4. Repeat until <1% change in positive set size or 5 iterations maximum
 5. Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `peptide`, `feature_idx`, `is_decoy`, `catboost_score`, `q_value`, `reweighted_score`, `reweighted_q_value`
 
-**LC-MS/MS prior reweight** (applied after both backends): `compute_lcms_prior()` min-max normalizes each `LCMS_PRIOR_FEATURES` column across all candidates, averages the normalized values (excluding all-zero features), and multiplies the resulting weight into the base score. Q-values are recomputed on the reweighted score. Original scores are preserved alongside reweighted scores.
+**`model="generative"`:** Probabilistic generative scorer. No training. Implemented in `probabilistic_scorer.py`.
+- Estimates noise parameters label-free from the best-ppm non-decoy candidate per MALDI feature (proxy for true positives).
+- Computes a log-sum generative score from independent half-normal / normal likelihoods for: ppm error, isotope cosine deviation from 1.0, CCS deviation (if im2deep present), spatial autocorrelation (if spatial features present).
+- Adds per-feature ranking features: `generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`.
+- **FDR estimation** uses per-feature TDC ranked by Tm. For each MALDI feature, the best target score (Tm) and best decoy score (Dm) are computed independently. Features are ranked by descending Tm; at threshold τ, FDR(τ) = (#{features where Dm ≥ τ} + 1) / #{features where Tm ≥ τ}. Delta_m = Tm − Dm is retained as a supplementary column for diagnostics and near-tie filtering, but is not the ranking statistic. Local PEP is estimated by isotonic regression on the Tm-sorted target/decoy win labels (requires scikit-learn).
+- Output columns specific to FDR step: `Tm`, `Dm`, `Delta_m`, `generative_q_value`, `generative_pep`, `is_tdc_winner`.
+- LC-MS/MS prior reweight: applied to raw generative_score per candidate; reweighted scores re-enter a second `estimate_fdr` pass to produce `reweighted_q_value`.
+- Returns `(psm_list, result_df, feature_names)` with columns: `peptide`, `feature_idx`, `is_decoy`, `generative_score`, `Delta_m`, `q_value`, `reweighted_score`, `reweighted_q_value`, `is_tdc_winner`.
+
+**Generative pre-scoring for SVM/CatBoost** (`compute_generative=True`, default): when model is `"svm"` or `"catboost"`, the generative scorer runs first (step 7b) and its four ranking features are added to `MALDI_INTRINSIC_FEATURES` before the training step. This gives the discriminative model a calibrated signal-to-noise score as an additional feature.
+
+**LC-MS/MS prior reweight** (applied after all backends): `compute_lcms_prior()` min-max normalizes each `LCMS_PRIOR_FEATURES` column across all candidates, averages the normalized values (excluding all-zero features), and multiplies the resulting weight into the base score. Q-values are recomputed on the reweighted score. Original scores are preserved alongside reweighted scores.
 
 ---
 
