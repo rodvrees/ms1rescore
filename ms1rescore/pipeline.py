@@ -279,8 +279,9 @@ def _feature_level_tdc(
     feat_qvals = np.empty_like(qval_sorted)
     feat_qvals[order] = qval_sorted
 
-    feat_to_qval = pd.Series(feat_qvals, index=winner_pos.index)
-    q_values = df["_feat"].map(feat_to_qval).values
+    # q-values are only meaningful for the per-feature winner; NaN for all others
+    q_values = np.full(len(df), np.nan)
+    q_values[winner_pos.values] = feat_qvals
 
     is_tdc_winner = np.zeros(len(df), dtype=bool)
     is_tdc_winner[winner_pos.values] = True

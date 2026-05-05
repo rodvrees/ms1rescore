@@ -146,7 +146,13 @@ def _write_results(
     result.to_csv(out_path, sep="\t", index=False)
     n_winners = result.get("is_tdc_winner", result["is_decoy"].apply(lambda x: not x)).sum()
     logger.info(f"  Wrote {len(result)} candidates ({n_winners} TDC winners) → {out_path}")
-
+    # Filter per-feature winners filtered by q-value
+    if "is_tdc_winner" in result.columns and "q_value" in result.columns:
+        winners = result[result["is_tdc_winner"] & (result["q_value"] <= 0.01)]
+        peptides_out = os.path.join(output_dir, "ms1rescore_peptides.tsv")
+        peptides = winners[["peptide", "q_value"]].drop_duplicates().sort_values("q_value")
+        peptides.to_csv(peptides_out, sep="\t", index=False)
+        logger.info(f"  Wrote {len(peptides)} peptide-level winners → {peptides_out}")
 
 # ---------------------------------------------------------------------------
 # Argument parser
