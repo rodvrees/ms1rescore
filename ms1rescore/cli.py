@@ -150,7 +150,7 @@ def _write_results(
     if "is_tdc_winner" in result.columns and "q_value" in result.columns:
         winners = result[result["is_tdc_winner"] & (result["q_value"] <= 0.01)]
         peptides_out = os.path.join(output_dir, "ms1rescore_peptides.tsv")
-        peptides = winners[["peptide", "q_value"]].drop_duplicates().sort_values("q_value")
+        peptides = winners[["feature_idx", "feature_mz", "peptide", "q_value"]].drop_duplicates().sort_values("q_value")
         peptides.to_csv(peptides_out, sep="\t", index=False)
         logger.info(f"  Wrote {len(peptides)} peptide-level winners → {peptides_out}")
 
@@ -183,6 +183,17 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="PATH",
         help="Protein FASTA file (forward sequences only; decoys are generated).",
+    )
+    req.add_argument(
+        "--extra-fasta",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Additional FASTA file whose proteins are always included in the "
+            "candidate database (e.g. contaminants, spike-ins). Works with both "
+            "Strategy A and C. Peptides already present in the primary database "
+            "are not duplicated."
+        ),
     )
     req.add_argument(
         "--mzml",
@@ -645,6 +656,7 @@ def main() -> None:
         lcms_id_format=lcms_id_format,
         protein_fdr=args.protein_fdr,
         peptide_fdr=args.peptide_fdr,
+        extra_fasta_path=args.extra_fasta,
         verbose=args.verbose,
         output_dir=args.output_dir,
     )

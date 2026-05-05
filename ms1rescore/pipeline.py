@@ -339,6 +339,7 @@ def rescore(
     lcms_id_format: str = "percolator",
     protein_fdr: float = 0.01,
     peptide_fdr: float = 0.01,
+    extra_fasta_path: str | None = None,
     verbose: bool = False,
     output_dir: str = "ms1rescore_output",
 ):
@@ -408,6 +409,13 @@ def rescore(
         Protein FDR threshold for Strategy C protein filtering (default 0.01).
     peptide_fdr
         Peptide FDR threshold for Strategy C candidate inclusion (default 0.01).
+    extra_fasta_path
+        Optional additional FASTA file (e.g. contaminants). All proteins in
+        this file are always included in the candidate database regardless of
+        LC-MS/MS identification status. Works with both Strategy A and C.
+        Proteins already present in the primary database (by peptide sequence)
+        are not duplicated; when the same peptide appears in both, the entry
+        from the primary digest (with any LC-MS/MS evidence) is kept.
 
     Returns
     -------
@@ -493,6 +501,26 @@ def rescore(
             pd.DataFrame(peptide_db).to_csv(
                 f"{output_dir}/8_debug_peptide_db_full.tsv", sep="\t", index=False
             )
+
+    # --- Step 1b: Merge extra FASTA (contaminants / spike-ins) ---
+    if extra_fasta_path is not None:
+        logger.info(f"Step 1b: Merging extra FASTA: {extra_fasta_path}")
+        extra_db = digest_fasta(
+            extra_fasta_path,
+            missed_cleavages=missed_cleavages,
+            min_length=min_length,
+            max_length=max_length,
+            generate_decoys=True,
+        )
+        existing_seqs = set(peptide_db["peptide"].values)
+        extra_db = extra_db[~extra_db["peptide"].isin(existing_seqs)].copy()
+        n_target_extra = int((~extra_db["is_decoy"]).sum())
+        n_decoy_extra = int(extra_db["is_decoy"].sum())
+        peptide_db = pd.concat([peptide_db, extra_db], ignore_index=True)
+        logger.info(
+            f"  Added {n_target_extra} target + {n_decoy_extra} decoy peptide entries "
+            f"from {extra_fasta_path!r}"
+        )
 
     maldi_intensities = None
     maldi_intensities_p90 = None
