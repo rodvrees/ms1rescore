@@ -110,13 +110,19 @@ Install: `pip install ms1rescore[maldi]` (installs `pyimzml`).
 
 2. **Baseline correction** (optional, `baseline_correction=True`): rolling-minimum filter (`scipy.ndimage.minimum_filter1d`) + Gaussian smoothing of the baseline estimate, subtracted from the mean spectrum before peak detection. Window width in points computed at median m/z from `baseline_window_ppm`.
 
-3. **Detect intervals** on the (optionally baseline-corrected) mean spectrum: Savitzky-Golay smooth → `find_peaks` → valley-to-valley boundaries. For each detected peak, left boundary = last valley before the peak, right boundary = first valley after the peak. Fallback to `mz_apex ± ppm_tolerance × mz_apex × 1e-6` when no flanking valley exists (isolated edge peak). Intervals narrower than `min_interval_width_ppm` are symmetrically expanded.
+3. **Detect intervals** on the (optionally baseline-corrected) mean spectrum: Savitzky-Golay smooth → `find_peaks(height=threshold)` → valley-to-valley boundaries. The height threshold matches the paper's "4% relative intensity threshold" (peaks above 4% of the base peak, as an absolute height filter). **Do not use scipy's topographic `prominence=` here** — prominence is the peak height above its lowest connecting saddle to a higher peak, which can be far below the absolute height for peaks surrounded by moderately intense neighbours, causing genuine peaks to be missed. When `local_prominence_window_da > 0`, the threshold for each peak is `peak_prominence × local_max(±window)` (sliding-window local max) instead of `peak_prominence × global_max`. This reduces the effective threshold in low-signal m/z regions (e.g. >1600 Da) where the global threshold would suppress genuine peptide peaks. For each detected peak, left boundary = last valley before the peak, right boundary = first valley after the peak. Fallback to `mz_apex ± ppm_tolerance × mz_apex × 1e-6` when no flanking valley exists. Intervals narrower than `min_interval_width_ppm` are symmetrically expanded.
 
 4. **Recalibration** (optional, `calibrant_mzs` non-empty): for each calibrant m/z, find the nearest detected apex within `calibrant_tol_ppm`; fit a linear ppm offset vs m/z model; apply correction to all interval apices and boundaries.
 
-5. **Deisotoping** (optional, `deisotope=True`): remove M+1 and M+2 isotope peaks at z=1 spacing (1.003355 Da ± `deisotope_tol_da`), retaining only monoisotopic apices.
+5. **Deisotoping** (optional, `deisotope=True`): remove M+1 and M+2 isotope peaks at z=1 spacing (1.003355 Da ± `deisotope_tol_da`). Two intensity guards prevent false positives:
 
-6. **Mass defect filter** (optional, `filter_mass_defect=True`): Senko-plot peptide corridor. For each [M+H]+ apex: `neutral = apex − 1.007276`, `defect = neutral − round(neutral)`, `expected = round(neutral) × −0.000491 + 0.1`. Keep if `|defect − expected| ≤ mass_defect_halfwidth`. Default halfwidth 0.5 passes all peaks; use 0.15–0.20 to filter lipids and matrix clusters.
+   - **k-specific expected ratio**: for k=1, threshold = `(1/lambda) × min_fold`; for k=2, threshold = `(2/lambda²) × min_fold`. The M0/M+2 ratio (2/lambda²) is always much larger than M0/M+1 (1/lambda), so the k=2 guard is substantially stricter. Using the k=1 formula for k=2 causes false-positive removal of GT features that coincidentally fall ~2 Da above a more intense unrelated peak.
+
+   - **Absolute floor at 1.0**: `threshold = max(k-specific-threshold, 1.0)`. If M+k > M0 in the mean spectrum (obs_ratio < 1), the pair is physically inconsistent with a true isotope pattern — two unrelated peptides of similar intensity, or a mean-spectrum averaging artifact — so removal is skipped. This prevents false-positive deisotoping at high masses (>~1400 Da) where the averagine M0/M+1 ratio drops below ~1.43 and the averagine-relative threshold would drop below 1.0.
+
+   Default `deisotope_min_fold=0.67`. **Note**: in single-cell MALDI-MSI data, M+1 peaks often survive deisotoping because heterogeneous cell expression patterns cause the mean spectrum M0/M+1 ratio to be lower than the averagine prediction. This is a fundamental limitation of mean-spectrum deisotoping; per-pixel deisotoping would be needed to eliminate all isotope peaks reliably.
+
+6. **Mass defect filter** (optional, `filter_mass_defect=True`): Senko-plot peptide corridor. For each [M+H]+ apex: `neutral = apex − 1.007276`, `nominal = floor(neutral)`, `defect = neutral − nominal` (always in [0,1)), `expected = 0.000509 × nominal` (averagine slope, positive). Keep if `|defect − expected| ≤ mass_defect_halfwidth`. Default halfwidth 0.5 passes all peaks; use 0.25 to filter lipids/matrix while retaining all tryptic peptides in 800–2000 Da. **Do not use `round()` for nominal mass** — for neutrals with fractional part >0.5 it flips the defect sign and breaks the corridor test.
 
 7. **Integrate pixels** over intervals. RMS normalization (if `normalize_rms=True`, takes priority) or TIC normalization (if `normalize_tic=True`) is applied to each pixel spectrum before interval integration. Per interval: sum all intensities within `[mz_start, mz_end]` (`use_apex=False`) or take the apex intensity (`use_apex=True`).
 
@@ -145,10 +151,13 @@ SCiLSConfig(
     calibrant_tol_ppm=200.0,
     # Deisotoping
     deisotope=False,
-    deisotope_tol_da=0.05,
+    deisotope_tol_da=0.15,
+    deisotope_min_fold=0.67,         # fraction of averagine-expected M0/M+1 ratio; see step 5 above
     # Senko mass defect filter
     filter_mass_defect=False,
     mass_defect_halfwidth=0.5,    # 0.5 = all pass; 0.15–0.20 = meaningful peptide filter
+    # Local adaptive prominence (0 = global max reference)
+    local_prominence_window_da=0.0,  # >0 enables sliding-window local max; suggested 200 Da
 )
 ```
 
@@ -170,7 +179,7 @@ ms1rescore \
   --peak-prominence 0.04 \
   --calibrant-mzs 842.51 870.54 1045.56 \
   --deisotope \
-  --filter-mass-defect --mass-defect-halfwidth 0.2 \
+  --filter-mass-defect --mass-defect-halfwidth 0.25 \
   --min-fraction 0.01 \
   --smoothing-window 11 --smoothing-polyorder 2 \
   --output-dir results/replicated_pipeline/ \
@@ -182,8 +191,10 @@ ms1rescore \
 - `--normalize-rms`: matches SCiLS Lab default (RMS, not TIC). Takes priority over the default TIC normalization.
 - `--peak-prominence 0.04`: matches the paper's "4% relative intensity threshold".
 - `--calibrant-mzs`: trypsin autolysis peaks used as internal mass standards. `--calibrant-tol-ppm` defaults to 200 ppm (wide enough to find them before recalibration).
-- `--mass-defect-halfwidth 0.2`: tighter than the 0.5 default; filters lipids/matrix clusters outside the peptide corridor.
-- `--smoothing-window 11 --smoothing-polyorder 2`: best config from parameter sweep on this dataset (17/22 GT features matched).
+- `--mass-defect-halfwidth 0.25`: covers all 22 GT tryptic peptides in 800–2000 Da while filtering lipids/matrix. Use 0.5 (default) to disable the filter.
+- `--picking-height 0.75` (default): matches the mMass "picking height 75%" setting. Computes apex m/z as the midpoint of the two interpolated crossings at 75% of the peak maximum, giving a more accurate centroid for asymmetric peaks. Use `--picking-height 0.0` to revert to the raw smoothed-spectrum apex.
+- `--smoothing-window 11 --smoothing-polyorder 1`: best config from parameter sweep on this dataset (v11: 17/22 GT features matched).
+- `--deisotope-min-fold 0.67` (default): scales the k-specific averagine-expected ratio. The effective threshold is `max((1/lambda for k=1, or 2/lambda² for k=2) × fold, 1.0)`. With fold=0.67 at 975 Da and k=1: threshold = 1.35×; at k=2: threshold = 5.40×. The absolute floor at 1.0 prevents false-positive removal at high masses (>1400 Da) where the averagine M0/M+1 ratio approaches 1:1.
 
 #### `extract_scils_features(imzml_path, config, output_dir, visualize)`
 

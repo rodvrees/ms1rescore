@@ -49,10 +49,15 @@ class SCiLSConfig:
     calibrant_tol_ppm: float = 200.0     # search window to find each calibrant
     # Deisotoping (remove M+1/M+2 peaks at z=1 spacing)
     deisotope: bool = False
-    deisotope_tol_da: float = 0.05       # tolerance around 1.003355 Da
+    deisotope_tol_da: float = 0.15       # tolerance around 1.003355 Da
+    deisotope_min_fold: float = 0.67     # fraction of averagine-expected M0/M+1 ratio; lower = more permissive
     # Senko mass defect filter (peptide corridor)
     filter_mass_defect: bool = False
     mass_defect_halfwidth: float = 0.5   # half-width of corridor; 0.5 = all pass
+    # Picking height centroid (mMass-style apex refinement)
+    picking_height: float = 0.75         # fraction of apex intensity; 0.0 = disabled (raw apex)
+    # Local adaptive prominence (sliding-window local max as reference instead of global max)
+    local_prominence_window_da: float = 0.0  # 0 = global max reference; >0 = window half-width in Da
 
 
 # ---------------------------------------------------------------------------
@@ -256,28 +261,77 @@ def _recalibrate_intervals(
 def _deisotope_intervals(
     intervals: list[tuple[float, float, float]],
     tol_da: float,
+    apex_intensities: np.ndarray | None = None,
+    min_fold: float = 0.7,
 ) -> list[tuple[float, float, float]]:
     """Remove M+1 and M+2 isotope peaks (z=1, spacing 1.003355 Da).
 
-    Sorts by apex ascending. A peak is flagged as an isotope peak when its
-    apex is within tol_da of exactly 1× or 2× the neutron mass above any
-    earlier (lower m/z) apex. Only the monoisotopic peak is retained.
+    Sorts by apex ascending. A peak i is flagged as an isotope of peak j when:
+      - |apex_i − apex_j − k × 1.003355| < tol_da  (k = 1 or 2), AND
+      - intensity_j >= intensity_i × (1/lambda) × min_fold
+
+    where lambda = 0.000509 × mz_j (averagine Poisson parameter).
+
+    Two physically motivated guards prevent false-positive deisotoping:
+
+    1. **k-specific expected ratio**: for k=1 the expected M0/M+1 ratio is
+       1/lambda; for k=2 the expected M0/M+2 ratio is 2/lambda². The M+2
+       threshold is always much higher than the M+1 threshold, preventing
+       false removal of an unrelated peptide that coincidentally falls ~2 Da
+       above a more intense peak.
+
+    2. **Absolute minimum of 1.0**: the threshold is floored at 1.0, meaning
+       M0 must always be at least as intense as M+k. When M+k > M0 in the
+       mean spectrum (obs_ratio < 1) the pair is physically inconsistent with
+       a true isotope pattern — likely two unrelated peptides of similar
+       intensity — so removal is skipped. This also prevents false-positive
+       deisotoping at high masses (>~1400 Da) where the averagine-expected
+       M0/M+1 ratio drops below 1.43 and the guard becomes overly permissive.
+
+    ``min_fold`` (default 0.7) scales the averagine-expected ratio. When
+    apex_intensities is None the intensity guard is skipped entirely.
     """
     NEUTRON = 1.003355
+    AVERAGINE_SLOPE = 0.000509  # lambda = slope × M0_mz
     if not intervals:
         return intervals
 
-    sorted_ivs = sorted(intervals, key=lambda iv: iv[2])
+    order = np.argsort([iv[2] for iv in intervals])
+    sorted_ivs = [intervals[k] for k in order]
     apices = np.array([iv[2] for iv in sorted_ivs])
-    is_isotope = np.zeros(len(apices), dtype=bool)
 
+    if apex_intensities is not None:
+        sorted_ints = np.asarray(apex_intensities, dtype=np.float64)[order]
+    else:
+        sorted_ints = None
+
+    is_isotope = np.zeros(len(apices), dtype=bool)
     for i in range(1, len(apices)):
         for k in (1, 2):
             target = apices[i] - k * NEUTRON
             diffs = np.abs(apices[:i] - target)
-            if diffs.min() <= tol_da:
-                is_isotope[i] = True
-                break
+            best_j = int(np.argmin(diffs))
+            if diffs[best_j] <= tol_da:
+                if sorted_ints is None:
+                    is_isotope[i] = True
+                    break
+                lam = AVERAGINE_SLOPE * apices[best_j]
+                if lam <= 0:
+                    expected_ratio = 2.0 if k == 1 else 8.0
+                elif k == 1:
+                    # M0/M+1 from averagine Poisson: E[M0]/E[M+1] = 1/lambda
+                    expected_ratio = 1.0 / lam
+                else:
+                    # M0/M+2 from averagine Poisson: E[M0]/E[M+2] = 2/lambda^2
+                    # Much higher than 1/lambda — prevents false-positive k=2 flagging
+                    expected_ratio = 2.0 / (lam ** 2)
+                # Floor at 1.0: M0 must always be at least as intense as M+k.
+                # If M+k > M0 in the mean spectrum (obs_ratio < 1) the pair is
+                # inconsistent with a true isotope pattern — skip removal.
+                threshold = max(expected_ratio * min_fold, 1.0)
+                if sorted_ints[best_j] >= sorted_ints[i] * threshold:
+                    is_isotope[i] = True
+                    break
 
     return [iv for iv, flag in zip(sorted_ivs, is_isotope) if not flag]
 
@@ -288,20 +342,27 @@ def _filter_mass_defect(
 ) -> list[tuple[float, float, float]]:
     """Senko-plot peptide corridor mass defect filter.
 
-    Retains only intervals whose mass defect (neutral mass − nominal mass)
-    falls within halfwidth of the empirical peptide corridor:
-      expected_defect = nominal_mass × −0.000491 + 0.1
+    Uses floor-based mass defect (always in [0, 1)) and an averagine-derived
+    corridor centred on:
+      expected_defect = 0.000509 × floor(neutral_mass)
+
+    The slope +0.000509 comes from the averagine residue composition
+    (C4.9 H7.8 N1.3 O1.5 S0.04 per 111 Da); it is positive because H atoms
+    dominate the defect accumulation. Using round() instead of floor() flips
+    the sign for neutrals with fractional part > 0.5 and produces a bimodal
+    distribution that breaks the corridor test.
 
     With halfwidth=0.5 (default), all peaks pass — effectively disabled.
-    Set halfwidth≈0.15–0.20 to filter out lipids and matrix clusters.
+    Use halfwidth≈0.25 to filter lipids and matrix clusters while retaining
+    all tryptic peptides in the 800–2000 Da range.
     """
     PROTON = 1.007276
     kept: list[tuple[float, float, float]] = []
     for mz_lo, mz_hi, mz_apex in intervals:
         neutral = mz_apex - PROTON
-        nominal = round(neutral)
-        defect = neutral - nominal
-        expected = nominal * (-0.000491) + 0.1
+        nominal = int(np.floor(neutral))
+        defect = neutral - nominal          # always in [0, 1)
+        expected = 0.000509 * nominal
         if abs(defect - expected) <= halfwidth:
             kept.append((mz_lo, mz_hi, mz_apex))
     return kept
@@ -340,20 +401,60 @@ def _detect_intervals(
     smoothed = np.maximum(smoothed, 0.0)
 
     max_int = float(smoothed.max())
-    prominence = config.peak_prominence * max_int if max_int > 0 else 0.0
+    if max_int == 0.0:
+        return []
 
-    # Detect peaks on the mean spectrum
-    peaks, _ = find_peaks(smoothed, prominence=prominence)
+    # Detect peaks on the mean spectrum.
+    # Use absolute height threshold (matches the paper's "4% relative intensity
+    # threshold" = peaks above 4% of the base peak), not scipy topographic
+    # prominence.  Topographic prominence can reject genuine peaks that are
+    # surrounded by moderate neighbours even when their absolute height clearly
+    # exceeds the threshold.
+    if config.local_prominence_window_da > 0.0:
+        # Adaptive threshold: 4% of the local max within a sliding window.
+        # Reduces the effective threshold in low-signal regions (e.g. >1600 Da).
+        from scipy.ndimage import maximum_filter1d as _mf1d
+        resolution = float(mz_grid[1] - mz_grid[0]) if len(mz_grid) > 1 else config.mz_grid_resolution
+        half_pts = max(1, int(round(config.local_prominence_window_da / resolution)))
+        local_max = _mf1d(smoothed, size=2 * half_pts + 1)
+        height_thresholds = config.peak_prominence * local_max
+        peaks_all, _ = find_peaks(smoothed)
+        peaks = peaks_all[smoothed[peaks_all] >= height_thresholds[peaks_all]]
+    else:
+        global_threshold = config.peak_prominence * max_int
+        peaks, _ = find_peaks(smoothed, height=global_threshold)
     if len(peaks) == 0:
         return []
 
     # Detect valleys (local minima) as peaks in the negated signal
     valleys, _ = find_peaks(-smoothed)
-    valley_set = set(valleys.tolist())
 
     intervals: list[tuple[float, float, float]] = []
-    for k, pk in enumerate(peaks):
-        mz_apex = float(mz_grid[pk])
+    for pk in peaks:
+        # --- Apex m/z: raw grid point or picking-height centroid ---
+        if config.picking_height > 0.0:
+            threshold = config.picking_height * smoothed[pk]
+            # Left crossing: walk left until below threshold, then interpolate
+            li_cross = pk - 1
+            while li_cross > 0 and smoothed[li_cross] >= threshold:
+                li_cross -= 1
+            if smoothed[li_cross + 1] > smoothed[li_cross]:
+                t = (threshold - smoothed[li_cross]) / (smoothed[li_cross + 1] - smoothed[li_cross])
+                left_mz = mz_grid[li_cross] + t * (mz_grid[li_cross + 1] - mz_grid[li_cross])
+            else:
+                left_mz = float(mz_grid[li_cross])
+            # Right crossing: walk right until below threshold, then interpolate
+            ri_cross = pk + 1
+            while ri_cross < len(smoothed) - 1 and smoothed[ri_cross] >= threshold:
+                ri_cross += 1
+            if smoothed[ri_cross] < smoothed[ri_cross - 1]:
+                t = (threshold - smoothed[ri_cross - 1]) / (smoothed[ri_cross] - smoothed[ri_cross - 1])
+                right_mz = mz_grid[ri_cross - 1] + t * (mz_grid[ri_cross] - mz_grid[ri_cross - 1])
+            else:
+                right_mz = float(mz_grid[ri_cross])
+            mz_apex = (left_mz + right_mz) / 2.0
+        else:
+            mz_apex = float(mz_grid[pk])
 
         # Left boundary: largest valley index strictly less than pk
         left_vals = valleys[valleys < pk]
@@ -427,7 +528,7 @@ def _integrate_pixel(
 
     mzs = mzs.astype(np.float64)
 
-    for j, (mz_lo, mz_hi, mz_apex) in enumerate(intervals):
+    for j, (mz_lo, mz_hi, _) in enumerate(intervals):
         lo = int(np.searchsorted(mzs, mz_lo, side="left"))
         hi = int(np.searchsorted(mzs, mz_hi, side="right"))
         if lo >= hi:
@@ -641,7 +742,11 @@ def extract_scils_features(
 
         if config.deisotope:
             n_before = len(intervals)
-            intervals = _deisotope_intervals(intervals, config.deisotope_tol_da)
+            apex_ints = np.array(
+                [float(mean_ints[np.argmin(np.abs(mz_grid - iv[2]))]) for iv in intervals],
+                dtype=np.float64,
+            )
+            intervals = _deisotope_intervals(intervals, config.deisotope_tol_da, apex_ints, config.deisotope_min_fold)
             logger.info(f"  {len(intervals)}/{n_before} intervals after deisotoping")
 
         if config.filter_mass_defect:
@@ -657,7 +762,7 @@ def extract_scils_features(
         intensity_matrix = np.zeros((n_pixels, len(intervals)), dtype=np.float32)
         pixel_coords: list[tuple[int, int]] = []
 
-        for i, (x, y, _z) in enumerate(parser.coordinates):
+        for i, (x, y, *_) in enumerate(parser.coordinates):
             pixel_coords.append((x - 1, y - 1))  # 1-based → 0-based
             mzs, ints = parser.getspectrum(i)
             mzs = np.asarray(mzs, dtype=np.float64)

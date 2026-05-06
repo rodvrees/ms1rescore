@@ -399,9 +399,23 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--deisotope-tol-da",
         type=float,
-        default=0.05,
+        default=0.15,
         metavar="FLOAT",
-        help="Tolerance (Da) around the 1.003355 Da isotope spacing. Default: 0.05.",
+        help="Tolerance (Da) around the 1.003355 Da isotope spacing. Default: 0.15.",
+    )
+    raw_grp.add_argument(
+        "--deisotope-min-fold",
+        type=float,
+        default=0.67,
+        metavar="FLOAT",
+        help=(
+            "Averagine-relative intensity guard for deisotoping. A peak is removed as "
+            "M+1 only if M0 >= M+1 × (1/lambda) × FLOAT, where lambda = 0.000509 × M0 "
+            "(averagine Poisson parameter) and 1/lambda is the expected M0/M+1 ratio. "
+            "Default 0.67: M0 must be at least 67%% of the averagine-expected ratio "
+            "(e.g. >= 1.35× M+1 for a 975 Da compound). This prevents false-positive "
+            "deisotoping of two unrelated peptides ~1 Da apart."
+        ),
     )
     raw_grp.add_argument(
         "--filter-mass-defect",
@@ -419,6 +433,34 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Half-width of the mass defect corridor. Default 0.5 passes all peaks "
             "(effectively disabled). Use 0.15–0.20 for a meaningful peptide filter."
+        ),
+    )
+    raw_grp.add_argument(
+        "--picking-height",
+        type=float,
+        default=0.75,
+        metavar="FLOAT",
+        help=(
+            "Picking height for apex m/z centroid refinement (mMass-style). "
+            "The apex is reported as the midpoint of the two interpolated "
+            "crossing points at this fraction of the peak maximum. "
+            "Default 0.75 matches the mMass 75%% setting. Use 0.0 to disable "
+            "(raw smoothed-spectrum apex)."
+        ),
+    )
+    raw_grp.add_argument(
+        "--local-prominence-window-da",
+        type=float,
+        default=0.0,
+        metavar="FLOAT",
+        help=(
+            "Half-width in Da of the sliding-window local maximum used as the "
+            "reference for the peak height threshold. When > 0, the threshold "
+            "for each peak is peak_prominence × local_max(±window) instead of "
+            "peak_prominence × global_max. This reduces the effective threshold "
+            "in low-signal m/z regions (e.g. >1600 Da) where genuine peptide "
+            "peaks would otherwise fall below the global threshold. "
+            "Default 0 (global max, disabled). Suggested value: 200."
         ),
     )
     raw_grp.add_argument(
@@ -669,8 +711,11 @@ def main() -> None:
             calibrant_tol_ppm=args.calibrant_tol_ppm,
             deisotope=args.deisotope,
             deisotope_tol_da=args.deisotope_tol_da,
+            deisotope_min_fold=args.deisotope_min_fold,
             filter_mass_defect=args.filter_mass_defect,
             mass_defect_halfwidth=args.mass_defect_halfwidth,
+            picking_height=args.picking_height,
+            local_prominence_window_da=args.local_prominence_window_da,
             output_npz=args.save_npz,
             output_spatial_tsv=args.save_spatial,
             output_dir=args.output_dir,
@@ -704,8 +749,11 @@ def main() -> None:
             calibrant_tol_ppm=args.calibrant_tol_ppm,
             deisotope=args.deisotope,
             deisotope_tol_da=args.deisotope_tol_da,
+            deisotope_min_fold=args.deisotope_min_fold,
             filter_mass_defect=args.filter_mass_defect,
             mass_defect_halfwidth=args.mass_defect_halfwidth,
+            picking_height=args.picking_height,
+            local_prominence_window_da=args.local_prominence_window_da,
         )
         intervals, intensity_matrix, pixel_coords = extract_scils_features(
             args.maldi_imzml,

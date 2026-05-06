@@ -618,9 +618,12 @@ def extract_maldi_data(
     calibrant_mzs: list | None = None,
     calibrant_tol_ppm: float = 200.0,
     deisotope: bool = False,
-    deisotope_tol_da: float = 0.05,
+    deisotope_tol_da: float = 0.15,
+    deisotope_min_fold: float = 0.67,
     filter_mass_defect: bool = False,
     mass_defect_halfwidth: float = 0.5,
+    picking_height: float = 0.75,
+    local_prominence_window_da: float = 0.0,
     feature_mzs: np.ndarray | None = None,
     images_path: str | None = None,
     image_batch_size: int = 100,
@@ -735,8 +738,11 @@ def extract_maldi_data(
                 calibrant_tol_ppm=calibrant_tol_ppm,
                 deisotope=deisotope,
                 deisotope_tol_da=deisotope_tol_da,
+                deisotope_min_fold=deisotope_min_fold,
                 filter_mass_defect=filter_mass_defect,
                 mass_defect_halfwidth=mass_defect_halfwidth,
+                picking_height=picking_height,
+                local_prominence_window_da=local_prominence_window_da,
             )
             mz_grid, mean_ints = _build_profile_mean_spectrum(
                 reader, normalize_rms=normalize_rms, normalize_tic=not normalize_rms
@@ -745,7 +751,11 @@ def extract_maldi_data(
             if calibrant_mzs:
                 intervals = _recalibrate_intervals(intervals, calibrant_mzs, calibrant_tol_ppm)
             if deisotope:
-                intervals = _deisotope_intervals(intervals, deisotope_tol_da)
+                apex_ints = np.array(
+                    [float(mean_ints[np.argmin(np.abs(mz_grid - iv[2]))]) for iv in intervals],
+                    dtype=np.float64,
+                )
+                intervals = _deisotope_intervals(intervals, deisotope_tol_da, apex_ints, deisotope_min_fold)
             if filter_mass_defect:
                 intervals = _filter_mass_defect(intervals, mass_defect_halfwidth)
             feature_mzs = np.array(
