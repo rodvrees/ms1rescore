@@ -337,6 +337,7 @@ def rescore(
     lcms_peptides_path: str | None = None,
     lcms_psms_path: str | None = None,
     lcms_id_format: str = "percolator",
+    psm_utils_reader: str | None = None,
     protein_fdr: float = 0.01,
     peptide_fdr: float = 0.01,
     extra_fasta_path: str | None = None,
@@ -404,7 +405,12 @@ def rescore(
         Path to LC-MS/MS PSM-level file for RT/intensity aggregation (optional).
     lcms_id_format
         Format of the LC-MS/MS ID files: ``"percolator"`` (default),
-        ``"mzidentml"``, or ``"psm_utils"``.
+        ``"mzidentml"``, ``"psm_utils"``, or ``"msf"``.
+    psm_utils_reader
+        Only used when ``lcms_id_format="psm_utils"``. Either a psm_utils
+        filetype key (e.g. ``"maxquant"``) or a reader class name (e.g.
+        ``"MSMSReader"``). When ``None``, auto-detection from filename is
+        attempted.
     protein_fdr
         Protein FDR threshold for Strategy C protein filtering (default 0.01).
     peptide_fdr
@@ -447,6 +453,7 @@ def rescore(
             protein_fdr=protein_fdr,
             peptide_fdr=peptide_fdr,
             format=lcms_id_format,
+            psm_utils_reader=psm_utils_reader,
         )
         if verbose:
             logger.debug("Writing parsed LC-MS/MS IDs to debug_lcms_ids.tsv")
@@ -728,6 +735,7 @@ def rescore(
         result_df = pd.DataFrame(
             {
                 "peptide": features_df["peptide"].values,
+                "protein": features_df["protein"].values if "protein" in features_df.columns else "",
                 "feature_idx": features_df.get(
                     "feature_idx", pd.Series(range(len(features_df)))
                 ).values,
@@ -804,7 +812,7 @@ def rescore(
         if all_scores is not None:
             q_values, is_winner = _feature_level_tdc(features_df, all_scores, feature_col)
             reweighted_scores = all_scores * lcms_prior
-            reweighted_q, _ = _feature_level_tdc(features_df, reweighted_scores, feature_col)
+            reweighted_q, is_winner = _feature_level_tdc(features_df, reweighted_scores, feature_col)
         else:
             logger.warning(
                 "SVM score extraction failed — q_value and reweighted_q_value will be NaN."
@@ -818,6 +826,7 @@ def rescore(
         result_df = pd.DataFrame(
             {
                 "peptide": features_df["peptide"].values,
+                "protein": features_df["protein"].values if "protein" in features_df.columns else "",
                 "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
                 "feature_idx": features_df.get(
                     "feature_idx", pd.Series(range(len(features_df)))
@@ -863,11 +872,12 @@ def rescore(
         # LC-MS/MS prior reweight
         lcms_prior = compute_lcms_prior(features_df, lcms_present)
         reweighted_scores = scores * lcms_prior
-        reweighted_q, _ = _feature_level_tdc(features_df, reweighted_scores, feature_col)
+        reweighted_q, is_winner = _feature_level_tdc(features_df, reweighted_scores, feature_col)
 
         result_df = pd.DataFrame(
             {
                 "peptide": features_df["peptide"].values,
+                "protein": features_df["protein"].values if "protein" in features_df.columns else "",
                 "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
                 "feature_idx": features_df.get(
                     "feature_idx", pd.Series(range(len(features_df)))

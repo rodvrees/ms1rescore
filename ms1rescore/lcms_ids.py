@@ -95,6 +95,7 @@ def parse_lcms_ids(
     protein_fdr: float = 0.01,
     peptide_fdr: float = 0.01,
     format: str = "percolator",
+    psm_utils_reader: str | None = None,
 ) -> LCMSIds:
     """
     Parse LC-MS/MS identification results.
@@ -120,6 +121,11 @@ def parse_lcms_ids(
     format
         Input format: ``"percolator"``, ``"mzidentml"``, ``"psm_utils"``, or
         ``"msf"`` (ProteomeDiscoverer ``.msf`` SQLite database).
+    psm_utils_reader
+        Only used when ``format="psm_utils"``. Either a psm_utils filetype
+        key (e.g. ``"maxquant"``, ``"tsv"``) or a reader class name (e.g.
+        ``"MSMSReader"``, ``"TSVReader"``). When ``None``, auto-detection
+        from filename is attempted.
 
     Returns
     -------
@@ -136,7 +142,9 @@ def parse_lcms_ids(
             proteins_path or peptides_path, protein_fdr, peptide_fdr
         )
     elif format == "psm_utils":
-        return _parse_psm_utils(peptides_path, protein_fdr, peptide_fdr)
+        return _parse_psm_utils(
+            peptides_path, protein_fdr, peptide_fdr, psm_utils_reader
+        )
     elif format == "msf":
         return _parse_msf(peptides_path, protein_fdr, peptide_fdr)
     else:
@@ -386,32 +394,73 @@ def _parse_mzidentml(path: str, protein_fdr: float, peptide_fdr: float) -> LCMSI
 # psm_utils parser
 # ---------------------------------------------------------------------------
 
-def _parse_psm_utils(path: str, protein_fdr: float, peptide_fdr: float) -> LCMSIds:
+def _parse_psm_utils(
+    path: str,
+    protein_fdr: float,
+    peptide_fdr: float,
+    psm_utils_reader: str | None = None,
+) -> LCMSIds:
     """Parse any psm_utils-supported format."""
     try:
-        from psm_utils.io import read_file
+        from psm_utils.io import READERS, read_file
     except ImportError as exc:
         raise ImportError(
             "psm_utils is required for format='psm_utils'. "
             "Install with: pip install psm_utils"
         ) from exc
 
-    psm_list = read_file(path)
+    # Resolve reader: accept either a filetype key ("tsv") or class name ("TSVReader")
+    filetype = "infer"
+    if psm_utils_reader is not None:
+        cls_to_key = {cls.__name__: key for key, cls in READERS.items()}
+        if psm_utils_reader in READERS:
+            filetype = psm_utils_reader
+        elif psm_utils_reader in cls_to_key:
+            filetype = cls_to_key[psm_utils_reader]
+        else:
+            available = sorted(set(list(READERS.keys()) + list(cls_to_key.keys())))
+            raise ValueError(
+                f"Unknown psm_utils reader {psm_utils_reader!r}. "
+                f"Available filetype keys and class names: {available}"
+            )
+
+    psm_list = read_file(path, filetype=filetype)
+
     records = []
+    seq_proteins: dict[str, list[str]] = {}  # sequence → all normalised protein accessions
     for psm in psm_list:
         try:
-            raw_seq = str(psm.peptidoform) if psm.peptidoform else ""
-            seq = _bare_sequence(raw_seq)
-            prot = _normalize_accession(psm.protein_list[0]) if psm.protein_list else ""
+            if psm.peptidoform is None:
+                continue
+            sequence = psm.peptidoform.sequence
+            prot_first = (
+                _normalize_accession(psm.protein_list[0]) if psm.protein_list else ""
+            )
+            if psm.protein_list:
+                bucket = seq_proteins.setdefault(sequence, [])
+                for acc in psm.protein_list:
+                    norm = _normalize_accession(acc)
+                    if norm and norm not in bucket:
+                        bucket.append(norm)
+
+            charge = psm.get_precursor_charge()
+            intensity = np.nan
+            if psm.metadata and "precursor_intensity" in psm.metadata:
+                try:
+                    intensity = float(psm.metadata["precursor_intensity"])
+                except (TypeError, ValueError):
+                    pass
+
             records.append({
-                "sequence": seq,
-                "peptidoform": raw_seq,
-                "protein": prot,
+                "sequence": sequence,
+                "peptidoform": str(psm.peptidoform),
+                "protein": prot_first,
                 "q_value": float(psm.qvalue) if psm.qvalue is not None else np.nan,
-                "pep": float(psm.pep) if hasattr(psm, "pep") and psm.pep is not None else np.nan,
+                "pep": float(psm.pep) if psm.pep is not None else np.nan,
                 "score": float(psm.score) if psm.score is not None else np.nan,
-                "charge": int(psm.precursor_mz) if hasattr(psm, "precursor_mz") else np.nan,
+                "charge": int(charge) if charge is not None else np.nan,
                 "rt": float(psm.retention_time) if psm.retention_time is not None else np.nan,
+                "lcms_intensity": intensity,
             })
         except Exception:
             continue
@@ -420,6 +469,7 @@ def _parse_psm_utils(path: str, protein_fdr: float, peptide_fdr: float) -> LCMSI
         return LCMSIds(proteins=set(), peptides=pd.DataFrame(columns=_PEP_COLS))
 
     df = pd.DataFrame(records)
+
     pep_agg = (
         df.sort_values("q_value")
         .groupby("sequence")
@@ -432,17 +482,41 @@ def _parse_psm_utils(path: str, protein_fdr: float, peptide_fdr: float) -> LCMSI
             n_psms=("sequence", "count"),
             charge=("charge", lambda x: x.mode().iloc[0] if len(x) > 0 else np.nan),
             rt_mean=("rt", "mean"),
+            lcms_intensity=("lcms_intensity", "max"),
         )
         .reset_index()
     )
-    pep_agg["lcms_intensity"] = np.nan
-    pep_df = pep_agg[pep_agg["q_value"] <= peptide_fdr].copy()
 
-    proteins_set = set(pep_df["protein"].unique())
+    # When q_value is absent for all PSMs (raw search output), skip FDR filter
+    all_nan_q = pep_agg["q_value"].isna().all()
+    if all_nan_q:
+        logger.warning(
+            "No q_value available for any PSM — skipping FDR filter and returning all peptides."
+        )
+        pep_df = pep_agg.copy()
+    else:
+        pep_df = pep_agg[pep_agg["q_value"] <= peptide_fdr].copy()
+        if pep_df.empty:
+            raise ValueError(
+                f"No peptides remain after FDR filter (q_value <= {peptide_fdr}). "
+                f"Check that your input file contains FDR-controlled identifications."
+            )
+
+    # Collect all protein accessions for sequences that pass FDR
+    passing_seqs = set(pep_df["sequence"])
+    proteins_set: set[str] = set()
+    for seq, accs in seq_proteins.items():
+        if seq in passing_seqs:
+            proteins_set.update(accs)
+
     logger.info(
-        f"  psm_utils: {len(proteins_set)} proteins, {len(pep_df)} peptides at FDR thresholds"
+        f"  psm_utils: {len(proteins_set)} proteins, {len(pep_df)} peptides "
+        f"at {peptide_fdr*100:.0f}% FDR"
     )
-    return LCMSIds(proteins=proteins_set, peptides=pep_df[_PEP_COLS].reset_index(drop=True))
+    return LCMSIds(
+        proteins=proteins_set,
+        peptides=pep_df[_PEP_COLS].reset_index(drop=True),
+    )
 
 
 # ---------------------------------------------------------------------------

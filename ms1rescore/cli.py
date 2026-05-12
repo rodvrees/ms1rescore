@@ -139,18 +139,19 @@ def _write_results(
 
     Writes all candidates (targets and decoys) with q-value annotation.
     No hard filtering is applied — downstream consumers can filter by
-    ``q_value``, ``is_tdc_winner``, and ``is_decoy`` as needed.
+    ``reweighted_q_value``, ``is_tdc_winner``, and ``is_decoy`` as needed.
     """
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, "ms1rescore_psms.tsv")
+    out_path = os.path.join(output_dir, "ms1rescore_matches.tsv")
     result.to_csv(out_path, sep="\t", index=False)
     n_winners = result.get("is_tdc_winner", result["is_decoy"].apply(lambda x: not x)).sum()
     logger.info(f"  Wrote {len(result)} candidates ({n_winners} TDC winners) → {out_path}")
     # Filter per-feature winners filtered by q-value
-    if "is_tdc_winner" in result.columns and "q_value" in result.columns:
-        winners = result[result["is_tdc_winner"] & (result["q_value"] <= 0.01)]
+    if "is_tdc_winner" in result.columns and "reweighted_q_value" in result.columns:
+        winners = result[result["is_tdc_winner"] & (result["reweighted_q_value"] <= 0.01)]
         peptides_out = os.path.join(output_dir, "ms1rescore_peptides.tsv")
-        peptides = winners[["feature_idx", "feature_mz", "peptide", "q_value"]].drop_duplicates().sort_values("q_value")
+        cols = [c for c in ["feature_idx", "feature_mz", "peptide", "protein", "reweighted_q_value"] if c in winners.columns]
+        peptides = winners[cols].drop_duplicates().sort_values("reweighted_q_value")
         peptides.to_csv(peptides_out, sep="\t", index=False)
         logger.info(f"  Wrote {len(peptides)} peptide-level winners → {peptides_out}")
 
@@ -616,6 +617,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     strat_c.add_argument(
+        "--psm-utils-reader",
+        metavar="READER",
+        default=None,
+        help=(
+            "psm_utils reader to use when --lcms-id-format is 'psm_utils'. "
+            "Accepts a filetype key (e.g. 'maxquant', 'tsv', 'fragpipe') or "
+            "a reader class name (e.g. 'MSMSReader', 'TSVReader'). "
+            "When omitted, the reader is inferred from the file extension."
+        ),
+    )
+    strat_c.add_argument(
         "--protein-fdr",
         type=float,
         default=0.01,
@@ -821,6 +833,7 @@ def main() -> None:
             protein_fdr=args.protein_fdr,
             peptide_fdr=args.peptide_fdr,
             format=lcms_id_format,
+            psm_utils_reader=args.psm_utils_reader,
         )
         if args.verbose:
             logger.debug("Writing parsed LC-MS/MS IDs to debug_lcms_ids.tsv")
@@ -870,6 +883,7 @@ def main() -> None:
         lcms_peptides_path=lcms_peptides_path,
         lcms_psms_path=args.lcms_psms,
         lcms_id_format=lcms_id_format,
+        psm_utils_reader=args.psm_utils_reader,
         protein_fdr=args.protein_fdr,
         peptide_fdr=args.peptide_fdr,
         extra_fasta_path=args.extra_fasta,
