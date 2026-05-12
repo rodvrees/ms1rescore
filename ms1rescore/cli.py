@@ -18,10 +18,57 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _read_feature_mzs(path: str) -> tuple[np.ndarray, np.ndarray | None]:
+    """
+    Load feature m/z values from a plain text file or a SCiLS Lab CSV export.
+
+    Plain text: one m/z value per line, no header. Returns (mzs, None).
+    SCiLS CSV: semicolon-delimited; lines starting with '#' are comments;
+               the first non-comment line is a header (first column = 'm/z').
+               If a 'CCS [Å²]' column is present, its values are returned as
+               the second element of the tuple. Otherwise returns (mzs, None).
+    """
+    with open(path) as fh:
+        lines = [ln.rstrip("\n") for ln in fh]
+
+    data_lines = [ln for ln in lines if not ln.startswith("#") and ln.strip()]
+    if not data_lines:
+        raise ValueError(f"No data lines found in {path!r}")
+
+    if ";" in data_lines[0]:
+        # SCiLS-style: first non-comment line is header, rest are data rows.
+        header = data_lines[0].split(";")
+        rows = data_lines[1:]
+        mzs = np.array([float(row.split(";")[0]) for row in rows if row.strip()], dtype=np.float64)
+        # Find CCS column by checking for both 'CCS' and 'Å' in the column name
+        ccs_col_idx = None
+        for i, col in enumerate(header):
+            if "CCS" in col and "Å" in col:  # Å = U+00C5
+                ccs_col_idx = i
+                break
+        if ccs_col_idx is not None:
+            ccs_vals: list[float] = []
+            for row in rows:
+                if row.strip():
+                    parts = row.split(";")
+                    try:
+                        ccs_vals.append(float(parts[ccs_col_idx]))
+                    except (IndexError, ValueError):
+                        ccs_vals.append(np.nan)
+            ccs: np.ndarray | None = np.array(ccs_vals, dtype=np.float64)
+        else:
+            ccs = None
+    else:
+        mzs = np.array([float(ln) for ln in data_lines], dtype=np.float64)
+        ccs = None
+
+    return mzs, ccs
+
+
 def _load_maldi(
     npz_path: str | None,
     mzs_path: str | None,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """
     Load MALDI feature data from disk.
 
@@ -31,13 +78,16 @@ def _load_maldi(
         NumPy NPZ file with ``"mzs"`` key (required) and optional ``"images"``
         key (3D ion image array).
     mzs_path
-        Plain text file with one m/z value per line (no header).
+        Plain text file with one m/z value per line (no header), or a SCiLS
+        Lab CSV export (semicolon-delimited) with optional ``CCS [Å²]`` column.
 
     Returns
     -------
-    (maldi_mzs, ion_images, ion_image_mzs)
+    (maldi_mzs, ion_images, ion_image_mzs, ccs)
         ``ion_images`` and ``ion_image_mzs`` are ``None`` when loading from a
         plain text file or when the NPZ has no ``"images"`` key.
+        ``ccs`` is ``None`` unless a SCiLS CSV with a ``CCS [Å²]`` column was
+        supplied as ``mzs_path``.
     """
     if npz_path is not None:
         logger.info(f"Loading MALDI data from NPZ: {npz_path}")
@@ -58,11 +108,11 @@ def _load_maldi(
                 else ", no ion images"
             )
         )
-        return mzs, images, image_mzs
+        return mzs, images, image_mzs, None
 
     logger.info(f"Loading MALDI m/z values from text file: {mzs_path}")
     try:
-        mzs = np.loadtxt(mzs_path)
+        mzs, ccs = _read_feature_mzs(mzs_path)
     except Exception as exc:
         logger.error(f"Could not read {mzs_path!r}: {exc}")
         sys.exit(1)
@@ -73,7 +123,7 @@ def _load_maldi(
         )
         sys.exit(1)
     logger.info(f"  {len(mzs)} MALDI features, no ion images")
-    return mzs, None, None
+    return mzs, None, None, ccs
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +299,19 @@ def build_parser() -> argparse.ArgumentParser:
             "imzML file (.imzML + .ibd). SCiLS Lab-style interval-based "
             "feature extraction is performed automatically. Ion images and "
             "spatial features are computed and optionally saved."
+        ),
+    )
+
+    maldi_group.add_argument(
+        "--feature-mzs",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Pre-computed feature m/z values to use with --maldi-raw, skipping "
+            "automatic feature detection (step 1) but still extracting ion images "
+            "and spatial features. Accepts a plain text file (one m/z per line) or "
+            "a SCiLS Lab CSV export (semicolon-delimited, '#' comment lines, first "
+            "data column = m/z)."
         ),
     )
 
@@ -594,6 +657,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Disabled by default."
         ),
     )
+    rescore_grp.add_argument(
+        "--n-debug",
+        type=int,
+        default=15,
+        metavar="INT",
+        help="Number of candidates to sample for per-candidate debug figures (default 50).",
+    )
+    rescore_grp.add_argument(
+        "--debug-seed",
+        type=int,
+        default=42,
+        metavar="INT",
+        help="Random seed for debug candidate sampling (default 42).",
+    )
 
     # --- Strategy C: LC-MS/MS-guided candidates ---
     strat_c = parser.add_argument_group(
@@ -728,6 +805,8 @@ def main() -> None:
 
     # --- Load MALDI data ---
     spatial_features = None
+    maldi_envelopes = None
+    _ccs_arr: np.ndarray | None = None
 
     if args.maldi_raw:
         from ms1rescore.maldi_extraction import extract_maldi_data
@@ -737,9 +816,20 @@ def main() -> None:
             "LC-MS/MS identifications will be used for candidate generation and "
             "prior features only, not for feature selection."
         )
+        precomputed_mzs = None
+        if args.feature_mzs:
+            logger.info(f"Loading pre-computed feature m/z values from {args.feature_mzs}")
+            try:
+                precomputed_mzs, _ccs_arr = _read_feature_mzs(args.feature_mzs)
+            except Exception as exc:
+                logger.error(f"Could not read --feature-mzs {args.feature_mzs!r}: {exc}")
+                sys.exit(1)
+            logger.info(f"  {len(precomputed_mzs)} features loaded (skipping detection)")
+
         logger.info(f"Extracting MALDI features from raw data: {args.maldi_raw}")
-        maldi_mzs, ion_images, spatial_features = extract_maldi_data(
+        maldi_mzs, ion_images, spatial_features, maldi_envelopes = extract_maldi_data(
             args.maldi_raw,
+            feature_mzs=precomputed_mzs,
             ppm_bin=args.ppm_bin,
             extraction_ppm=args.extraction_ppm,
             matching_ppm=args.matching_ppm,
@@ -806,7 +896,7 @@ def main() -> None:
             picking_height=args.picking_height,
             local_prominence_window_da=args.local_prominence_window_da,
         )
-        intervals, intensity_matrix, pixel_coords = extract_scils_features(
+        intervals, _, _, mean_1_over_k0 = extract_scils_features(
             args.maldi_imzml,
             config=cfg,
             output_dir=args.output_dir,
@@ -817,8 +907,12 @@ def main() -> None:
         ion_image_mzs = None
         spatial_features = None
         logger.info(f"  {len(maldi_mzs)} intervals extracted")
+        if mean_1_over_k0 is not None and len(mean_1_over_k0) == len(maldi_mzs):
+            from ms1rescore.maldi_imzml import one_over_k0_to_ccs
+            _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
+            logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
     else:
-        maldi_mzs, ion_images, ion_image_mzs = _load_maldi(
+        maldi_mzs, ion_images, ion_image_mzs, _ccs_arr = _load_maldi(
             args.maldi_npz, args.maldi_mzs
         )
 
@@ -876,17 +970,28 @@ def main() -> None:
         f"max_length={max_length}, missed_cleavages={missed_cleavages}"
     )
 
+    # --- Build observed CCS dict from loaded CCS array ---
+    observed_ccs: dict | None = None
+    if _ccs_arr is not None and len(_ccs_arr) == len(maldi_mzs):
+        observed_ccs = {
+            idx: float(v) for idx, v in enumerate(_ccs_arr) if np.isfinite(v)
+        }
+        logger.info(
+            f"  CCS values loaded for {len(observed_ccs)}/{len(maldi_mzs)} features"
+        )
+
     # --- Run pipeline ---
     from ms1rescore.pipeline import rescore
 
     logger.info("Starting ms1rescore pipeline...")
-    psm_list, result_df, feature_names = rescore(
+    _, result_df, _ = rescore(
         fasta_path=args.fasta,
         maldi_mzs=maldi_mzs,
         mzml_paths=args.mzml,
         ion_images=ion_images,
         ion_image_mzs=ion_image_mzs,
         spatial_features=spatial_features,
+        maldi_envelopes=maldi_envelopes,
         msf_path=args.msf,
         ppm_tolerance=args.ppm_tolerance,
         train_fdr=args.train_fdr,
@@ -908,6 +1013,10 @@ def main() -> None:
         use_protein_level_features=args.use_protein_level_feats,
         verbose=args.verbose,
         output_dir=args.output_dir,
+        debug_dir=os.path.join(args.output_dir, "debug") if args.verbose else None,
+        n_debug=args.n_debug,
+        debug_seed=args.debug_seed,
+        observed_ccs_per_feature=observed_ccs,
     )
 
     # --- Write results ---

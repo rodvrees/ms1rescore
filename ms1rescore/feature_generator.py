@@ -81,11 +81,6 @@ MALDI_INTRINSIC_FEATURES = [
     # --- ion mobility (B-group) — optional, requires im2deep + observed CCS ---
     "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
     "im2deep_ccs_zscore", "im2deep_ccs_rank", "im2deep_mahalanobis",
-    # --- spatial (optional — requires spatial_features DataFrame) ---
-    "spatial_autocorrelation", "fraction_detected", "intensity_cv",
-    "log_mean_intensity", "spatial_entropy",
-    # --- full spatial autocorrelation (E5/E6) — optional, requires ion_images ---
-    "spatial_morans_i", "spatial_gearys_c",
     # --- isotopologue co-localization (E1) — optional, requires ion_images ---
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
     "isotope_image_colocalization_mean",
@@ -134,6 +129,17 @@ _LCMS_ID_FEATURES = [
 
 LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_ID_FEATURES
 
+# Spatial prior features: ion-image-level quality signals applied as a
+# multiplicative prior after scoring (analogous to LCMS_PRIOR_FEATURES).
+# Excluded from the ranker because they are feature-level, not candidate-level
+# — all candidates at the same m/z feature share identical values, so they
+# cannot discriminate between candidate sequences within a feature.
+SPATIAL_PRIOR_FEATURES = [
+    "spatial_autocorrelation", "fraction_detected", "intensity_cv",
+    "log_mean_intensity", "spatial_entropy",
+    "spatial_morans_i", "spatial_gearys_c",
+]
+
 # Alias kept separate so LDA-specific feature selection can diverge later.
 LDA_FEATURES = MALDI_INTRINSIC_FEATURES
 
@@ -173,7 +179,7 @@ _GENERATIVE_FEATS = frozenset([
 
 
 def get_feature_names(
-    has_spatial: bool = False,
+    has_spatial: bool = False,  # kept for backwards compatibility; no longer used
     has_ion_images: bool = False,
     has_envelopes: bool = False,
     has_pixel_coords: bool = False,
@@ -188,11 +194,9 @@ def get_feature_names(
     """
     intrinsic = [
         f for f in MALDI_INTRINSIC_FEATURES
-        if (f not in _SPATIAL_FEATS or has_spatial)
-        and (f not in _COLOC_FEATS or has_ion_images)
+        if (f not in _COLOC_FEATS or has_ion_images)
         and (f not in _ISOTOPOLOGUE_COLOC_FEATS or has_ion_images)
         and (f not in _ADDUCT_COLOC_FEATS or has_ion_images)
-        and (f not in _MORANS_FEATS or has_ion_images)
         and (f not in _ENVELOPE_FEATS or has_envelopes)
         and (f not in _PIXEL_FEATS or has_pixel_coords)
         and (f not in _CCS_FEATS or has_ccs)

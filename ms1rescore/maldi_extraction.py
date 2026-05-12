@@ -393,6 +393,132 @@ def extract_ion_images(
 
 
 # ---------------------------------------------------------------------------
+# Isotope envelope mean extraction (single streaming pass)
+# ---------------------------------------------------------------------------
+
+
+def _collect_pixel_spectra(reader) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """Stream all pixels and return flat CSR arrays for Rust consumption.
+
+    Returns
+    -------
+    flat_mzs : np.ndarray, float64
+        All pixel m/z values concatenated.
+    flat_ints : np.ndarray, float32
+        All pixel intensities concatenated.
+    pixel_offsets : list[int]
+        CSR-style offsets; pixel i spans ``[offsets[i], offsets[i+1])``.
+    """
+    mz_chunks: list[np.ndarray] = []
+    int_chunks: list[np.ndarray] = []
+    pixel_offsets: list[int] = [0]
+    for mzs, ints in reader.spectra_iter(silent=True):
+        mz_arr = np.asarray(mzs, dtype=np.float64)
+        int_arr = np.asarray(ints, dtype=np.float32)
+        mz_chunks.append(mz_arr)
+        int_chunks.append(int_arr)
+        pixel_offsets.append(pixel_offsets[-1] + len(mz_arr))
+    flat_mzs = np.concatenate(mz_chunks) if mz_chunks else np.empty(0, dtype=np.float64)
+    flat_ints = np.concatenate(int_chunks) if int_chunks else np.empty(0, dtype=np.float32)
+    return flat_mzs, flat_ints, pixel_offsets
+
+
+def _compute_isotope_means_python(
+    flat_mzs: np.ndarray,
+    flat_ints: np.ndarray,
+    pixel_offsets: list[int],
+    target_mzs: np.ndarray,
+    ppm_tolerance: float,
+) -> np.ndarray:
+    """Pure-Python fallback for compute_maldi_isotope_means (no Rust required).
+
+    Uses vectorised numpy per pixel: nearest-peak lookup with searchsorted.
+    O(n_pixels * n_targets) with small constant — acceptable for Rust-absent envs.
+    """
+    n_targets = len(target_mzs)
+    n_pixels = len(pixel_offsets) - 1
+    sums = np.zeros(n_targets, dtype=np.float64)
+    tols = target_mzs * ppm_tolerance * 1e-6
+
+    for px in range(n_pixels):
+        lo = pixel_offsets[px]
+        hi = pixel_offsets[px + 1]
+        if lo == hi:
+            continue
+        mzs = flat_mzs[lo:hi]
+        ints = flat_ints[lo:hi].astype(np.float64)
+
+        # Vectorised nearest-peak lookup for all targets simultaneously.
+        idx_r = np.searchsorted(mzs, target_mzs)
+        idx_r = np.clip(idx_r, 0, len(mzs) - 1)
+        idx_l = np.clip(idx_r - 1, 0, len(mzs) - 1)
+
+        dist_r = np.abs(mzs[idx_r] - target_mzs)
+        dist_l = np.abs(mzs[idx_l] - target_mzs)
+
+        best_idx = np.where(dist_l < dist_r, idx_l, idx_r)
+        best_dist = np.minimum(dist_l, dist_r)
+
+        sums += np.where(best_dist <= tols, ints[best_idx], 0.0)
+
+    return sums / max(n_pixels, 1)
+
+
+def compute_isotope_envelope_means(
+    reader,
+    feature_mzs: np.ndarray,
+    extraction_ppm: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute per-feature mean intensities for M0, M+1, and M+2 in one pass.
+
+    Streams all pixels exactly once (via ``reader.spectra_iter``), builds flat
+    CSR arrays, and dispatches to the Rust ``compute_maldi_isotope_means``
+    function if available — falling back to vectorised Python otherwise.
+
+    Returns
+    -------
+    m0_means, m1_means, m2_means : np.ndarray, shape (n_features,), float32
+        Spatial-mean intensity for each isotope peak.
+    """
+    _NEUTRON = 1.003355
+    n_feat = len(feature_mzs)
+
+    logger.info("  Streaming pixel spectra for M+1/M+2 isotope envelope extraction...")
+    flat_mzs, flat_ints, pixel_offsets = _collect_pixel_spectra(reader)
+    n_pixels = len(pixel_offsets) - 1
+    logger.debug(f"    Collected {n_pixels} pixels, {len(flat_mzs):,} total peaks")
+
+    # M0: computed from the flat arrays directly (avoids relying on ion_images).
+    # M+1 and M+2: extracted together in the same Rust call.
+    all_targets = np.concatenate([
+        feature_mzs,
+        feature_mzs + _NEUTRON,
+        feature_mzs + 2 * _NEUTRON,
+    ])  # shape (3 * n_feat,)
+
+    try:
+        from ms1rescore_rs import compute_maldi_isotope_means as _rs_means
+        means = np.asarray(
+            _rs_means(flat_mzs, flat_ints, pixel_offsets, all_targets.tolist(), extraction_ppm),
+            dtype=np.float64,
+        )
+        logger.debug("  compute_maldi_isotope_means: used Rust implementation")
+    except (ImportError, AttributeError):
+        means = _compute_isotope_means_python(
+            flat_mzs, flat_ints, pixel_offsets, all_targets, extraction_ppm
+        )
+        logger.debug("  compute_maldi_isotope_means: used Python fallback")
+
+    # Free the large flat arrays as soon as Rust is done.
+    del flat_mzs, flat_ints
+
+    m0_means = means[:n_feat].astype(np.float32)
+    m1_means = means[n_feat:2 * n_feat].astype(np.float32)
+    m2_means = means[2 * n_feat:].astype(np.float32)
+    return m0_means, m1_means, m2_means
+
+
+# ---------------------------------------------------------------------------
 # Spatial feature computation
 # ---------------------------------------------------------------------------
 
@@ -706,161 +832,161 @@ def extract_maldi_data(
         ) from exc
 
     logger.info(f"Opening MALDI dataset: {d_path}")
-    with imzy.get_reader(d_path) as reader:
+    reader = imzy.get_reader(d_path)
+    logger.info(
+        f"  {reader.n_pixels:,} pixels, image shape {reader.image_shape}, "
+        f"m/z range {reader.mz_min:.1f}–{reader.mz_max:.1f}"
+    )
+
+    if feature_mzs is not None:
         logger.info(
-            f"  {reader.n_pixels:,} pixels, image shape {reader.image_shape}, "
-            f"m/z range {reader.mz_min:.1f}–{reader.mz_max:.1f}"
+            f"Step 1/3: Using {len(feature_mzs)} provided feature m/z values "
+            f"(skipping detection)."
+        )
+    elif not reader.is_centroid:
+        logger.info(
+            "Step 1/3: Profile data detected — building mean spectrum for "
+            "SCiLS-style interval detection..."
+        )
+        from ms1rescore.maldi_imzml import (
+            SCiLSConfig, _detect_intervals,
+            _recalibrate_intervals, _merge_duplicate_intervals,
+            _deisotope_intervals, _filter_mass_defect,
         )
 
-        if feature_mzs is not None:
-            logger.info(
-                f"Step 1/3: Using {len(feature_mzs)} provided feature m/z values "
-                f"(skipping detection)."
+        scils_cfg = SCiLSConfig(
+            min_pixel_fraction=min_fraction,
+            peak_prominence=peak_prominence,
+            smoothing_window=smoothing_window,
+            smoothing_polyorder=smoothing_polyorder,
+            ppm_tolerance=ppm_tolerance,
+            min_interval_width_ppm=min_interval_width_ppm,
+            normalize_rms=normalize_rms,
+            baseline_correction=baseline_correction,
+            baseline_window_ppm=baseline_window_ppm,
+            calibrant_mzs=calibrant_mzs or [],
+            calibrant_tol_ppm=calibrant_tol_ppm,
+            deisotope=deisotope,
+            deisotope_averagine=deisotope_averagine,
+            deisotope_scorer=deisotope_scorer,
+            deisotope_min_score=deisotope_min_score,
+            deisotope_charge_range=deisotope_charge_range,
+            deisotope_error_ppm=deisotope_error_ppm,
+            filter_mass_defect=filter_mass_defect,
+            mass_defect_halfwidth=mass_defect_halfwidth,
+            picking_height=picking_height,
+            local_prominence_window_da=local_prominence_window_da,
+        )
+        mz_grid, mean_ints = _build_profile_mean_spectrum(
+            reader, normalize_rms=normalize_rms, normalize_tic=not normalize_rms
+        )
+        intervals = _detect_intervals(mz_grid, mean_ints, scils_cfg)
+        if calibrant_mzs:
+            intervals = _recalibrate_intervals(intervals, calibrant_mzs, calibrant_tol_ppm)
+        if deisotope:
+            apex_ints = np.array(
+                [float(mean_ints[np.argmin(np.abs(mz_grid - iv[2]))]) for iv in intervals],
+                dtype=np.float64,
             )
-        elif not reader.is_centroid:
-            logger.info(
-                "Step 1/3: Profile data detected — building mean spectrum for "
-                "SCiLS-style interval detection..."
+            intervals, apex_ints = _merge_duplicate_intervals(intervals, apex_ints)
+            intervals = _deisotope_intervals(
+                intervals, apex_ints,
+                averagine=deisotope_averagine,
+                scorer=deisotope_scorer,
+                min_score=deisotope_min_score,
+                charge_range=deisotope_charge_range,
+                error_ppm=deisotope_error_ppm,
             )
-            from ms1rescore.maldi_imzml import (
-                SCiLSConfig, _detect_intervals,
-                _recalibrate_intervals, _merge_duplicate_intervals,
-                _deisotope_intervals, _filter_mass_defect,
-            )
+        if filter_mass_defect:
+            intervals = _filter_mass_defect(intervals, mass_defect_halfwidth)
+        feature_mzs = np.array(
+            [iv[2] for iv in intervals], dtype=np.float64
+        )
+        logger.info(f"  {len(feature_mzs)} intervals detected from mean spectrum")
+        if verbose:
+            logger.info(f"  Detected feature m/z values:\n  {feature_mzs}")
+            if output_dir:
+                features_txt = os.path.join(output_dir, "1_detected_features.txt")
+                np.savetxt(features_txt, feature_mzs, fmt="%.6f")
+                logger.info(f"  Saved detected features → {features_txt}")
+    else:
+        logger.info("Step 1/3: Detecting features...")
+        feature_mzs = detect_features(
+            reader, ppm_bin=ppm_bin, min_fraction=min_fraction
+        )
+        if verbose:
+            logger.info(f"  Detected feature m/z values:\n  {feature_mzs}")
+            # Save detected features to a text file for debugging.
+            if output_dir:
+                features_txt = os.path.join(output_dir, "1_detected_features.txt")
+                np.savetxt(features_txt, feature_mzs, fmt="%.6f")
+                logger.info(f"  Saved detected features → {features_txt}")
 
-            scils_cfg = SCiLSConfig(
-                min_pixel_fraction=min_fraction,
-                peak_prominence=peak_prominence,
-                smoothing_window=smoothing_window,
-                smoothing_polyorder=smoothing_polyorder,
-                ppm_tolerance=ppm_tolerance,
-                min_interval_width_ppm=min_interval_width_ppm,
-                normalize_rms=normalize_rms,
-                baseline_correction=baseline_correction,
-                baseline_window_ppm=baseline_window_ppm,
-                calibrant_mzs=calibrant_mzs or [],
-                calibrant_tol_ppm=calibrant_tol_ppm,
-                deisotope=deisotope,
-                deisotope_averagine=deisotope_averagine,
-                deisotope_scorer=deisotope_scorer,
-                deisotope_min_score=deisotope_min_score,
-                deisotope_charge_range=deisotope_charge_range,
-                deisotope_error_ppm=deisotope_error_ppm,
-                filter_mass_defect=filter_mass_defect,
-                mass_defect_halfwidth=mass_defect_halfwidth,
-                picking_height=picking_height,
-                local_prominence_window_da=local_prominence_window_da,
-            )
-            mz_grid, mean_ints = _build_profile_mean_spectrum(
-                reader, normalize_rms=normalize_rms, normalize_tic=not normalize_rms
-            )
-            intervals = _detect_intervals(mz_grid, mean_ints, scils_cfg)
-            if calibrant_mzs:
-                intervals = _recalibrate_intervals(intervals, calibrant_mzs, calibrant_tol_ppm)
-            if deisotope:
-                apex_ints = np.array(
-                    [float(mean_ints[np.argmin(np.abs(mz_grid - iv[2]))]) for iv in intervals],
-                    dtype=np.float64,
-                )
-                intervals, apex_ints = _merge_duplicate_intervals(intervals, apex_ints)
-                intervals = _deisotope_intervals(
-                    intervals, apex_ints,
-                    averagine=deisotope_averagine,
-                    scorer=deisotope_scorer,
-                    min_score=deisotope_min_score,
-                    charge_range=deisotope_charge_range,
-                    error_ppm=deisotope_error_ppm,
-                )
-            if filter_mass_defect:
-                intervals = _filter_mass_defect(intervals, mass_defect_halfwidth)
-            feature_mzs = np.array(
-                [iv[2] for iv in intervals], dtype=np.float64
-            )
-            logger.info(f"  {len(feature_mzs)} intervals detected from mean spectrum")
-            if verbose:
-                logger.info(f"  Detected feature m/z values:\n  {feature_mzs}")
-                if output_dir:
-                    features_txt = os.path.join(output_dir, "1_detected_features.txt")
-                    np.savetxt(features_txt, feature_mzs, fmt="%.6f")
-                    logger.info(f"  Saved detected features → {features_txt}")
-        else:
-            logger.info("Step 1/3: Detecting features...")
-            feature_mzs = detect_features(
-                reader, ppm_bin=ppm_bin, min_fraction=min_fraction
-            )
-            if verbose:
-                logger.info(f"  Detected feature m/z values:\n  {feature_mzs}")
-                # Save detected features to a text file for debugging.
-                if output_dir:
-                    features_txt = os.path.join(output_dir, "1_detected_features.txt")
-                    np.savetxt(features_txt, feature_mzs, fmt="%.6f")
-                    logger.info(f"  Saved detected features → {features_txt}")
+    if len(feature_mzs) == 0:
+        raise ValueError(
+            f"No features for {d_path!r}. "
+            "If using detect_features, try lowering min_fraction. "
+            "If using feature_mzs, ensure the sequences are valid and in range."
+        )
 
-        if len(feature_mzs) == 0:
-            raise ValueError(
-                f"No features for {d_path!r}. "
-                "If using detect_features, try lowering min_fraction. "
-                "If using feature_mzs, ensure the sequences are valid and in range."
-            )
+    x_coords = reader.x_coordinates
+    y_coords = reader.y_coordinates
 
-        x_coords = reader.x_coordinates
-        y_coords = reader.y_coordinates
+    logger.info("Step 2/3: Extracting ion images...")
+    if images_path is None:
+        logger.debug("  No images_path given, extracting full ion image array in RAM.")
+        # Default: single pass, full array in RAM.
+        ion_images = extract_ion_images(reader, feature_mzs, ppm=extraction_ppm)
+        if verbose:
+            logger.info(f"  Ion images shape: {ion_images.shape}, dtype: {ion_images.dtype}")
+            # Save to disk
+            if output_dir:
+                images_npy = os.path.join(output_dir, "2_ion_images.npy")
+                np.save(images_npy, ion_images)
+                logger.info(f"  Saved ion images → {images_npy}")
 
-        logger.info("Step 2/3: Extracting ion images...")
-        if images_path is None:
-            logger.debug("  No images_path given, extracting full ion image array in RAM.")
-            # Default: single pass, full array in RAM.
-            ion_images = extract_ion_images(reader, feature_mzs, ppm=extraction_ppm)
-            if verbose:
-                logger.info(f"  Ion images shape: {ion_images.shape}, dtype: {ion_images.dtype}")
-                # Save to disk
-                if output_dir:
-                    images_npy = os.path.join(output_dir, "2_ion_images.npy")
-                    np.save(images_npy, ion_images)
-                    logger.info(f"  Saved ion images → {images_npy}")
-                    
+        logger.info("Step 3/3: Computing spatial features...")
+        spatial_df = compute_spatial_features(
+            ion_images, feature_mzs, reader.n_pixels
+        )
+        if verbose:
+            logger.info(f"  Spatial features DataFrame:\n{spatial_df.head()}")
+            # Save to disk
+            if output_dir:
+                spatial_csv = os.path.join(output_dir, "3_spatial_features.csv")
+                spatial_df.to_csv(spatial_csv, index=False)
+                logger.info(f"  Saved spatial features → {spatial_csv}")
+    else:
+        # Memory-efficient: write to disk in batches, never hold full array in RAM.
+        n_features = len(feature_mzs)
+        height, width = reader.image_shape
+        ion_images = np.memmap(
+            images_path,
+            dtype=np.float32,
+            mode="w+",
+            shape=(n_features, height, width),
+        )
+        logger.info(
+            f"  Memmap {n_features} × {height} × {width} float32 → {images_path}"
+        )
+        spatial_chunks: list[pd.DataFrame] = []
+        for batch_start in range(0, n_features, image_batch_size):
+            batch_end = min(batch_start + image_batch_size, n_features)
+            batch_mzs = feature_mzs[batch_start:batch_end]
+            batch_images = reader.get_ion_images(
+                np.asarray(batch_mzs, dtype=np.float64),
+                ppm=extraction_ppm,
+                fill_value=0.0,
+                silent=True,
+            ).astype(np.float32)
+            ion_images[batch_start:batch_end] = batch_images
             logger.info("Step 3/3: Computing spatial features...")
-            spatial_df = compute_spatial_features(
-                ion_images, feature_mzs, reader.n_pixels
+            spatial_chunks.append(
+                compute_spatial_features(batch_images, batch_mzs, reader.n_pixels)
             )
-            if verbose:
-                logger.info(f"  Spatial features DataFrame:\n{spatial_df.head()}")
-                # Save to disk
-                if output_dir:
-                    spatial_csv = os.path.join(output_dir, "3_spatial_features.csv")
-                    spatial_df.to_csv(spatial_csv, index=False)
-                    logger.info(f"  Saved spatial features → {spatial_csv}")
-        else:
-            # Memory-efficient: write to disk in batches, never hold full array in RAM.
-            n_features = len(feature_mzs)
-            height, width = reader.image_shape
-            ion_images = np.memmap(
-                images_path,
-                dtype=np.float32,
-                mode="w+",
-                shape=(n_features, height, width),
-            )
-            logger.info(
-                f"  Memmap {n_features} × {height} × {width} float32 → {images_path}"
-            )
-            spatial_chunks: list[pd.DataFrame] = []
-            for batch_start in range(0, n_features, image_batch_size):
-                batch_end = min(batch_start + image_batch_size, n_features)
-                batch_mzs = feature_mzs[batch_start:batch_end]
-                batch_images = reader.get_ion_images(
-                    np.asarray(batch_mzs, dtype=np.float64),
-                    ppm=extraction_ppm,
-                    fill_value=0.0,
-                    silent=True,
-                ).astype(np.float32)
-                ion_images[batch_start:batch_end] = batch_images
-                logger.info("Step 3/3: Computing spatial features...")
-                spatial_chunks.append(
-                    compute_spatial_features(batch_images, batch_mzs, reader.n_pixels)
-                )
-                del batch_images
-            ion_images.flush()
-            spatial_df = pd.concat(spatial_chunks, ignore_index=True)
+            del batch_images
+        ion_images.flush()
+        spatial_df = pd.concat(spatial_chunks, ignore_index=True)
 
     # Drop features with zero MALDI signal (no pixels detected).
     # This is especially important when feature_mzs come from LC-MS/MS IDs,
@@ -900,4 +1026,19 @@ def extract_maldi_data(
         spatial_df.to_csv(tsv_path, sep="\t", index=False)
         logger.info(f"  Saved spatial features → {tsv_path}")
 
-    return feature_mzs, ion_images, spatial_df
+    # --- Compute MALDI isotope envelopes (M0/M+1/M+2 mean spatial intensity) ---
+    # Single streaming pass via Rust (or vectorised Python fallback) replaces the
+    # previous two reader.get_ion_images() calls that each allocated a full 3-D
+    # ion-image array (~4.8 GB each for 5254 features × 412 × 559 pixels).
+    logger.info("Computing MALDI isotope envelopes (single-pass streaming)...")
+    m0_means, m1_means, m2_means = compute_isotope_envelope_means(
+        reader, feature_mzs, extraction_ppm
+    )
+    maldi_envelopes = {
+        float(mz): [float(m0), float(m1), float(m2)]
+        for mz, m0, m1, m2 in zip(feature_mzs, m0_means, m1_means, m2_means)
+        if m0 > 0
+    }
+    logger.info(f"  {len(maldi_envelopes)}/{len(feature_mzs)} features with M0 signal for envelope scoring")
+
+    return feature_mzs, ion_images, spatial_df, maldi_envelopes

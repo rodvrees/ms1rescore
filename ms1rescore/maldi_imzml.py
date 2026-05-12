@@ -805,6 +805,107 @@ def _visualize_scils(
 
 
 # ---------------------------------------------------------------------------
+# Ion mobility helpers
+# ---------------------------------------------------------------------------
+
+
+def one_over_k0_to_ccs(
+    one_over_k0: np.ndarray | float,
+    mz: np.ndarray | float,
+    charge: int = 1,
+    mass_gas: float = 28.013,
+    temp: float = 31.85,
+    t_diff: float = 273.15,
+) -> np.ndarray | float:
+    """Convert reduced ion mobility (1/K0, Vs/cm²) to CCS (Å²).
+
+    Uses the same Mason-Schamp formula and default constants as im2deep.utils.im2ccs
+    (N2 drift gas, 31.85 °C). Adapted from theGreatHerrLebert/ionmob.
+    """
+    # Same formula as im2deep.utils.im2ccs (SUMMARY_CONSTANT = 18509.8632163405)
+    _SUMMARY_CONSTANT = 18509.8632163405
+    one_over_k0 = np.asarray(one_over_k0, dtype=np.float64)
+    mz = np.asarray(mz, dtype=np.float64)
+    reduced_mass = (mz * charge * mass_gas) / (mz * charge + mass_gas)
+    return (_SUMMARY_CONSTANT * charge) / (np.sqrt(reduced_mass * (temp + t_diff)) / one_over_k0)
+
+
+def _parse_mobility_offsets(
+    imzml_path: str,
+) -> tuple[np.ndarray, np.ndarray, str] | None:
+    """Parse per-spectrum mobility array offsets from imzML XML.
+
+    Returns (offsets, lengths, dtype_str) or None if no mobilityArray group found.
+    dtype_str is 'float32' or 'float64'.
+    """
+    import xml.etree.ElementTree as ET
+
+    def _strip_ns(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    tree = ET.parse(imzml_path)
+    root = tree.getroot()
+
+    # Find the referenceableParamGroup used for mobility arrays.
+    mobility_group_id: str | None = None
+    mobility_dtype = "float64"
+
+    for elem in root.iter():
+        if _strip_ns(elem.tag) == "referenceableParamGroup":
+            group_id = elem.get("id", "")
+            if "mobility" in group_id.lower():
+                mobility_group_id = group_id
+                for child in elem:
+                    acc = child.get("accession", "")
+                    if acc == "MS:1000521":   # 32-bit float
+                        mobility_dtype = "float32"
+                    elif acc == "MS:1000523": # 64-bit float
+                        mobility_dtype = "float64"
+                break
+
+    if mobility_group_id is None:
+        return None
+
+    offsets: list[int] = []
+    lengths: list[int] = []
+
+    for spectrum_elem in root.iter():
+        if _strip_ns(spectrum_elem.tag) != "spectrum":
+            continue
+
+        for bda in spectrum_elem:
+            if _strip_ns(bda.tag) != "binaryDataArray":
+                continue
+
+            is_mobility = False
+            offset: int | None = None
+            length: int | None = None
+
+            for child in bda:
+                child_tag = _strip_ns(child.tag)
+                if child_tag == "referenceableParamGroupRef":
+                    if child.get("ref", "") == mobility_group_id:
+                        is_mobility = True
+                elif child_tag == "cvParam":
+                    acc = child.get("accession", "")
+                    val = child.get("value")
+                    if acc == "IMS:1000102" and val is not None:
+                        offset = int(val)
+                    elif acc == "IMS:1000103" and val is not None:
+                        length = int(val)
+
+            if is_mobility and offset is not None and length is not None:
+                offsets.append(offset)
+                lengths.append(length)
+                break  # only one mobility array per spectrum
+
+    if not offsets:
+        return None
+
+    return np.array(offsets, dtype=np.int64), np.array(lengths, dtype=np.int64), mobility_dtype
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -814,7 +915,7 @@ def extract_scils_features(
     config: Optional[SCiLSConfig] = None,
     output_dir: Optional[str] = None,
     visualize: bool = False,
-) -> tuple[list[tuple[float, float, float]], np.ndarray, list[tuple[int, int]]]:
+) -> tuple[list[tuple[float, float, float]], np.ndarray, list[tuple[int, int]], np.ndarray | None]:
     """Extract SCiLS Lab-style interval features from an imzML dataset.
 
     Parameters
@@ -836,7 +937,16 @@ def extract_scils_features(
         Per-pixel integrated intensities.
     pixel_coords : list of (x, y)
         0-based pixel coordinates, same row order as intensity_matrix.
+    mean_1_over_k0 : np.ndarray or None
+        Intensity-weighted mean 1/K0 per interval (Vs/cm²), or None when
+        no mobility binary arrays are present in the imzML file.
     """
+    # Patch pyimzml to tolerate CV params with no value attribute in
+    # mobilityArray referenceableParamGroups (pyimzml 1.5.5 crash).
+    import pyimzml.ontology.ontology as _pyo
+    _orig_convert = _pyo.convert_xml_value
+    _pyo.convert_xml_value = lambda dtype, v: None if v is None else _orig_convert(dtype, v)
+
     from pyimzml.ImzMLParser import ImzMLParser
 
     if config is None:
@@ -856,7 +966,7 @@ def extract_scils_features(
 
         if len(mz_grid) == 0:
             logger.warning("Empty imzML dataset — no spectra found.")
-            return [], np.zeros((0, 0), dtype=np.float32), []
+            return [], np.zeros((0, 0), dtype=np.float32), [], None
 
         # Detect intervals from mean spectrum
         intervals = _detect_intervals(mz_grid, mean_ints, config)
@@ -889,19 +999,54 @@ def extract_scils_features(
             logger.info(f"  {len(intervals)}/{n_before} intervals after mass defect filter")
 
         if len(intervals) == 0:
-            return [], np.zeros((n_pixels, 0), dtype=np.float32), []
+            return [], np.zeros((n_pixels, 0), dtype=np.float32), [], None
+
+        # Check for per-spectrum mobility arrays before Pass 2
+        ibd_path = imzml_path.rsplit(".", 1)[0] + ".ibd"
+        mob_offsets_result = _parse_mobility_offsets(imzml_path)
+        has_mobility = (
+            mob_offsets_result is not None
+            and len(mob_offsets_result[0]) == n_pixels
+            and os.path.exists(ibd_path)
+        )
+
+        if has_mobility:
+            mob_offsets, mob_lengths, mob_dtype = mob_offsets_result
+            mob_weight_sum = np.zeros(len(intervals), dtype=np.float64)
+            mob_int_sum = np.zeros(len(intervals), dtype=np.float64)
+            logger.info("  Mobility arrays detected — accumulating 1/K0 during Pass 2")
 
         # Pass 2: integrate each pixel
         logger.info("Pass 2: integrating pixels over intervals…")
         intensity_matrix = np.zeros((n_pixels, len(intervals)), dtype=np.float32)
         pixel_coords: list[tuple[int, int]] = []
 
-        for i, (x, y, *_) in enumerate(parser.coordinates):
-            pixel_coords.append((x - 1, y - 1))  # 1-based → 0-based
-            mzs, ints = parser.getspectrum(i)
-            mzs = np.asarray(mzs, dtype=np.float64)
-            ints = np.asarray(ints, dtype=np.float64)
-            intensity_matrix[i] = _integrate_pixel(mzs, ints, intervals, config)
+        ibd_fh = open(ibd_path, "rb") if has_mobility else None
+        try:
+            for i, (x, y, *_) in enumerate(parser.coordinates):
+                pixel_coords.append((x - 1, y - 1))  # 1-based → 0-based
+                mzs, ints = parser.getspectrum(i)
+                mzs = np.asarray(mzs, dtype=np.float64)
+                ints = np.asarray(ints, dtype=np.float64)
+                intensity_matrix[i] = _integrate_pixel(mzs, ints, intervals, config)
+
+                if has_mobility and ibd_fh is not None:
+                    n_pts = int(mob_lengths[i])
+                    itemsize = 4 if mob_dtype == "float32" else 8
+                    ibd_fh.seek(int(mob_offsets[i]))
+                    mob = np.frombuffer(ibd_fh.read(n_pts * itemsize), dtype=mob_dtype).astype(np.float64)
+                    for j, (mz_lo, mz_hi, _) in enumerate(intervals):
+                        lo = int(np.searchsorted(mzs, mz_lo, side="left"))
+                        hi = int(np.searchsorted(mzs, mz_hi, side="right"))
+                        if lo < hi and lo < len(mob):
+                            hi_m = min(hi, len(mob))
+                            seg_ints = ints[lo:hi_m]
+                            seg_mob = mob[lo:hi_m]
+                            mob_weight_sum[j] += float((seg_ints * seg_mob).sum())
+                            mob_int_sum[j] += float(seg_ints.sum())
+        finally:
+            if ibd_fh is not None:
+                ibd_fh.close()
 
     # Filter intervals
     keep = _filter_intervals(intensity_matrix, intervals, config, n_pixels)
@@ -915,10 +1060,18 @@ def extract_scils_features(
     intervals = [iv for iv, k in zip(intervals, keep) if k]
     intensity_matrix = intensity_matrix[:, keep]
 
+    if has_mobility:
+        mean_1_over_k0_full = np.where(
+            mob_int_sum > 0, mob_weight_sum / mob_int_sum, np.nan
+        )
+        mean_1_over_k0: np.ndarray | None = mean_1_over_k0_full[keep]
+    else:
+        mean_1_over_k0 = None
+
     if visualize and output_dir is not None:
         _visualize_scils(
             mz_grid, mean_ints, intervals, intensity_matrix, pixel_coords,
             output_dir=output_dir,
         )
 
-    return intervals, intensity_matrix, pixel_coords
+    return intervals, intensity_matrix, pixel_coords, mean_1_over_k0

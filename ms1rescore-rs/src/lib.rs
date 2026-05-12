@@ -1,9 +1,11 @@
 mod digest;
 mod features;
 mod isotope;
+mod maldi_isotope;
 mod spectral;
 mod xic;
 
+use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
 
 /// Extract XICs for multiple target m/z values across all MS1 scans.
@@ -146,6 +148,51 @@ fn count_missed_cleavages_batch(sequences: Vec<String>) -> Vec<i32> {
     features::missed_cleavages_batch(&sequences)
 }
 
+/// Compute mean intensities at target m/z values across all MALDI pixels.
+///
+/// Uses a single streaming pass (CSR layout) and rayon parallelism over pixels.
+/// Replaces two ``reader.get_ion_images()`` calls for M+1 / M+2 isotope extraction,
+/// avoiding two full streaming passes and two large temporary 3-D arrays.
+///
+/// Args:
+///     flat_mzs: Concatenated sorted m/z arrays for all pixels (float64 numpy array).
+///     flat_ints: Concatenated intensity arrays for all pixels (float32 numpy array).
+///     pixel_offsets: CSR-style start index for each pixel (list of int, length n_pixels+1).
+///     target_mzs: Target m/z values in any order (list of float).
+///     ppm_tolerance: Mass tolerance in ppm (default 25.0).
+///
+/// Returns:
+///     List of mean intensities, one per target m/z, in the same order as target_mzs.
+#[pyfunction]
+#[pyo3(signature = (flat_mzs, flat_ints, pixel_offsets, target_mzs, ppm_tolerance=25.0))]
+fn compute_maldi_isotope_means(
+    py: Python<'_>,
+    flat_mzs: PyReadonlyArray1<'_, f64>,
+    flat_ints: PyReadonlyArray1<'_, f32>,
+    pixel_offsets: Vec<usize>,
+    target_mzs: Vec<f64>,
+    ppm_tolerance: f64,
+) -> Vec<f64> {
+    let mzs_slice = flat_mzs.as_slice().expect("flat_mzs must be C-contiguous");
+    let ints_slice = flat_ints.as_slice().expect("flat_ints must be C-contiguous");
+
+    // Cast pointers to usize to cross the allow_threads (Ungil) boundary.
+    // usize is Send + Sync; we re-cast to *const inside the closure.
+    // Safety: the numpy arrays remain alive (PyReadonlyArray1 holds a GIL-
+    // protected reference); PyReadonlyArray1 guarantees no mutation while
+    // we hold the borrow; rayon threads only read.
+    let mzs_addr = mzs_slice.as_ptr() as usize;
+    let mzs_len = mzs_slice.len();
+    let ints_addr = ints_slice.as_ptr() as usize;
+    let ints_len = ints_slice.len();
+
+    py.allow_threads(move || {
+        let mzs = unsafe { std::slice::from_raw_parts(mzs_addr as *const f64, mzs_len) };
+        let ints = unsafe { std::slice::from_raw_parts(ints_addr as *const f32, ints_len) };
+        maldi_isotope::compute_isotope_means_flat(mzs, ints, &pixel_offsets, &target_mzs, ppm_tolerance)
+    })
+}
+
 #[pymodule]
 fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_xics_batch, m)?)?;
@@ -156,5 +203,6 @@ fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_ionization_features, m)?)?;
     m.add_function(wrap_pyfunction!(compute_property_features, m)?)?;
     m.add_function(wrap_pyfunction!(count_missed_cleavages_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_maldi_isotope_means, m)?)?;
     Ok(())
 }

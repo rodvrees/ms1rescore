@@ -810,6 +810,8 @@ def compute_im2deep_features(
 
     df["im2deep_delta_ccs"] = delta
     df["im2deep_abs_delta_ccs_pct"] = abs_pct
+    df["im2deep_observed_ccs"] = observed
+    df["im2deep_predicted_ccs"] = predicted_cal
 
     # Z-score and rank within each MALDI feature
     df["im2deep_ccs_zscore"] = df.groupby("feature_mz")["_im2deep_delta"].transform(

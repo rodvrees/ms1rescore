@@ -1,6 +1,8 @@
 - Move MSF parser to psm_utils
 - LC-MS/MS prior features should just be MS2Rescore features
 - Implement LDA
-- Feature importance visualization
-- Debug output: a folder of figures showing ion images of matches and their protein-level colocalization
 - cleanup: classes of scoring algos? with a base class?
+- log_mean_intensity and spatial_entropy are empty?
+- Color the R1 winners in the CCS correlation plot
+- Finetuning/calibration correct?
+- Set right MS2PIP model, currently using HCD

@@ -16,6 +16,7 @@ from ms1rescore.feature_generator import (
     LCMS_PRIOR_FEATURES,
     MALDI_INTRINSIC_FEATURES,
     PROTEIN_LEVEL_FEATURES,
+    SPATIAL_PRIOR_FEATURES,
     candidates_to_psm_list,
     compute_all_features,
     get_feature_names,
@@ -40,6 +41,9 @@ _LCMS_NAN_FILL: dict[str, float] = {"lcms_q_value": 1.0, "lcms_pep": 1.0}
 
 # Relative weights for the weighted average in compute_lcms_prior
 _LCMS_PRIOR_WEIGHTS: dict[str, float] = {"source_lcms_confirmed": 2.0}
+
+# Spatial prior: Geary's C is lower-is-better (< 1 = positive autocorrelation)
+_SPATIAL_INVERT_FEATURES = frozenset(["spatial_gearys_c"])
 
 
 def compute_lcms_prior(
@@ -82,6 +86,41 @@ def compute_lcms_prior(
     return (weights_arr[:, None] * stacked).sum(axis=0) / weights_arr.sum()
 
 
+def compute_spatial_prior(
+    candidates_df: pd.DataFrame,
+    present_spatial_features: list[str],
+) -> np.ndarray:
+    """
+    Compute a per-candidate multiplicative weight in (0, 1] based on
+    spatial quality of the ion image.
+
+    All spatial features are feature-level (identical for all candidates at the
+    same m/z), so they cannot discriminate within a feature. Applied as a
+    post-scoring prior rather than as ranker inputs. Each feature is min-max
+    normalized; ``spatial_gearys_c`` is negated before normalization (lower
+    Geary's C = positive autocorrelation = better). Returns 1.0 if no
+    informative spatial features are present.
+    """
+    normed: list[np.ndarray] = []
+
+    for feat in present_spatial_features:
+        if feat not in candidates_df.columns:
+            continue
+        col = candidates_df[feat].fillna(0.0).values.astype(float)
+        col = np.where(np.isfinite(col), col, 0.0)
+        if feat in _SPATIAL_INVERT_FEATURES:
+            col = -col
+        col_min, col_max = col.min(), col.max()
+        if col_max - col_min < 1e-12:
+            continue
+        normed.append((col - col_min) / (col_max - col_min))
+
+    if not normed:
+        return np.ones(len(candidates_df))
+
+    return np.stack(normed, axis=0).mean(axis=0)
+
+
 def _rescore_svm(
     psm_list,
     features_df: pd.DataFrame,
@@ -92,11 +131,11 @@ def _rescore_svm(
 
     Returns
     -------
-    (conf_obj, all_scores)
-        ``conf_obj`` is the mokapot LinearConfidence object (for peptide/protein
-        level results). ``all_scores`` is a numpy array of SVM decision scores
-        for ALL candidates (targets + decoys) in ``features_df`` row order,
-        or ``None`` if score extraction fails.
+    (conf_obj, all_scores, importances, importance_names)
+        ``conf_obj`` is the mokapot LinearConfidence object. ``all_scores`` is
+        a numpy array of SVM decision scores for ALL candidates, or ``None``.
+        ``importances`` is the mean absolute SVM coefficient vector (or None).
+        ``importance_names`` is the aligned feature name list (or None).
     """
     from mokapot import brew
     from mokapot.model import PercolatorModel
@@ -111,9 +150,12 @@ def _rescore_svm(
     # Score ALL candidates (targets + decoys) for TDC reweighting.
     # brew trains k fold models; average their scores across folds for stability.
     all_scores = None
+    importances = None
+    importance_names = None
     try:
         from mokapot.model import _get_scores
         fold_scores = []
+        fold_coefs = []
         for fm in trained_models:
             if not fm.is_trained:
                 continue
@@ -125,16 +167,24 @@ def _rescore_svm(
             X_all = features_df[present_raw].fillna(0.0).values.astype(float)
             X_scaled = fm.scaler.transform(X_all)
             fold_scores.append(_get_scores(fm.estimator, X_scaled))
+            try:
+                fold_coefs.append(fm.estimator.coef_[0])
+                if importance_names is None:
+                    importance_names = present_raw
+            except AttributeError:
+                pass
         if fold_scores:
             all_scores = np.mean(fold_scores, axis=0)
         else:
             logger.warning("No trained fold models found — LC-MS/MS prior reweighting will be skipped.")
+        if fold_coefs:
+            importances = np.mean(fold_coefs, axis=0)
     except Exception as exc:
         logger.warning(
             f"Could not extract SVM scores ({exc}). "
             "LC-MS/MS prior reweighting will be skipped."
         )
-    return conf_obj, all_scores
+    return conf_obj, all_scores, importances, importance_names
 
 
 def _rescore_catboost(
@@ -155,7 +205,10 @@ def _rescore_catboost(
       4. Expand positives to candidates with q <= 0.05 (targets only).
       5. Repeat until convergence (<1% change in positive set size) or 5 iters.
 
-    Returns a score array (higher = more likely correct).
+    Returns ``(scores, importances, feature_names_used)`` where ``scores`` is
+    a 1-D array (higher = more likely correct), ``importances`` is the feature
+    importance vector from the last iteration's model (or None), and
+    ``feature_names_used`` is the aligned feature name list.
     """
     try:
         from catboost import CatBoostRanker, Pool
@@ -202,6 +255,7 @@ def _rescore_catboost(
 
     scores = np.zeros(len(df))
     prev_pos_size = -1
+    model_cb = None
 
     for iteration in range(5):
         # Build training set: pseudo-positives (label=1) + decoys (label=0)
@@ -243,7 +297,13 @@ def _rescore_catboost(
         prev_pos_size = n_new
         seed_mask = new_seed.values if hasattr(new_seed, "values") else new_seed
 
-    return scores
+    importances = None
+    if model_cb is not None:
+        try:
+            importances = model_cb.get_feature_importance()
+        except Exception:
+            pass
+    return scores, importances, present
 
 
 def _rescore_lda(
@@ -259,7 +319,10 @@ def _rescore_lda(
     StandardScaler inside a sklearn Pipeline.  Pseudo-label iteration
     follows the same structure as _rescore_catboost.
 
-    Returns a score array (higher = more likely correct).
+    Returns ``(scores, importances, feature_names_used)`` where ``scores`` is
+    a 1-D array (higher = more likely correct), ``importances`` is
+    ``|coef_[0]|`` from the final LDA pipeline (or None), and
+    ``feature_names_used`` is the aligned feature name list.
     """
     from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
     from sklearn.impute import SimpleImputer
@@ -295,6 +358,7 @@ def _rescore_lda(
 
     scores = np.zeros(len(df))
     prev_pos_size = -1
+    pipe = None
 
     for iteration in range(5):
         pos_idx = np.where(seed_mask)[0]
@@ -318,6 +382,10 @@ def _rescore_lda(
             f"  LDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size})"
         )
 
+        if n_new == 0:
+            logger.warning("  LDA: no pseudo-positives at q≤0.05 — stopping early")
+            break
+
         change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
         if prev_pos_size >= 0 and change < 0.01:
             logger.info("  LDA: converged")
@@ -326,51 +394,57 @@ def _rescore_lda(
         prev_pos_size = n_new
         seed_mask = new_seed.values if hasattr(new_seed, "values") else new_seed
 
-    return scores
+    importances = None
+    if pipe is not None:
+        try:
+            importances = np.abs(pipe["lda"].coef_[0])
+        except Exception:
+            pass
+    return scores, importances, present
 
 
-def _feature_level_tdc(
-    features_df: pd.DataFrame,
-    scores: np.ndarray,
-    feature_col: str = "feature_mz",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-feature TDC q-values.
+# def _feature_level_tdc(
+#     features_df: pd.DataFrame,
+#     scores: np.ndarray,
+#     feature_col: str = "feature_mz",
+# ) -> tuple[np.ndarray, np.ndarray]:
+#     """Per-feature TDC q-values.
 
-    For each MALDI feature the winner is the highest-scoring candidate
-    regardless of target/decoy status. TDC is applied over features ranked
-    by their winning score. Q-values are propagated to all candidates at
-    each feature (non-winners inherit their feature's q-value so the full
-    candidate table remains annotated).
+#     For each MALDI feature the winner is the highest-scoring candidate
+#     regardless of target/decoy status. TDC is applied over features ranked
+#     by their winning score. Q-values are propagated to all candidates at
+#     each feature (non-winners inherit their feature's q-value so the full
+#     candidate table remains annotated).
 
-    Returns
-    -------
-    q_values : np.ndarray, shape (n_candidates,)
-    is_tdc_winner : np.ndarray[bool], shape (n_candidates,)
-    """
-    df = pd.DataFrame({"_score": scores, "_feat": features_df[feature_col].values})
-    df["_is_decoy"] = features_df["is_decoy"].values.astype(bool)
+#     Returns
+#     -------
+#     q_values : np.ndarray, shape (n_candidates,)
+#     is_tdc_winner : np.ndarray[bool], shape (n_candidates,)
+#     """
+#     df = pd.DataFrame({"_score": scores, "_feat": features_df[feature_col].values})
+#     df["_is_decoy"] = features_df["is_decoy"].values.astype(bool)
 
-    winner_pos = df.groupby("_feat")["_score"].idxmax()
-    winner_scores = df.loc[winner_pos, "_score"].values
-    winner_is_decoy = df.loc[winner_pos, "_is_decoy"].values
+#     winner_pos = df.groupby("_feat")["_score"].idxmax()
+#     winner_scores = df.loc[winner_pos, "_score"].values
+#     winner_is_decoy = df.loc[winner_pos, "_is_decoy"].values
 
-    order = np.argsort(-winner_scores)
-    n_target_cum = np.cumsum(~winner_is_decoy[order]).astype(float)
-    n_decoy_cum = np.cumsum(winner_is_decoy[order]).astype(float)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        fdr = np.where(n_target_cum > 0, n_decoy_cum / n_target_cum, 1.0)
-    qval_sorted = np.minimum.accumulate(fdr[::-1])[::-1].clip(max=1.0)
-    feat_qvals = np.empty_like(qval_sorted)
-    feat_qvals[order] = qval_sorted
+#     order = np.argsort(-winner_scores)
+#     n_target_cum = np.cumsum(~winner_is_decoy[order]).astype(float)
+#     n_decoy_cum = np.cumsum(winner_is_decoy[order]).astype(float)
+#     with np.errstate(invalid="ignore", divide="ignore"):
+#         fdr = np.where(n_target_cum > 0, n_decoy_cum / n_target_cum, 1.0)
+#     qval_sorted = np.minimum.accumulate(fdr[::-1])[::-1].clip(max=1.0)
+#     feat_qvals = np.empty_like(qval_sorted)
+#     feat_qvals[order] = qval_sorted
 
-    # q-values are only meaningful for the per-feature winner; NaN for all others
-    q_values = np.full(len(df), np.nan)
-    q_values[winner_pos.values] = feat_qvals
+#     # q-values are only meaningful for the per-feature winner; NaN for all others
+#     q_values = np.full(len(df), np.nan)
+#     q_values[winner_pos.values] = feat_qvals
 
-    is_tdc_winner = np.zeros(len(df), dtype=bool)
-    is_tdc_winner[winner_pos.values] = True
+#     is_tdc_winner = np.zeros(len(df), dtype=bool)
+#     is_tdc_winner[winner_pos.values] = True
 
-    return q_values, is_tdc_winner
+#     return q_values, is_tdc_winner
 
 
 def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
@@ -451,6 +525,12 @@ def rescore(
     use_protein_level_features: bool = False,
     verbose: bool = False,
     output_dir: str = "ms1rescore_output",
+    debug_dir: str | None = None,
+    n_debug: int = 50,
+    debug_seed: int = 42,
+    observed_ccs_per_feature: dict | None = None,
+    im2deep_calibration_slope: float = 1.0,
+    im2deep_calibration_intercept: float = 0.0,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -785,6 +865,9 @@ def rescore(
         ion_image_mzs=ion_image_mzs,
         maldi_envelopes=maldi_envelopes,
         lcms_envelopes=lcms_envelopes_xic,
+        observed_ccs_per_feature=observed_ccs_per_feature,
+        im2deep_calibration_slope=im2deep_calibration_slope,
+        im2deep_calibration_intercept=im2deep_calibration_intercept,
     )
     if verbose:
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
@@ -813,6 +896,7 @@ def rescore(
         has_ion_images=ion_images is not None,
         has_envelopes=maldi_envelopes is not None and lcms_envelopes_xic is not None,
         has_generative=has_generative,
+        has_ccs=observed_ccs_per_feature is not None,
     )
     logger.debug(f"Selected feature names: {feature_names}")
 
@@ -824,6 +908,7 @@ def rescore(
     )
     intrinsic_present = [f for f in _intrinsic_pool if f in features_df.columns]
     lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
+    spatial_present = [f for f in SPATIAL_PRIOR_FEATURES if f in features_df.columns]
 
     # --- Generative-only backend: two-pass ---
     if model == "generative":
@@ -854,7 +939,8 @@ def rescore(
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         q2 = _tdc_qvalues(scores2, is_decoy_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
-        reweighted2 = scores2 * lcms_prior_w
+        spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
+        reweighted2 = scores2 * lcms_prior_w * spatial_prior_w
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
         # Map back to full candidate table
@@ -897,6 +983,17 @@ def rescore(
             )
 
         psm_list = candidates_to_psm_list(features_df)
+
+        if debug_dir is not None:
+            from ms1rescore.debug_viz import save_debug_figures
+            save_debug_figures(
+                features_df, result_df,
+                ion_images=ion_images, ion_image_mzs=ion_image_mzs,
+                maldi_envelopes=maldi_envelopes,
+                feature_names=intrinsic_present, model_name="generative",
+                debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+            )
+
         return psm_list, result_df, feature_names
 
     # --- Step 8: Build PSMList ---
@@ -930,7 +1027,9 @@ def rescore(
             psm_list.to_dataframe().to_csv(
                 f"{output_dir}/14_debug_psm_list_after_intrinsic.tsv", sep="\t", index=False
             )
-        conf_obj_r1, scores1 = _rescore_svm(psm_list, features_df, intrinsic_present, train_fdr)
+        conf_obj_r1, scores1, _imp_r1_svm, _imp_names_r1_svm = _rescore_svm(
+            psm_list, features_df, intrinsic_present, train_fdr
+        )
         if verbose:
             with open(f"{output_dir}/15_debug_mokapot_conf_r1.pkl", "wb") as f:
                 pickle.dump(conf_obj_r1, f)
@@ -951,7 +1050,9 @@ def rescore(
         # --- Round 2: retrain on winner subset ---
         psm_list_r2 = candidates_to_psm_list(winners_df)
         populate_psm_features(psm_list_r2, winners_df, intrinsic_present)
-        conf_obj_r2, scores2 = _rescore_svm(psm_list_r2, winners_df, intrinsic_present, train_fdr)
+        conf_obj_r2, scores2, svm_imp_r2, svm_imp_names_r2 = _rescore_svm(
+            psm_list_r2, winners_df, intrinsic_present, train_fdr
+        )
         if verbose:
             with open(f"{output_dir}/15_debug_mokapot_conf_r2.pkl", "wb") as f:
                 pickle.dump(conf_obj_r2, f)
@@ -966,7 +1067,8 @@ def rescore(
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         q2 = _tdc_qvalues(scores2, is_decoy_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
-        reweighted2 = scores2 * lcms_prior_w
+        spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
+        reweighted2 = scores2 * lcms_prior_w * spatial_prior_w
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
         # --- Map back to full candidate table ---
@@ -1008,13 +1110,25 @@ def rescore(
                 f"{n_rw} target features (reweighted)"
             )
 
+        if debug_dir is not None:
+            from ms1rescore.debug_viz import save_debug_figures
+            save_debug_figures(
+                features_df, result_df,
+                ion_images=ion_images, ion_image_mzs=ion_image_mzs,
+                maldi_envelopes=maldi_envelopes,
+                feature_names=intrinsic_present, model_name="svm",
+                importances_r1=_imp_r1_svm, importances_r2=svm_imp_r2,
+                importance_names=svm_imp_names_r2 or _imp_names_r1_svm,
+                debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+            )
+
         return psm_list, result_df, feature_names
 
     elif model == "catboost":
         feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
 
         # --- Round 1: score all candidates ---
-        scores1 = _rescore_catboost(
+        scores1, _imp_r1_cb, _imp_names_cb = _rescore_catboost(
             features_df,
             intrinsic_present,
             train_fdr=train_fdr,
@@ -1033,7 +1147,7 @@ def rescore(
         )
 
         # --- Round 2: retrain on winner subset ---
-        scores2 = _rescore_catboost(
+        scores2, cb_imp_r2, cb_imp_names_r2 = _rescore_catboost(
             winners_df,
             intrinsic_present,
             train_fdr=train_fdr,
@@ -1048,7 +1162,8 @@ def rescore(
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         q2 = _tdc_qvalues(scores2, is_decoy_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
-        reweighted2 = scores2 * lcms_prior_w
+        spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
+        reweighted2 = scores2 * lcms_prior_w * spatial_prior_w
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
         # --- Map back to full candidate table ---
@@ -1090,13 +1205,25 @@ def rescore(
                 f"{n_rw} target features (reweighted)"
             )
 
+        if debug_dir is not None:
+            from ms1rescore.debug_viz import save_debug_figures
+            save_debug_figures(
+                features_df, result_df,
+                ion_images=ion_images, ion_image_mzs=ion_image_mzs,
+                maldi_envelopes=maldi_envelopes,
+                feature_names=intrinsic_present, model_name="catboost",
+                importances_r1=_imp_r1_cb, importances_r2=cb_imp_r2,
+                importance_names=cb_imp_names_r2 or _imp_names_cb,
+                debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+            )
+
         return psm_list, result_df, feature_names
 
     elif model == "lda":
         feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
 
         # --- Round 1: score all candidates ---
-        scores1 = _rescore_lda(
+        scores1, _imp_r1_lda, _imp_names_lda = _rescore_lda(
             features_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
@@ -1111,7 +1238,7 @@ def rescore(
         )
 
         # --- Round 2: retrain on winner subset ---
-        scores2 = _rescore_lda(
+        scores2, lda_imp_r2, lda_imp_names_r2 = _rescore_lda(
             winners_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
@@ -1122,7 +1249,8 @@ def rescore(
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         q2 = _tdc_qvalues(scores2, is_decoy_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
-        reweighted2 = scores2 * lcms_prior_w
+        spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
+        reweighted2 = scores2 * lcms_prior_w * spatial_prior_w
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
         # --- Map back to full candidate table ---
@@ -1162,6 +1290,18 @@ def rescore(
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
                 f"{n_rw} target features (reweighted)"
+            )
+
+        if debug_dir is not None:
+            from ms1rescore.debug_viz import save_debug_figures
+            save_debug_figures(
+                features_df, result_df,
+                ion_images=ion_images, ion_image_mzs=ion_image_mzs,
+                maldi_envelopes=maldi_envelopes,
+                feature_names=intrinsic_present, model_name="lda",
+                importances_r1=_imp_r1_lda, importances_r2=lda_imp_r2,
+                importance_names=lda_imp_names_r2 or _imp_names_lda,
+                debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
             )
 
         return psm_list, result_df, feature_names
