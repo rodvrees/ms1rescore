@@ -6,3 +6,4 @@
 - Color the R1 winners in the CCS correlation plot
 - Finetuning/calibration correct?
 - Set right MS2PIP model, currently using HCD
+- New release of psm_utils

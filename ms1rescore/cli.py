@@ -807,6 +807,7 @@ def main() -> None:
     spatial_features = None
     maldi_envelopes = None
     _ccs_arr: np.ndarray | None = None
+    _ccs_source_mzs: np.ndarray | None = None  # mzs aligned with _ccs_arr; may differ from maldi_mzs
 
     if args.maldi_raw:
         from ms1rescore.maldi_extraction import extract_maldi_data
@@ -821,6 +822,7 @@ def main() -> None:
             logger.info(f"Loading pre-computed feature m/z values from {args.feature_mzs}")
             try:
                 precomputed_mzs, _ccs_arr = _read_feature_mzs(args.feature_mzs)
+                _ccs_source_mzs = precomputed_mzs
             except Exception as exc:
                 logger.error(f"Could not read --feature-mzs {args.feature_mzs!r}: {exc}")
                 sys.exit(1)
@@ -971,14 +973,33 @@ def main() -> None:
     )
 
     # --- Build observed CCS dict from loaded CCS array ---
+    # _ccs_source_mzs is set when the CCS array comes from a file whose m/z list
+    # may differ from maldi_mzs (e.g. --maldi-raw + --feature-mzs: extract_maldi_data
+    # can drop zero-signal features, making maldi_mzs shorter than precomputed_mzs).
+    # Build a m/z→CCS lookup and re-index into maldi_mzs to handle this case.
     observed_ccs: dict | None = None
-    if _ccs_arr is not None and len(_ccs_arr) == len(maldi_mzs):
-        observed_ccs = {
-            idx: float(v) for idx, v in enumerate(_ccs_arr) if np.isfinite(v)
-        }
-        logger.info(
-            f"  CCS values loaded for {len(observed_ccs)}/{len(maldi_mzs)} features"
-        )
+    if _ccs_arr is not None:
+        _ref_mzs = _ccs_source_mzs if _ccs_source_mzs is not None else maldi_mzs
+        if _ref_mzs is not None and len(_ccs_arr) == len(_ref_mzs):
+            _mz_to_ccs = {
+                float(mz): float(v)
+                for mz, v in zip(_ref_mzs, _ccs_arr)
+                if np.isfinite(v)
+            }
+            observed_ccs = {
+                idx: _mz_to_ccs[float(mz)]
+                for idx, mz in enumerate(maldi_mzs)
+                if float(mz) in _mz_to_ccs
+            }
+            if observed_ccs:
+                logger.info(
+                    f"  CCS values loaded for {len(observed_ccs)}/{len(maldi_mzs)} features"
+                )
+            else:
+                logger.warning(
+                    "  CCS array found but no m/z values matched maldi_mzs; "
+                    "CCS features will be skipped"
+                )
 
     # --- Run pipeline ---
     from ms1rescore.pipeline import rescore
