@@ -618,8 +618,11 @@ def extract_maldi_data(
     calibrant_mzs: list | None = None,
     calibrant_tol_ppm: float = 200.0,
     deisotope: bool = False,
-    deisotope_tol_da: float = 0.15,
-    deisotope_min_fold: float = 0.67,
+    deisotope_averagine: str = "peptide",
+    deisotope_scorer: str = "MSDeconVFitter",
+    deisotope_min_score: float = 10.0,
+    deisotope_charge_range: tuple = (1, 1),
+    deisotope_error_ppm: float = 15.0,
     filter_mass_defect: bool = False,
     mass_defect_halfwidth: float = 0.5,
     picking_height: float = 0.75,
@@ -721,7 +724,8 @@ def extract_maldi_data(
             )
             from ms1rescore.maldi_imzml import (
                 SCiLSConfig, _detect_intervals,
-                _recalibrate_intervals, _deisotope_intervals, _filter_mass_defect,
+                _recalibrate_intervals, _merge_duplicate_intervals,
+                _deisotope_intervals, _filter_mass_defect,
             )
 
             scils_cfg = SCiLSConfig(
@@ -737,8 +741,11 @@ def extract_maldi_data(
                 calibrant_mzs=calibrant_mzs or [],
                 calibrant_tol_ppm=calibrant_tol_ppm,
                 deisotope=deisotope,
-                deisotope_tol_da=deisotope_tol_da,
-                deisotope_min_fold=deisotope_min_fold,
+                deisotope_averagine=deisotope_averagine,
+                deisotope_scorer=deisotope_scorer,
+                deisotope_min_score=deisotope_min_score,
+                deisotope_charge_range=deisotope_charge_range,
+                deisotope_error_ppm=deisotope_error_ppm,
                 filter_mass_defect=filter_mass_defect,
                 mass_defect_halfwidth=mass_defect_halfwidth,
                 picking_height=picking_height,
@@ -755,7 +762,15 @@ def extract_maldi_data(
                     [float(mean_ints[np.argmin(np.abs(mz_grid - iv[2]))]) for iv in intervals],
                     dtype=np.float64,
                 )
-                intervals = _deisotope_intervals(intervals, deisotope_tol_da, apex_ints, deisotope_min_fold)
+                intervals, apex_ints = _merge_duplicate_intervals(intervals, apex_ints)
+                intervals = _deisotope_intervals(
+                    intervals, apex_ints,
+                    averagine=deisotope_averagine,
+                    scorer=deisotope_scorer,
+                    min_score=deisotope_min_score,
+                    charge_range=deisotope_charge_range,
+                    error_ppm=deisotope_error_ppm,
+                )
             if filter_mass_defect:
                 intervals = _filter_mass_defect(intervals, mass_defect_halfwidth)
             feature_mzs = np.array(

@@ -26,7 +26,13 @@ ms1rescore/
 │   ├── maldi_extraction.py     # Raw MALDI extraction: feature detection, ion images, spatial features
 │   ├── maldi_features.py       # MALDI-side rescoring features
 │   ├── feature_generator.py    # Orchestration + PSMList construction
-│   └── pipeline.py             # End-to-end pipeline function
+│   ├── pipeline.py             # End-to-end pipeline function
+│   └── tests/                  # Unit tests (pytest; testpaths configured in pyproject.toml)
+│       ├── fixtures/           # Static test fixtures (e.g. test_maldi.mgf)
+│       ├── test_deisotoping.py
+│       ├── test_evidence_score.py
+│       ├── test_isotope_distribution.py
+│       └── test_maldi_extraction.py
 └── ms1rescore-rs/              # Rust extension (PyO3 + rayon)
     ├── Cargo.toml
     └── src/
@@ -35,6 +41,12 @@ ms1rescore/
         ├── xic.rs              # Parallel XIC extraction
         ├── spectral.rs         # Spectral angle computation
         └── isotope.rs          # MS1 isotope envelope extraction
+```
+
+Run the test suite from the `ms1rescore/` directory:
+
+```bash
+cd ms1rescore && pytest   # testpaths = ["ms1rescore/tests"] in pyproject.toml
 ```
 
 ---
@@ -114,13 +126,17 @@ Install: `pip install ms1rescore[maldi]` (installs `pyimzml`).
 
 4. **Recalibration** (optional, `calibrant_mzs` non-empty): for each calibrant m/z, find the nearest detected apex within `calibrant_tol_ppm`; fit a linear ppm offset vs m/z model; apply correction to all interval apices and boundaries.
 
-5. **Deisotoping** (optional, `deisotope=True`): remove M+1 and M+2 isotope peaks at z=1 spacing (1.003355 Da ± `deisotope_tol_da`). Two intensity guards prevent false positives:
+5. **Deisotoping** (optional, `deisotope=True`): uses the `ms_deisotope` package (`deconvolute_peaks()`) to remove isotope satellite peaks. A pre-merge step (`_merge_duplicate_intervals`) collapses near-identical apices within `tol_da=0.001` Da (taking max intensity) before deconvolution.
 
-   - **k-specific expected ratio**: for k=1, threshold = `(1/lambda) × min_fold`; for k=2, threshold = `(2/lambda²) × min_fold`. The M0/M+2 ratio (2/lambda²) is always much larger than M0/M+1 (1/lambda), so the k=2 guard is substantially stricter. Using the k=1 formula for k=2 causes false-positive removal of GT features that coincidentally fall ~2 Da above a more intense unrelated peak.
+   `ms_deisotope` fits averagine-based isotope envelopes using MSDeconV scoring. Peaks that appear as k>0 positions in a fitted envelope (score ≥ `deisotope_min_score`) are removed as satellites. Peaks not assigned to any envelope are kept.
 
-   - **Absolute floor at 1.0**: `threshold = max(k-specific-threshold, 1.0)`. If M+k > M0 in the mean spectrum (obs_ratio < 1), the pair is physically inconsistent with a true isotope pattern — two unrelated peptides of similar intensity, or a mean-spectrum averaging artifact — so removal is skipped. This prevents false-positive deisotoping at high masses (>~1400 Da) where the averagine M0/M+1 ratio drops below ~1.43 and the averagine-relative threshold would drop below 1.0.
+   Key behavioral properties:
+   - Envelopes where M+k is far more intense than M0 score below threshold and are not removed (ms_deisotope returns empty `peak_set` for physically inconsistent intensity ratios).
+   - Error tolerance is in ppm (`deisotope_error_ppm`), not Da. At 1000 Da, 15 ppm ≈ 0.015 Da (stricter than the old 0.15 Da default).
+   - Charge range is configurable via `deisotope_charge_range` (default `(1, 1)` for MALDI [M+H]+).
+   - Averagine model is configurable: `"peptide"` (default), `"glycopeptide"`, `"glycan"`, `"heparin"`.
 
-   Default `deisotope_min_fold=0.67`. **Note**: in single-cell MALDI-MSI data, M+1 peaks often survive deisotoping because heterogeneous cell expression patterns cause the mean spectrum M0/M+1 ratio to be lower than the averagine prediction. This is a fundamental limitation of mean-spectrum deisotoping; per-pixel deisotoping would be needed to eliminate all isotope peaks reliably.
+   **Note**: in single-cell MALDI-MSI data, M+1 peaks often survive deisotoping because heterogeneous cell expression patterns cause the mean spectrum M0/M+1 ratio to be lower than the averagine prediction. This is a fundamental limitation of mean-spectrum deisotoping; per-pixel deisotoping would be needed to eliminate all isotope peaks reliably.
 
 6. **Mass defect filter** (optional, `filter_mass_defect=True`): Senko-plot peptide corridor. For each [M+H]+ apex: `neutral = apex − 1.007276`, `nominal = floor(neutral)`, `defect = neutral − nominal` (always in [0,1)), `expected = 0.000509 × nominal` (averagine slope, positive). Keep if `|defect − expected| ≤ mass_defect_halfwidth`. Default halfwidth 0.5 passes all peaks; use 0.25 to filter lipids/matrix while retaining all tryptic peptides in 800–2000 Da. **Do not use `round()` for nominal mass** — for neutrals with fractional part >0.5 it flips the defect sign and breaks the corridor test.
 
@@ -149,10 +165,13 @@ SCiLSConfig(
     # Recalibration
     calibrant_mzs=[],             # theoretical m/z of internal standards
     calibrant_tol_ppm=200.0,
-    # Deisotoping
+    # Deisotoping (ms_deisotope-based)
     deisotope=False,
-    deisotope_tol_da=0.15,
-    deisotope_min_fold=0.67,         # fraction of averagine-expected M0/M+1 ratio; see step 5 above
+    deisotope_averagine="peptide",   # "peptide", "glycopeptide", "glycan", "heparin"
+    deisotope_scorer="MSDeconVFitter",  # or "PenalizedMSDeconVFitter"
+    deisotope_min_score=10.0,        # MSDeconV score threshold; lower = more aggressive
+    deisotope_charge_range=(1, 1),   # MALDI is [M+H]+; widen for multi-charge data
+    deisotope_error_ppm=15.0,        # m/z matching tolerance in ppm (15 ppm ≈ 0.015 Da at 1000 Da)
     # Senko mass defect filter
     filter_mass_defect=False,
     mass_defect_halfwidth=0.5,    # 0.5 = all pass; 0.15–0.20 = meaningful peptide filter
@@ -194,7 +213,10 @@ ms1rescore \
 - `--mass-defect-halfwidth 0.25`: covers all 22 GT tryptic peptides in 800–2000 Da while filtering lipids/matrix. Use 0.5 (default) to disable the filter.
 - `--picking-height 0.75` (default): matches the mMass "picking height 75%" setting. Computes apex m/z as the midpoint of the two interpolated crossings at 75% of the peak maximum, giving a more accurate centroid for asymmetric peaks. Use `--picking-height 0.0` to revert to the raw smoothed-spectrum apex.
 - `--smoothing-window 11 --smoothing-polyorder 1`: best config from parameter sweep on this dataset (v11: 17/22 GT features matched).
-- `--deisotope-min-fold 0.67` (default): scales the k-specific averagine-expected ratio. The effective threshold is `max((1/lambda for k=1, or 2/lambda² for k=2) × fold, 1.0)`. With fold=0.67 at 975 Da and k=1: threshold = 1.35×; at k=2: threshold = 5.40×. The absolute floor at 1.0 prevents false-positive removal at high masses (>1400 Da) where the averagine M0/M+1 ratio approaches 1:1.
+- `--deisotope-min-score 10.0` (default): MSDeconV score threshold for accepting an isotope envelope. Lower values remove more peaks; raise to 20+ to be conservative. At 10.0, a clear 3-peak M0/M+1/M+2 pattern matching averagine scores ~20.
+- `--deisotope-error-ppm 15.0` (default): m/z tolerance for envelope fitting. At 1000 Da, 15 ppm ≈ 0.015 Da. The old `--deisotope-tol-da 0.15` was 150 ppm at 1000 Da (10× looser).
+- `--deisotope-averagine peptide` (default): averagine model. Use `glycopeptide`, `glycan`, or `heparin` for non-peptide analytes.
+- `--deisotope-scorer MSDeconVFitter` (default): scoring function. `PenalizedMSDeconVFitter` applies an additional penalty for charge-state ambiguity.
 
 #### `extract_scils_features(imzml_path, config, output_dir, visualize)`
 
@@ -231,7 +253,7 @@ Shared mathematical utilities. No external state.
 
 | Function | Description |
 |---|---|
-| `theoretical_isotope_distribution(n_C, n_H, n_N, n_O, n_S)` | Poisson approximation for M0/M+1/M+2 |
+| `theoretical_isotope_distribution(n_C, n_H, n_N, n_O, n_S, n_peaks=4)` | brainpy Mercury algorithm; `@lru_cache` keyed on composition tuple |
 | `composition_from_sequence(peptide)` | Element counts from amino acid sequence |
 | `averagine_composition(mass)` | Averagine model composition |
 | `cosine_similarity(a, b)` | Safe cosine with zero-vector guard |
@@ -241,6 +263,8 @@ Shared mathematical utilities. No external state.
 | `ppm_error(observed, theoretical)` | Signed ppm |
 
 Constants: `NEUTRON = 1.003355`, `PROTON = 1.007276`
+
+**`theoretical_isotope_distribution` — normalization scheme:** brainpy is called with `npeaks = max(n_peaks, 6)` to ensure the normalization denominator captures essentially all isotope signal. The returned intensities are normalized over all returned peaks (full-spectrum norm), then truncated to `n_peaks`. As a result, the sum of the returned array is < 1 for `n_peaks < 6` (remaining signal is in M+3+). This is more physically correct than the prior Poisson approach, which renormalized only over the first 3 peaks. The `lru_cache` makes repeated calls with the same composition free — the vectorized path in `maldi_features.py` builds a dict of unique compositions first to minimize brainpy calls to O(unique compositions).
 
 ### `candidates.py`
 
@@ -336,15 +360,17 @@ All four ion-image feature functions are performance-critical. Their design:
 
 #### `compute_theoretical_isotope_features()`
 
-Fully vectorized — no pyteomics calls in the hot path:
+Uses `theoretical_isotope_distribution()` from `utils.py` (brainpy-backed, `lru_cache`). The hot path deduplicates compositions before calling brainpy:
+
 ```python
-lam = df["n_C"] * 0.01109 + df["n_H"] * 0.000115 + df["n_N"] * 0.003663 + \
-      df["n_O"] * 0.000380 + df["n_S"] * 0.0425
-m0 = np.exp(-lam)
-m1 = lam * m0
-m2 = lam**2 / 2 * m0
+comp_cols = ["n_C", "n_H", "n_N", "n_O", "n_S"]
+unique_comps = {tuple(row) for row in df[comp_cols].astype(int).values}
+iso_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_comps}
+dist = np.array([iso_cache[tuple(row)] for row in df[comp_cols].astype(int).values])
+theo_m0, theo_m1, theo_m2 = dist[:, 0], dist[:, 1], dist[:, 2]
 ```
-Uses the pre-computed `n_C, n_H, n_N, n_O, n_S, mass` columns from `digest_fasta()`.
+
+The averagine comparison path (for `averagine_deviation` features) uses the same function with `n_S=0` (consistent with the prior behaviour of omitting sulfur from the averagine model). Uses `n_C, n_H, n_N, n_O, n_S, mass` columns from `digest_fasta()`.
 
 ### `feature_generator.py`
 
@@ -529,8 +555,9 @@ The Rust `target/` directory can be 1-2 GB. Delete it with `rm -rf ms1rescore/ms
 
 - Python: `/home/robbe/.pyenv/versions/MSIscore`
 - Notebook kernel: MSIscore
-- Key packages: `ms2pip>=4.0.0a1`, `deeplc>=4.0.0a1`, `mokapot>=0.10`, `pyteomics>=4.7`, `psm_utils>=1.1`, `catboost>=1.2` (optional, for `model="catboost"`)
+- Key packages: `ms2pip>=4.0.0a1`, `deeplc>=4.0.0a1`, `mokapot>=0.10`, `pyteomics>=4.7`, `psm_utils>=1.1`, `brain-isotopic-distribution>=1.5` (PyPI name for `brainpy`), `catboost>=1.2` (optional, for `model="catboost"`)
 - ms2pip import: `from ms2pip.core import predict_batch` (not `from ms2pip import predict_batch`)
+- `brain-isotopic-distribution` is a transitive dependency of `ms-deisotope` but is listed explicitly in `pyproject.toml` as a core dependency because `theoretical_isotope_distribution()` in `utils.py` imports `from brainpy import isotopic_variants` directly.
 
 Install the package in editable mode:
 ```bash

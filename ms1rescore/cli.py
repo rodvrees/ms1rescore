@@ -392,30 +392,45 @@ def build_parser() -> argparse.ArgumentParser:
         "--deisotope",
         action="store_true",
         help=(
-            "Remove M+1 and M+2 isotope peaks (z=1 spacing, 1.003355 Da) after "
-            "interval detection, retaining only monoisotopic peaks (profile mode only)."
+            "Remove isotope satellite peaks using ms_deisotope after interval "
+            "detection, retaining only monoisotopic peaks (profile mode only)."
         ),
     )
     raw_grp.add_argument(
-        "--deisotope-tol-da",
+        "--deisotope-error-ppm",
         type=float,
-        default=0.15,
+        default=15.0,
         metavar="FLOAT",
-        help="Tolerance (Da) around the 1.003355 Da isotope spacing. Default: 0.15.",
+        help="PPM error tolerance for isotope envelope fitting. Default: 15.0.",
     )
     raw_grp.add_argument(
-        "--deisotope-min-fold",
+        "--deisotope-min-score",
         type=float,
-        default=0.67,
+        default=10.0,
         metavar="FLOAT",
-        help=(
-            "Averagine-relative intensity guard for deisotoping. A peak is removed as "
-            "M+1 only if M0 >= M+1 × (1/lambda) × FLOAT, where lambda = 0.000509 × M0 "
-            "(averagine Poisson parameter) and 1/lambda is the expected M0/M+1 ratio. "
-            "Default 0.67: M0 must be at least 67%% of the averagine-expected ratio "
-            "(e.g. >= 1.35× M+1 for a 975 Da compound). This prevents false-positive "
-            "deisotoping of two unrelated peptides ~1 Da apart."
-        ),
+        help="Minimum MSDeconV fit score to accept an isotope envelope. Default: 10.0.",
+    )
+    raw_grp.add_argument(
+        "--deisotope-averagine",
+        default="peptide",
+        choices=["peptide", "glycopeptide", "glycan", "heparin"],
+        metavar="MODEL",
+        help="Averagine model for isotope envelope prediction. Default: peptide.",
+    )
+    raw_grp.add_argument(
+        "--deisotope-scorer",
+        default="MSDeconVFitter",
+        choices=["MSDeconVFitter", "PenalizedMSDeconVFitter"],
+        metavar="SCORER",
+        help="ms_deisotope scoring function. Default: MSDeconVFitter.",
+    )
+    raw_grp.add_argument(
+        "--deisotope-charge-range",
+        type=int,
+        nargs=2,
+        default=[1, 1],
+        metavar=("MIN", "MAX"),
+        help="Charge range for deconvolution. Default: 1 1 (MALDI [M+H]+).",
     )
     raw_grp.add_argument(
         "--filter-mass-defect",
@@ -710,8 +725,11 @@ def main() -> None:
             calibrant_mzs=args.calibrant_mzs,
             calibrant_tol_ppm=args.calibrant_tol_ppm,
             deisotope=args.deisotope,
-            deisotope_tol_da=args.deisotope_tol_da,
-            deisotope_min_fold=args.deisotope_min_fold,
+            deisotope_averagine=args.deisotope_averagine,
+            deisotope_scorer=args.deisotope_scorer,
+            deisotope_min_score=args.deisotope_min_score,
+            deisotope_charge_range=tuple(args.deisotope_charge_range),
+            deisotope_error_ppm=args.deisotope_error_ppm,
             filter_mass_defect=args.filter_mass_defect,
             mass_defect_halfwidth=args.mass_defect_halfwidth,
             picking_height=args.picking_height,
@@ -748,8 +766,11 @@ def main() -> None:
             calibrant_mzs=args.calibrant_mzs or [],
             calibrant_tol_ppm=args.calibrant_tol_ppm,
             deisotope=args.deisotope,
-            deisotope_tol_da=args.deisotope_tol_da,
-            deisotope_min_fold=args.deisotope_min_fold,
+            deisotope_averagine=args.deisotope_averagine,
+            deisotope_scorer=args.deisotope_scorer,
+            deisotope_min_score=args.deisotope_min_score,
+            deisotope_charge_range=tuple(args.deisotope_charge_range),
+            deisotope_error_ppm=args.deisotope_error_ppm,
             filter_mass_defect=args.filter_mass_defect,
             mass_defect_halfwidth=args.mass_defect_halfwidth,
             picking_height=args.picking_height,

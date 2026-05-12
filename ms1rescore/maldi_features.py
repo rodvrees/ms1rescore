@@ -10,7 +10,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from ms1rescore.utils import NEUTRON
+from ms1rescore.utils import NEUTRON, theoretical_isotope_distribution
 
 logger = logging.getLogger(__name__)
 
@@ -448,47 +448,34 @@ def compute_theoretical_isotope_features(
     """
     n = len(df)
 
-    # --- Vectorized: sequence-specific theoretical isotope distribution ---
-    nc = df["n_C"].values.astype(float)
-    nh = df["n_H"].values.astype(float)
-    nn = df["n_N"].values.astype(float)
-    no = df["n_O"].values.astype(float)
-    ns = df["n_S"].values.astype(float)
+    # --- sequence-specific theoretical isotope distribution (brainpy, cached) ---
+    comp_cols = ["n_C", "n_H", "n_N", "n_O", "n_S"]
+    comp_arr = df[comp_cols].astype(int).values
+    unique_comps = {tuple(row) for row in comp_arr}
+    iso_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_comps}
+    dist = np.array([iso_cache[tuple(row)] for row in comp_arr])  # (n, 3)
+    theo_m0, theo_m1, theo_m2 = dist[:, 0], dist[:, 1], dist[:, 2]
 
-    lam = nc * 0.01109 + nh * 0.000115 + nn * 0.00364 + no * 0.00205 + ns * 0.04493
-    # Poisson: P(k) = exp(-lam) * lam^k / k!
-    theo_m0 = np.exp(-lam)
-    theo_m1 = theo_m0 * lam
-    theo_m2 = theo_m0 * lam**2 / 2.0
+    df["theo_has_sulfur"] = (comp_arr[:, 4] > 0).astype(float)
 
-    # A8 — monoisotopic confidence: M0/(M0+M1) before normalisation.
-    # Values near 0.5 or below indicate the monoisotopic peak may not be the
-    # most abundant isotopologue, making the assignment less reliable.
-    mono_conf = theo_m0 / np.where(theo_m0 + theo_m1 > 0, theo_m0 + theo_m1, 1.0)
+    # A8 — monoisotopic confidence: M0/(M0+M1). Invariant to normalization scheme.
+    denom_conf = theo_m0 + theo_m1
+    mono_conf = np.where(denom_conf > 0, theo_m0 / denom_conf, 1.0)
 
-    theo_total = theo_m0 + theo_m1 + theo_m2
-    theo_total = np.where(theo_total > 0, theo_total, 1.0)
-    theo_m0 /= theo_total
-    theo_m1 /= theo_total
-    theo_m2 /= theo_total
-
-    df["theo_has_sulfur"] = (ns > 0).astype(float)
-
-    # --- Vectorized: averagine theoretical ---
+    # --- averagine theoretical (brainpy, cached; S=0 consistent with prior behaviour) ---
     pep_mass = df["mass"].values.astype(float)
-    nc_avg = np.round(pep_mass * 0.0444).astype(float)
-    nh_avg = np.round(pep_mass * 0.0698).astype(float)
-    nn_avg = np.round(pep_mass * 0.0123).astype(float)
-    no_avg = np.round(pep_mass * 0.0133).astype(float)
-    lam_avg = nc_avg * 0.01109 + nh_avg * 0.000115 + nn_avg * 0.00364 + no_avg * 0.00205
-    avg_m0 = np.exp(-lam_avg)
-    avg_m1 = avg_m0 * lam_avg
-    avg_m2 = avg_m0 * lam_avg**2 / 2.0
-    avg_total = avg_m0 + avg_m1 + avg_m2
-    avg_total = np.where(avg_total > 0, avg_total, 1.0)
-    avg_m0 /= avg_total
-    avg_m1 /= avg_total
-    avg_m2 /= avg_total
+    nc_avg = np.round(pep_mass * 0.0444).astype(int)
+    nh_avg = np.round(pep_mass * 0.0698).astype(int)
+    nn_avg = np.round(pep_mass * 0.0123).astype(int)
+    no_avg = np.round(pep_mass * 0.0133).astype(int)
+    avg_comps = list(zip(
+        nc_avg.tolist(), nh_avg.tolist(), nn_avg.tolist(), no_avg.tolist(),
+        [0] * n,
+    ))
+    unique_avg = set(avg_comps)
+    avg_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_avg}
+    avg_dist = np.array([avg_cache[k] for k in avg_comps])  # (n, 3)
+    avg_m0, avg_m1, avg_m2 = avg_dist[:, 0], avg_dist[:, 1], avg_dist[:, 2]
 
     # Averagine deviation (vectorized)
     dot_ta = theo_m0 * avg_m0 + theo_m1 * avg_m1 + theo_m2 * avg_m2

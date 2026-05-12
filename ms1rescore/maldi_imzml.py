@@ -47,10 +47,13 @@ class SCiLSConfig:
     # Internal standard recalibration (applied to detected apices)
     calibrant_mzs: list = field(default_factory=list)  # theoretical m/z of calibrants
     calibrant_tol_ppm: float = 200.0     # search window to find each calibrant
-    # Deisotoping (remove M+1/M+2 peaks at z=1 spacing)
+    # Deisotoping via ms_deisotope (remove isotope satellite peaks)
     deisotope: bool = False
-    deisotope_tol_da: float = 0.15       # tolerance around 1.003355 Da
-    deisotope_min_fold: float = 0.67     # fraction of averagine-expected M0/M+1 ratio; lower = more permissive
+    deisotope_averagine: str = "peptide"          # averagine model: peptide, glycopeptide, glycan, heparin
+    deisotope_scorer: str = "MSDeconVFitter"      # MSDeconVFitter or PenalizedMSDeconVFitter
+    deisotope_min_score: float = 10.0             # minimum MSDeconV fit score to accept an envelope
+    deisotope_charge_range: tuple = field(default_factory=lambda: (1, 1))  # MALDI is predominantly [M+H]+
+    deisotope_error_ppm: float = 15.0             # ppm error tolerance for isotope envelope fitting
     # Senko mass defect filter (peptide corridor)
     filter_mass_defect: bool = False
     mass_defect_halfwidth: float = 0.5   # half-width of corridor; 0.5 = all pass
@@ -258,82 +261,205 @@ def _recalibrate_intervals(
     return recal
 
 
-def _deisotope_intervals(
+def _merge_duplicate_intervals(
     intervals: list[tuple[float, float, float]],
-    tol_da: float,
-    apex_intensities: np.ndarray | None = None,
-    min_fold: float = 0.7,
-) -> list[tuple[float, float, float]]:
-    """Remove M+1 and M+2 isotope peaks (z=1, spacing 1.003355 Da).
+    apex_intensities: np.ndarray,
+    tol_da: float = 0.001,
+) -> tuple[list[tuple[float, float, float]], np.ndarray]:
+    """Merge near-identical interval apices within tol_da into a single interval.
 
-    Sorts by apex ascending. A peak i is flagged as an isotope of peak j when:
-      - |apex_i − apex_j − k × 1.003355| < tol_da  (k = 1 or 2), AND
-      - intensity_j >= intensity_i × (1/lambda) × min_fold
-
-    where lambda = 0.000509 × mz_j (averagine Poisson parameter).
-
-    Two physically motivated guards prevent false-positive deisotoping:
-
-    1. **k-specific expected ratio**: for k=1 the expected M0/M+1 ratio is
-       1/lambda; for k=2 the expected M0/M+2 ratio is 2/lambda². The M+2
-       threshold is always much higher than the M+1 threshold, preventing
-       false removal of an unrelated peptide that coincidentally falls ~2 Da
-       above a more intense peak.
-
-    2. **Absolute minimum of 1.0**: the threshold is floored at 1.0, meaning
-       M0 must always be at least as intense as M+k. When M+k > M0 in the
-       mean spectrum (obs_ratio < 1) the pair is physically inconsistent with
-       a true isotope pattern — likely two unrelated peptides of similar
-       intensity — so removal is skipped. This also prevents false-positive
-       deisotoping at high masses (>~1400 Da) where the averagine-expected
-       M0/M+1 ratio drops below 1.43 and the guard becomes overly permissive.
-
-    ``min_fold`` (default 0.7) scales the averagine-expected ratio. When
-    apex_intensities is None the intensity guard is skipped entirely.
+    Intervals are sorted ascending by apex. Consecutive intervals whose weighted-mean
+    apex separation is <= tol_da are merged: boundaries are expanded, apex is the
+    intensity-weighted mean, intensity is the cluster maximum.
     """
-    NEUTRON = 1.003355
-    AVERAGINE_SLOPE = 0.000509  # lambda = slope × M0_mz
     if not intervals:
-        return intervals
+        return intervals, apex_intensities
 
     order = np.argsort([iv[2] for iv in intervals])
     sorted_ivs = [intervals[k] for k in order]
-    apices = np.array([iv[2] for iv in sorted_ivs])
+    sorted_ints = np.asarray(apex_intensities, dtype=np.float64)[order]
 
-    if apex_intensities is not None:
-        sorted_ints = np.asarray(apex_intensities, dtype=np.float64)[order]
-    else:
-        sorted_ints = None
+    merged_ivs: list[tuple[float, float, float]] = []
+    merged_ints: list[float] = []
 
-    is_isotope = np.zeros(len(apices), dtype=bool)
-    for i in range(1, len(apices)):
-        for k in (1, 2):
-            target = apices[i] - k * NEUTRON
-            diffs = np.abs(apices[:i] - target)
-            best_j = int(np.argmin(diffs))
-            if diffs[best_j] <= tol_da:
-                if sorted_ints is None:
-                    is_isotope[i] = True
-                    break
-                lam = AVERAGINE_SLOPE * apices[best_j]
-                if lam <= 0:
-                    expected_ratio = 2.0 if k == 1 else 8.0
-                elif k == 1:
-                    # M0/M+1 from averagine Poisson: E[M0]/E[M+1] = 1/lambda
-                    expected_ratio = 1.0 / lam
-                else:
-                    # M0/M+2 from averagine Poisson: E[M0]/E[M+2] = 2/lambda^2
-                    # Much higher than 1/lambda — prevents false-positive k=2 flagging
-                    expected_ratio = 2.0 / (lam ** 2)
-                # Floor at 1.0: M0 must always be at least as intense as M+k.
-                # If M+k > M0 in the mean spectrum (obs_ratio < 1) the pair is
-                # inconsistent with a true isotope pattern — skip removal.
-                threshold = max(expected_ratio * min_fold, 1.0)
-                if sorted_ints[best_j] >= sorted_ints[i] * threshold:
-                    is_isotope[i] = True
-                    break
+    cur_lo, cur_hi, cur_apex = sorted_ivs[0]
+    cur_int = float(sorted_ints[0])
+    sum_int = cur_int
+    weighted_apex = cur_apex * cur_int
+    max_int = cur_int
 
-    return [iv for iv, flag in zip(sorted_ivs, is_isotope) if not flag]
+    for i in range(1, len(sorted_ivs)):
+        mz_lo, mz_hi, mz_apex = sorted_ivs[i]
+        i_int = float(sorted_ints[i])
+        cluster_apex = weighted_apex / sum_int if sum_int > 0 else cur_apex
+        if (mz_apex - cluster_apex) <= tol_da:
+            cur_lo = min(cur_lo, mz_lo)
+            cur_hi = max(cur_hi, mz_hi)
+            sum_int += i_int
+            weighted_apex += mz_apex * i_int
+            if i_int > max_int:
+                max_int = i_int
+        else:
+            merged_ivs.append((cur_lo, cur_hi, weighted_apex / sum_int if sum_int > 0 else cur_apex))
+            merged_ints.append(max_int)
+            cur_lo, cur_hi, cur_apex = mz_lo, mz_hi, mz_apex
+            cur_int = i_int
+            sum_int = i_int
+            weighted_apex = mz_apex * i_int
+            max_int = i_int
+
+    merged_ivs.append((cur_lo, cur_hi, weighted_apex / sum_int if sum_int > 0 else cur_apex))
+    merged_ints.append(max_int)
+    return merged_ivs, np.array(merged_ints, dtype=np.float64)
+
+
+def _deisotope_intervals(
+    intervals: list[tuple[float, float, float]],
+    apex_intensities: np.ndarray,
+    averagine: str = "peptide",
+    scorer: str = "MSDeconVFitter",
+    min_score: float = 10.0,
+    charge_range: tuple = (1, 1),
+    error_ppm: float = 15.0,
+    return_diagnostics: bool = False,
+) -> list[tuple[float, float, float]] | tuple[list[tuple[float, float, float]], list[dict]]:
+    """Remove isotope satellite peaks using ms_deisotope.
+
+    Feeds the interval apex positions and intensities as a peak list into
+    ms_deisotope's AveraginePeakDependenceGraphDeconvoluter. Peaks identified
+    as M+1, M+2, … of a higher-scoring monoisotopic peak are removed.
+    Peaks that cannot be fitted into any isotope envelope are kept (conservative:
+    no false-positive removal of isolated signals).
+
+    Behavioral differences vs the previous custom implementation:
+    - Error tolerance is ppm-based (error_ppm) rather than Da-based. At 1000 Da,
+      15 ppm ≈ 0.015 Da (stricter than the old 0.15 Da default).
+    - Filtering is based on MSDeconV fit score, not hand-coded k-specific averagine
+      ratio guards. A fitted envelope where M+k > M0 scores poorly and will not
+      exceed min_score, giving the same effect as the old "absolute floor at 1.0".
+    - Spatial ion-image similarity is no longer used.
+    - charge_range defaults to (1, 1): MALDI data is predominantly [M+H]+.
+    """
+    from ms_deisotope import deconvolute_peaks
+    import ms_deisotope.averagine as avg_module
+    from ms_deisotope.scoring import MSDeconVFitter, PenalizedMSDeconVFitter
+
+    if not intervals:
+        if return_diagnostics:
+            return [], []
+        return []
+
+    _scorer_map = {
+        "MSDeconVFitter": MSDeconVFitter(min_score),
+        "PenalizedMSDeconVFitter": PenalizedMSDeconVFitter(min_score),
+    }
+    if scorer not in _scorer_map:
+        raise ValueError(f"Unknown deisotope scorer {scorer!r}. Choose from: {list(_scorer_map)}")
+
+    averagine_model = getattr(avg_module, averagine, None)
+    if averagine_model is None:
+        raise ValueError(f"Unknown averagine model {averagine!r}. Choose from: peptide, glycopeptide, glycan, heparin")
+
+    # Scale intensities to [0, 1000] range before passing to ms_deisotope.
+    # ms_deisotope has an internal minimum absolute intensity threshold (~9 counts);
+    # mean spectra from RMS-normalized MALDI data are in the 0.5–2.0 range and
+    # would all fall below that floor, causing deconvolute_peaks to return nothing.
+    # Scaling preserves all intensity ratios (MSDeconV scoring is ratio-based).
+    max_int = float(np.max(apex_intensities)) if len(apex_intensities) else 1.0
+    scale = 1000.0 / max_int if max_int > 0 else 1.0
+    peaks = [(iv[2], float(apex_intensities[i]) * scale) for i, iv in enumerate(intervals)]
+
+    result = deconvolute_peaks(
+        peaks,
+        charge_range=charge_range,
+        error_tolerance=error_ppm * 1e-6,
+        averagine=averagine_model,
+        scorer=_scorer_map[scorer],
+        use_quick_charge=True,
+    )
+
+    # Build a set of observed input m/z values for phantom-M+1 guard below.
+    observed_input_mzs = {iv[2] for iv in intervals}
+
+    # Collect m/z values of isotope satellites (envelope positions > 0).
+    # Peaks not assigned to any envelope are kept (isolated monoisotopics).
+    # Two guards prevent false-positive satellite removal:
+    #
+    # 1. M+1 > M0: skip envelopes where the M+1 position is more intense than M0.
+    #    MSDeconV scoring is scale-dependent and can accept physically inconsistent
+    #    envelopes after intensity rescaling; we enforce the ratio check explicitly.
+    #
+    # 2. Phantom M+1: skip removal of M+2 (k≥2) when the M+1 position is a phantom
+    #    peak not present in the input list. Without an observed M+1, a M0/M+2
+    #    connection likely represents two unrelated peptides ~2 Da apart.
+    satellite_mzs: set[float] = set()
+    parent_score: dict[float, float] = {}   # satellite_mz → MSDeconV score of its parent
+    parent_charge: dict[float, int] = {}
+    for dp in result.peak_set:
+        env = dp.envelope
+        if len(env) >= 2 and env[1].intensity > env[0].intensity:
+            continue  # guard 1: M+1 > M0
+        # Check if M+1 is an observed peak (not a phantom inserted by ms_deisotope).
+        m1_observed = len(env) < 2 or any(
+            abs(env[1].mz - obs) < error_ppm * 1e-6 * env[1].mz + 0.001
+            for obs in observed_input_mzs
+        )
+        for k, ep in enumerate(env):
+            if k == 0:
+                continue
+            if k >= 2 and not m1_observed:
+                continue  # guard 2: skip M+2 if M+1 is phantom
+            satellite_mzs.add(ep.mz)
+            parent_score[ep.mz] = dp.score
+            parent_charge[ep.mz] = dp.charge
+
+    # Match satellites back to intervals with 1 mDa tolerance.
+    # ms_deisotope returns the same float objects from the input peak list,
+    # so exact equality usually holds; the 1 mDa guard covers edge cases.
+    def _is_satellite(apex: float) -> bool:
+        return any(abs(apex - s) < 0.001 for s in satellite_mzs)
+
+    kept = [iv for iv in intervals if not _is_satellite(iv[2])]
+
+    # Secondary pass: catch M+1 peaks that survived ms_deisotope but whose M0
+    # is present and more intense. In heterogeneous single-cell MALDI-MSI, the
+    # mean-spectrum M0/M+1 ratio is compressed toward 1:1 relative to the
+    # averagine prediction (cell-to-cell variation inflates the mean M+1), so
+    # ms_deisotope often declines to form an envelope even for genuine satellites.
+    # A simple intensity floor (M0 > M+1) is sufficient for the mean spectrum:
+    # if the M+1 is genuinely a different peptide, it will typically be at least
+    # as intense as M0, so the floor leaves it untouched.
+    NEUTRON_MASS = 1.003355
+    apex_int_by_mz = {iv[2]: float(apex_intensities[i]) for i, iv in enumerate(intervals)}
+    kept_mz_set = {iv[2] for iv in kept}
+    ratio_satellite_mzs: set[float] = set()
+    for iv in kept:
+        mz = iv[2]
+        mz_int = apex_int_by_mz.get(mz, 0.0)
+        tol = error_ppm * 1e-6 * mz + 0.001
+        m0_target = mz - NEUTRON_MASS
+        for m0_mz in kept_mz_set:
+            if abs(m0_mz - m0_target) <= tol and apex_int_by_mz.get(m0_mz, 0.0) > mz_int:
+                ratio_satellite_mzs.add(mz)
+                break
+    kept = [iv for iv in kept if iv[2] not in ratio_satellite_mzs]
+
+    if not return_diagnostics:
+        return kept
+
+    # Build per-interval diagnostic records
+    diagnostics: list[dict] = []
+    for iv in intervals:
+        apex = iv[2]
+        sat = next((s for s in satellite_mzs if abs(apex - s) < 0.001), None)
+        if sat is not None:
+            removed, score, charge = True, parent_score.get(sat), parent_charge.get(sat)
+        elif apex in ratio_satellite_mzs:
+            removed, score, charge = True, None, None  # removed by secondary ratio pass
+        else:
+            removed, score, charge = False, None, None
+        diagnostics.append({"apex_mz": apex, "removed": removed, "score": score, "charge": charge})
+    return kept, diagnostics
 
 
 def _filter_mass_defect(
@@ -746,7 +872,15 @@ def extract_scils_features(
                 [float(mean_ints[np.argmin(np.abs(mz_grid - iv[2]))]) for iv in intervals],
                 dtype=np.float64,
             )
-            intervals = _deisotope_intervals(intervals, config.deisotope_tol_da, apex_ints, config.deisotope_min_fold)
+            intervals, apex_ints = _merge_duplicate_intervals(intervals, apex_ints)
+            intervals = _deisotope_intervals(
+                intervals, apex_ints,
+                averagine=config.deisotope_averagine,
+                scorer=config.deisotope_scorer,
+                min_score=config.deisotope_min_score,
+                charge_range=config.deisotope_charge_range,
+                error_ppm=config.deisotope_error_ppm,
+            )
             logger.info(f"  {len(intervals)}/{n_before} intervals after deisotoping")
 
         if config.filter_mass_defect:

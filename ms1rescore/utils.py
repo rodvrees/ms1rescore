@@ -1,13 +1,19 @@
 """Shared utilities: isotope distributions, spectral angle, mass calculations."""
 
-from math import exp, factorial
+from functools import lru_cache
 
 import numpy as np
+from brainpy import isotopic_variants
 
 NEUTRON = 1.003355
 PROTON = 1.007276
 
+# Request at least this many peaks from brainpy so the normalization denominator
+# captures essentially all isotope signal before truncating to n_peaks.
+_NORM_NPEAKS = 6
 
+
+@lru_cache(maxsize=None)
 def theoretical_isotope_distribution(
     n_C: int,
     n_H: int,
@@ -17,20 +23,25 @@ def theoretical_isotope_distribution(
     n_peaks: int = 4,
 ) -> np.ndarray:
     """
-    Compute theoretical isotope distribution using the Poisson approximation.
+    Compute theoretical isotope distribution using brainpy (Mercury algorithm).
 
-    Returns normalized distribution [M0, M1, M2, ...].
+    Returns distribution [M0, M1, M2, ...] normalized over all peaks returned
+    by brainpy (full-spectrum norm), then truncated to n_peaks.
+
+    Results are cached by composition tuple — O(unique compositions) calls
+    rather than O(n_candidates) when used in a vectorized loop.
     """
-    lam = (
-        n_C * 0.01109
-        + n_H * 0.000115
-        + n_N * 0.00364
-        + n_O * 0.00205
-        + n_S * 0.04493
-    )
-    dist = np.array([exp(-lam) * lam**k / factorial(k) for k in range(n_peaks)])
-    total = dist.sum()
-    return dist / total if total > 0 else dist
+    composition = {"C": n_C, "H": n_H, "N": n_N, "O": n_O, "S": n_S}
+    # charge only shifts the .mz axis; .intensity is charge-independent, so charge=0 is fine
+    peaks = isotopic_variants(composition, npeaks=max(n_peaks, _NORM_NPEAKS), charge=0)
+    intensities = np.array([p.intensity for p in peaks], dtype=float)
+    total = intensities.sum()
+    if total < 1e-12:
+        return np.zeros(n_peaks, dtype=float)
+    intensities /= total
+    if len(intensities) < n_peaks:
+        intensities = np.pad(intensities, (0, n_peaks - len(intensities)))
+    return intensities[:n_peaks]
 
 
 def composition_from_sequence(peptide: str) -> dict[str, int]:
