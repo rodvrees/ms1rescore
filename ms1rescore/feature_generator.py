@@ -51,9 +51,6 @@ MALDI_INTRINSIC_FEATURES = [
     "ppm_error_calibrated_z",        # A3  — optional, requires pixel_coords
     # --- ambiguity ---
     "n_candidates", "log_n_candidates",
-    # --- protein consistency ---
-    "protein_n_features", "log_protein_n_features", "protein_coverage",
-    "protein_rank", "protein_best_ratio",
     # --- peptide properties (basic) ---
     "peptide_length", "n_missed_cleavages", "has_modifications",
     # --- peptide properties (extended, C-group) ---
@@ -89,9 +86,6 @@ MALDI_INTRINSIC_FEATURES = [
     "log_mean_intensity", "spatial_entropy",
     # --- full spatial autocorrelation (E5/E6) — optional, requires ion_images ---
     "spatial_morans_i", "spatial_gearys_c",
-    # --- protein co-localization — optional, requires ion_images ---
-    "protein_colocalization", "protein_colocalization_max",
-    "protein_colocalization_median", "protein_colocalization_n_partners",
     # --- isotopologue co-localization (E1) — optional, requires ion_images ---
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
     "isotope_image_colocalization_mean",
@@ -101,6 +95,19 @@ MALDI_INTRINSIC_FEATURES = [
     "isotope_envelope_cosine", "isotope_envelope_pearson",
     "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
     "isotope_n_matched",
+]
+
+# Protein-level features: aggregate signal across all candidates sharing a protein,
+# including decoys. This breaks the TDC null model (decoys inherit inflated counts
+# from target co-occurring proteins), so these features are excluded from the ranker
+# by default and only used when --use-protein-level-feats is explicitly requested.
+PROTEIN_LEVEL_FEATURES = [
+    # protein consistency (from compute_protein_consistency_features)
+    "protein_n_features", "log_protein_n_features", "protein_coverage",
+    "protein_rank", "protein_best_ratio",
+    # protein co-localization (from compute_colocalization_features; requires ion_images)
+    "protein_colocalization", "protein_colocalization_max",
+    "protein_colocalization_median", "protein_colocalization_n_partners",
 ]
 
 # LC-MS/MS prior features: NOT passed to the ranker/SVM — doing so would cause

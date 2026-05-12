@@ -576,6 +576,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FLOAT",
         help="CatBoost only: theo_isotope_cosine threshold for the initial positive seed.",
     )
+    rescore_grp.add_argument(
+        "--use-protein-level-feats",
+        action="store_true",
+        help=(
+            "Include protein-level features (protein_n_features, protein_coverage, "
+            "protein_rank, protein_best_ratio, protein_colocalization_*) in the "
+            "rescoring model. These features aggregate signal across all candidates "
+            "sharing a protein, which can break the TDC null model symmetry. "
+            "Disabled by default."
+        ),
+    )
 
     # --- Strategy C: LC-MS/MS-guided candidates ---
     strat_c = parser.add_argument_group(
@@ -887,6 +898,7 @@ def main() -> None:
         protein_fdr=args.protein_fdr,
         peptide_fdr=args.peptide_fdr,
         extra_fasta_path=args.extra_fasta,
+        use_protein_level_features=args.use_protein_level_feats,
         verbose=args.verbose,
         output_dir=args.output_dir,
     )

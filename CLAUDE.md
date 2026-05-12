@@ -383,23 +383,29 @@ Two named feature group lists are exported from this module — see "Feature gro
 
 ### Feature groups
 
-`feature_generator.py` exports two lists that are importable directly:
+`feature_generator.py` exports three lists that are importable directly:
 
 ```python
-from ms1rescore.feature_generator import MALDI_INTRINSIC_FEATURES, LCMS_PRIOR_FEATURES
+from ms1rescore.feature_generator import (
+    MALDI_INTRINSIC_FEATURES, PROTEIN_LEVEL_FEATURES, LCMS_PRIOR_FEATURES
+)
 ```
 
-**`MALDI_INTRINSIC_FEATURES`** — all features computable from MALDI data alone plus in-silico peptide properties:
+**`MALDI_INTRINSIC_FEATURES`** — features passed to the ranker by default; computable from MALDI data alone plus in-silico properties:
 - Mass accuracy: `ppm_error_abs`, `ppm_rank`, `ppm_best_ratio`
 - Ambiguity: `n_candidates`, `log_n_candidates`
-- Protein: `protein_n_features`, `log_protein_n_features`, `protein_coverage`, `protein_rank`, `protein_best_ratio`
 - Peptide: `peptide_length`, `n_missed_cleavages`, `has_modifications`
 - MALDI signal: `log_maldi_intensity`
 - Theoretical isotope: `theo_isotope_cosine`, `theo_isotope_chi2`, `theo_isotope_kl`, `theo_has_sulfur`, `averagine_deviation`, `averagine_deviation_sulfur`, `theo_m1_ratio_diff`, `theo_m2_ratio_diff`
 - Ionization priors: `n_arginine`, `n_basic_residues`, `n_phenylalanine`, `n_aromatic`, `gravy_score`, `charge_proxy`
 - Spatial (optional): `spatial_autocorrelation`, `fraction_detected`, `intensity_cv`, `log_mean_intensity`, `spatial_entropy`
-- Co-localization (optional): `protein_colocalization`, `protein_colocalization_max`, `protein_colocalization_median`, `protein_colocalization_n_partners`
 - Observed isotope envelope (optional): `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff`, `isotope_n_matched`
+
+**`PROTEIN_LEVEL_FEATURES`** — excluded from the ranker by default; opt-in via `--use-protein-level-feats`:
+- Protein consistency: `protein_n_features`, `log_protein_n_features`, `protein_coverage`, `protein_rank`, `protein_best_ratio`
+- Protein co-localization (optional, requires ion_images): `protein_colocalization`, `protein_colocalization_max`, `protein_colocalization_median`, `protein_colocalization_n_partners`
+
+**Why excluded by default:** these features aggregate counts and correlations over all candidates sharing a protein, including decoys. A decoy peptide whose protein happens to have many target matches inherits artificially high `protein_n_features` / colocalization values. This breaks TDC null-model symmetry. Use `--use-protein-level-feats` only if you understand and accept this trade-off.
 
 **`LCMS_PRIOR_FEATURES`** — two sub-groups, both excluded from the ranker:
 

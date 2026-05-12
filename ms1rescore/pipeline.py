@@ -15,6 +15,7 @@ from ms1rescore.candidates import (
 from ms1rescore.feature_generator import (
     LCMS_PRIOR_FEATURES,
     MALDI_INTRINSIC_FEATURES,
+    PROTEIN_LEVEL_FEATURES,
     candidates_to_psm_list,
     compute_all_features,
     get_feature_names,
@@ -364,6 +365,7 @@ def rescore(
     protein_fdr: float = 0.01,
     peptide_fdr: float = 0.01,
     extra_fasta_path: str | None = None,
+    use_protein_level_features: bool = False,
     verbose: bool = False,
     output_dir: str = "ms1rescore_output",
 ):
@@ -729,10 +731,13 @@ def rescore(
     )
     logger.debug(f"Selected feature names: {feature_names}")
 
-    # Intrinsic features that are actually present in the DataFrame
-    intrinsic_present = [
-        f for f in MALDI_INTRINSIC_FEATURES if f in features_df.columns
-    ]
+    # Intrinsic features that are actually present in the DataFrame.
+    # Protein-level features are excluded by default (TDC correctness); opt-in
+    # only when use_protein_level_features=True (--use-protein-level-feats).
+    _intrinsic_pool = MALDI_INTRINSIC_FEATURES + (
+        PROTEIN_LEVEL_FEATURES if use_protein_level_features else []
+    )
+    intrinsic_present = [f for f in _intrinsic_pool if f in features_df.columns]
     lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
 
     # --- Generative-only backend: two-pass ---
