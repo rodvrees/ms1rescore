@@ -32,6 +32,7 @@ ms1rescore/
 │       ├── test_deisotoping.py
 │       ├── test_evidence_score.py
 │       ├── test_isotope_distribution.py
+│       ├── test_lcms_ids.py
 │       └── test_maldi_extraction.py
 └── ms1rescore-rs/              # Rust extension (PyO3 + rayon)
     ├── Cargo.toml
@@ -483,31 +484,46 @@ P12345  →  P12345
 8. Build PSMList + populate rescoring features
 9. Rescore using selected backend (see "Rescoring backends" below)
 
+### Two-pass scoring logic
+
+All backends follow the same two-pass structure:
+
+1. **Round 1** — score all candidates globally. The model does not use per-feature grouping; every candidate is treated on equal footing.
+2. **Per-feature winner selection** (`_select_feature_winners`) — for each MALDI m/z feature, retain only the highest round-1 score candidate. Produces `winners_df` (~N rows for N features).
+3. **Round 2** — retrain/rescore on the winner subset only. Because each feature contributes exactly one candidate, this is a cleaner training set than the full candidate pool.
+4. **FDR** — standard TDC (`_tdc_qvalues`) over all winners sorted by round-2 score. Q-values propagated to non-winners as NaN.
+
+`result_df` contains all candidates. Round-2 score, q-value, and reweighted columns are NaN for non-winners. `is_tdc_winner` marks the round-1 winner per feature.
+
 ### Rescoring backends
 
 `rescore()` accepts a `model` parameter:
 
-**`model="svm"` (default):** mokapot `PercolatorModel` trained on `MALDI_INTRINSIC_FEATURES`. Returns `(psm_list, confidence_estimates_dict, feature_names)`. The confidence dict has the standard mokapot structure (`psms`, `peptides`, `proteins` keys).
+**`model="svm"` (default):** mokapot `PercolatorModel` trained on `MALDI_INTRINSIC_FEATURES`.
+- Round 1: train on all candidates, get `svm_score_r1`.
+- Round 2: rebuild PSMList from `winners_df`, retrain mokapot, get `svm_score_r2`.
+- FDR: `_tdc_qvalues(svm_score_r2, is_decoy_winners)` → `q_value`.
+- Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `peptide`, `protein`, `feature_mz`, `feature_idx`, `is_decoy`, `svm_score_r1`, `svm_score_r2`, `q_value`, `is_tdc_winner`, `reweighted_score`, `reweighted_q_value`.
 
-**`model="catboost"`:** Semi-supervised `CatBoostRanker` (iterations=500, YetiRank loss). Training uses only `MALDI_INTRINSIC_FEATURES`. Pseudo-label iteration:
+**`model="catboost"`:** Semi-supervised `CatBoostRanker` (iterations=500, YetiRank loss). Training uses only `MALDI_INTRINSIC_FEATURES`. Pseudo-label iteration (applied independently in each round):
 1. Seed positives: `ppm_error_abs < init_ppm_threshold` AND `theo_isotope_cosine > init_isotope_threshold` (configurable, defaults 2.0 ppm / 0.7 cosine)
 2. Train on positives + all decoys; predict scores on all candidates
 3. Compute TDC q-values; expand positives to targets with q ≤ 0.05
 4. Repeat until <1% change in positive set size or 5 iterations maximum
-5. Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `peptide`, `feature_idx`, `is_decoy`, `catboost_score`, `q_value`, `reweighted_score`, `reweighted_q_value`
+- Round 1 trains on all candidates → `catboost_score_r1`; round 2 retrains on `winners_df` → `catboost_score_r2`.
+- Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `peptide`, `protein`, `feature_mz`, `feature_idx`, `is_decoy`, `catboost_score_r1`, `catboost_score_r2`, `q_value`, `is_tdc_winner`, `reweighted_score`, `reweighted_q_value`.
 
 **`model="generative"`:** Probabilistic generative scorer. No training. Implemented in `probabilistic_scorer.py`.
 - Estimates noise parameters label-free from the best-ppm non-decoy candidate per MALDI feature (proxy for true positives).
 - Computes a log-sum generative score from independent half-normal / normal likelihoods for: ppm error, isotope cosine deviation from 1.0, CCS deviation (if im2deep present), spatial autocorrelation (if spatial features present).
-- Adds per-feature ranking features: `generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`.
-- **FDR estimation** uses per-feature TDC ranked by Tm. For each MALDI feature, the best target score (Tm) and best decoy score (Dm) are computed independently. Features are ranked by descending Tm; at threshold τ, FDR(τ) = (#{features where Dm ≥ τ} + 1) / #{features where Tm ≥ τ}. Delta_m = Tm − Dm is retained as a supplementary column for diagnostics and near-tie filtering, but is not the ranking statistic. Local PEP is estimated by isotonic regression on the Tm-sorted target/decoy win labels (requires scikit-learn).
-- Output columns specific to FDR step: `Tm`, `Dm`, `Delta_m`, `generative_q_value`, `generative_pep`, `is_tdc_winner`.
-- LC-MS/MS prior reweight: applied to raw generative_score per candidate; reweighted scores re-enter a second `estimate_fdr` pass to produce `reweighted_q_value`.
-- Returns `(psm_list, result_df, feature_names)` with columns: `peptide`, `feature_idx`, `is_decoy`, `generative_score`, `Delta_m`, `q_value`, `reweighted_score`, `reweighted_q_value`, `is_tdc_winner`.
+- Adds per-feature ranking features in step 7b: `generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`, plus diagnostic columns `Tm`, `Dm`, `Delta_m`, `generative_q_value`, `generative_pep`, `is_tdc_winner` (from the internal `estimate_fdr` call — **not used for final FDR**).
+- Round-1 scores = `generative_score` from step 7b. Round-2 re-estimates noise parameters on `winners_df` (cleaner proxy set) and recomputes log-likelihoods via `estimate_noise_params` + `compute_generative_scores`.
+- FDR: `_tdc_qvalues(generative_score_r2, is_decoy_winners)` — standard TDC, not margin-based.
+- Returns `(psm_list, result_df, feature_names)` with columns: `peptide`, `protein`, `feature_idx`, `is_decoy`, `generative_score_r1`, `generative_score_r2`, `Delta_m`, `q_value`, `is_tdc_winner`, `reweighted_score`, `reweighted_q_value`.
 
-**Generative pre-scoring for SVM/CatBoost** (`compute_generative=True`, default): when model is `"svm"` or `"catboost"`, the generative scorer runs first (step 7b) and its four ranking features are added to `MALDI_INTRINSIC_FEATURES` before the training step. This gives the discriminative model a calibrated signal-to-noise score as an additional feature.
+**Generative pre-scoring for SVM/CatBoost** (`compute_generative=True`, default): when model is `"svm"` or `"catboost"`, the generative scorer runs first (step 7b) and its four ranking features (`generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`) are added to `MALDI_INTRINSIC_FEATURES` before training. These features are carried into `winners_df` unchanged for the round-2 model — no recomputation needed.
 
-**LC-MS/MS prior reweight** (applied after all backends): `compute_lcms_prior()` min-max normalizes each `LCMS_PRIOR_FEATURES` column across all candidates, averages the normalized values (excluding all-zero features), and multiplies the resulting weight into the base score. Q-values are recomputed on the reweighted score. Original scores are preserved alongside reweighted scores.
+**LC-MS/MS prior reweight** (applied after all backends to winners only): `compute_lcms_prior()` min-max normalizes each `LCMS_PRIOR_FEATURES` column, averages the normalized values (excluding all-zero features), and multiplies the resulting weight into the round-2 score. `reweighted_score = round2_score × lcms_prior`. Q-values are recomputed on the reweighted scores with a second `_tdc_qvalues` call. Only winner rows receive non-NaN values.
 
 ---
 

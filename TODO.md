@@ -1,3 +1,2 @@
 - Move MSF parser to psm_utils
-- use psm_utils logic more
 - LC-MS/MS prior features should just be MS2Rescore features

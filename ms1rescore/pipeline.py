@@ -314,6 +314,29 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     return q_values
 
 
+def _select_feature_winners(
+    features_df: pd.DataFrame,
+    scores: np.ndarray,
+    feature_col: str,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """
+    For each MALDI feature select the candidate with the highest round-1 score.
+
+    Returns
+    -------
+    winner_pos : np.ndarray[int]
+        Integer positions (iloc-style) in ``features_df`` of the selected winners.
+    winners_df : pd.DataFrame
+        Subset of ``features_df`` with one row per feature, reset index.
+    """
+    score_series = pd.Series(scores, index=features_df.index)
+    winner_idx = score_series.groupby(features_df[feature_col].values).idxmax().values
+    # Convert label-based index values to positional indices
+    winner_pos = features_df.index.get_indexer(winner_idx)
+    winners_df = features_df.loc[winner_idx].copy().reset_index(drop=True)
+    return winner_pos, winners_df
+
+
 def rescore(
     fasta_path: str,
     maldi_mzs: np.ndarray,
@@ -712,24 +735,49 @@ def rescore(
     ]
     lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
 
-    # --- Generative-only backend: return without training ---
+    # --- Generative-only backend: two-pass ---
     if model == "generative":
-        from ms1rescore.probabilistic_scorer import estimate_fdr as _gen_fdr
+        from ms1rescore.probabilistic_scorer import (
+            compute_generative_scores,
+            estimate_noise_params,
+        )
 
-        logger.info("Step 9: Generative backend — margin-based TDC FDR...")
+        logger.info("Step 9: Generative backend — two-pass scoring...")
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
 
-        # Base q-values already computed by run_generative_scoring (margin-based)
-        q_values = features_df["generative_q_value"].values
-        gen_scores = features_df["generative_score"].values
+        # Round-1 scores already computed by run_generative_scoring (step 7b)
+        scores1 = features_df["generative_score"].values
 
-        # Reweighted: apply LC-MS/MS prior to raw scores, re-run margin TDC
-        lcms_prior = compute_lcms_prior(features_df, lcms_present)
-        reweighted_scores = gen_scores * lcms_prior
-        rw_df = features_df.copy()
-        rw_df["_rw_score"] = reweighted_scores
-        rw_df = _gen_fdr(rw_df, score_col="_rw_score", feature_col=feature_col)
-        reweighted_q = rw_df["generative_q_value"].values
+        # Per-feature winner selection
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        logger.info(
+            f"  Round-1 winner selection: {len(winners_df)} candidates retained "
+            f"({int(winners_df['is_decoy'].sum())} decoys)"
+        )
+
+        # Round-2: re-estimate noise on winner subset, recompute log-likelihoods
+        noise_params_r2 = estimate_noise_params(winners_df)
+        scores2_series, _ = compute_generative_scores(winners_df, noise_params_r2)
+        scores2 = scores2_series.values
+
+        # Standard TDC FDR on winners
+        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+        q2 = _tdc_qvalues(scores2, is_decoy_w)
+        lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
+        reweighted2 = scores2 * lcms_prior_w
+        rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+
+        # Map back to full candidate table
+        is_winner_full = np.zeros(len(features_df), dtype=bool)
+        is_winner_full[winner_pos] = True
+        scores2_full = np.full(len(features_df), np.nan)
+        scores2_full[winner_pos] = scores2
+        q_full = np.full(len(features_df), np.nan)
+        q_full[winner_pos] = q2
+        rw_full = np.full(len(features_df), np.nan)
+        rw_full[winner_pos] = reweighted2
+        rw_q_full = np.full(len(features_df), np.nan)
+        rw_q_full[winner_pos] = rw_q2
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
         result_df = pd.DataFrame(
@@ -740,18 +788,19 @@ def rescore(
                     "feature_idx", pd.Series(range(len(features_df)))
                 ).values,
                 "is_decoy": is_decoy,
-                "generative_score": gen_scores,
+                "generative_score_r1": scores1,
+                "generative_score_r2": scores2_full,
                 "Delta_m": features_df.get("Delta_m", pd.Series(np.nan, index=features_df.index)).values,
-                "q_value": q_values,
-                "reweighted_score": reweighted_scores,
-                "reweighted_q_value": reweighted_q,
-                "is_tdc_winner": features_df.get("is_tdc_winner", pd.Series(False, index=features_df.index)).values,
+                "q_value": q_full,
+                "is_tdc_winner": is_winner_full,
+                "reweighted_score": rw_full,
+                "reweighted_q_value": rw_q_full,
             }
         )
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = (result_df["is_tdc_winner"] & (result_df["q_value"] <= fdr_threshold)).sum()
-            n_rw = (result_df["is_tdc_winner"] & (result_df["reweighted_q_value"] <= fdr_threshold)).sum()
+            n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
+            n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} winners (base), "
                 f"{n_rw} winners (reweighted)"
@@ -780,49 +829,69 @@ def rescore(
     logger.info(f"Step 9: Running rescoring (model='{model}')...")
 
     if model == "svm":
-        # Pass only intrinsic features to the SVM
+        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
+
+        # --- Round 1: score all candidates ---
         populate_psm_features(psm_list, features_df, intrinsic_present)
         if verbose:
             logger.debug(
-                f"Writing PSM list with intrinsic features to {output_dir}/14_debug_psm_list_after_intrinsic.pkl for mokapot input"
+                f"Writing PSM list with intrinsic features to {output_dir}/14_debug_psm_list_after_intrinsic.tsv"
             )
-            psm_list_intrinsic_df = psm_list.to_dataframe()
-            psm_list_intrinsic_df.to_csv(
-                f"{output_dir}/14_debug_psm_list_after_intrinsic.tsv",
-                sep="\t",
-                index=False,
+            psm_list.to_dataframe().to_csv(
+                f"{output_dir}/14_debug_psm_list_after_intrinsic.tsv", sep="\t", index=False
             )
-        conf_obj, all_scores = _rescore_svm(
-            psm_list, features_df, intrinsic_present, train_fdr
-        )
+        conf_obj_r1, scores1 = _rescore_svm(psm_list, features_df, intrinsic_present, train_fdr)
         if verbose:
-            logger.debug(
-                f"Writing mokapot confidence object and scores to {output_dir}/15_debug_mokapot_conf.pkl"
-            )
-            with open(f"{output_dir}/15_debug_mokapot_conf.pkl", "wb") as f:
-                pickle.dump(conf_obj, f)
-            # all_scores may be None if score extraction fails; write an empty array in that case for debugging
-            with open(f"{output_dir}/15_debug_mokapot_scores.pkl", "wb") as f:
-                pickle.dump(all_scores if all_scores is not None else np.array([]), f)
+            with open(f"{output_dir}/15_debug_mokapot_conf_r1.pkl", "wb") as f:
+                pickle.dump(conf_obj_r1, f)
+            with open(f"{output_dir}/15_debug_svm_scores_r1.pkl", "wb") as f:
+                pickle.dump(scores1 if scores1 is not None else np.array([]), f)
+
+        if scores1 is None:
+            logger.warning("SVM round-1 score extraction failed; using zeros.")
+            scores1 = np.zeros(len(features_df))
+
+        # --- Per-feature winner selection ---
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        logger.info(
+            f"  Round-1 winner selection: {len(winners_df)} candidates retained "
+            f"({int(winners_df['is_decoy'].sum())} decoys)"
+        )
+
+        # --- Round 2: retrain on winner subset ---
+        psm_list_r2 = candidates_to_psm_list(winners_df)
+        populate_psm_features(psm_list_r2, winners_df, intrinsic_present)
+        conf_obj_r2, scores2 = _rescore_svm(psm_list_r2, winners_df, intrinsic_present, train_fdr)
+        if verbose:
+            with open(f"{output_dir}/15_debug_mokapot_conf_r2.pkl", "wb") as f:
+                pickle.dump(conf_obj_r2, f)
+            with open(f"{output_dir}/15_debug_svm_scores_r2.pkl", "wb") as f:
+                pickle.dump(scores2 if scores2 is not None else np.array([]), f)
+
+        if scores2 is None:
+            logger.warning("SVM round-2 score extraction failed; using zeros.")
+            scores2 = np.zeros(len(winners_df))
+
+        # --- Standard TDC FDR on winners ---
+        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+        q2 = _tdc_qvalues(scores2, is_decoy_w)
+        lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
+        reweighted2 = scores2 * lcms_prior_w
+        rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+
+        # --- Map back to full candidate table ---
+        is_winner_full = np.zeros(len(features_df), dtype=bool)
+        is_winner_full[winner_pos] = True
+        scores2_full = np.full(len(features_df), np.nan)
+        scores2_full[winner_pos] = scores2
+        q_full = np.full(len(features_df), np.nan)
+        q_full[winner_pos] = q2
+        rw_full = np.full(len(features_df), np.nan)
+        rw_full[winner_pos] = reweighted2
+        rw_q_full = np.full(len(features_df), np.nan)
+        rw_q_full[winner_pos] = rw_q2
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
-        lcms_prior = compute_lcms_prior(features_df, lcms_present)
-        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
-
-        if all_scores is not None:
-            q_values, is_winner = _feature_level_tdc(features_df, all_scores, feature_col)
-            reweighted_scores = all_scores * lcms_prior
-            reweighted_q, is_winner = _feature_level_tdc(features_df, reweighted_scores, feature_col)
-        else:
-            logger.warning(
-                "SVM score extraction failed — q_value and reweighted_q_value will be NaN."
-            )
-            all_scores = np.zeros(len(features_df))
-            reweighted_scores = np.zeros(len(features_df))
-            q_values = np.full(len(features_df), np.nan)
-            reweighted_q = np.full(len(features_df), np.nan)
-            is_winner = np.zeros(len(features_df), dtype=bool)
-
         result_df = pd.DataFrame(
             {
                 "peptide": features_df["peptide"].values,
@@ -832,17 +901,18 @@ def rescore(
                     "feature_idx", pd.Series(range(len(features_df)))
                 ).values,
                 "is_decoy": is_decoy,
-                "svm_score": all_scores,
-                "q_value": q_values,
-                "is_tdc_winner": is_winner,
-                "reweighted_score": reweighted_scores,
-                "reweighted_q_value": reweighted_q,
+                "svm_score_r1": scores1,
+                "svm_score_r2": scores2_full,
+                "q_value": q_full,
+                "is_tdc_winner": is_winner_full,
+                "reweighted_score": rw_full,
+                "reweighted_q_value": rw_q_full,
             }
         )
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = (is_winner & ~is_decoy & (q_values <= fdr_threshold)).sum()
-            n_rw = (is_winner & ~is_decoy & (reweighted_q <= fdr_threshold)).sum()
+            n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
+            n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
                 f"{n_rw} target features (reweighted)"
@@ -851,7 +921,10 @@ def rescore(
         return psm_list, result_df, feature_names
 
     elif model == "catboost":
-        scores = _rescore_catboost(
+        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
+
+        # --- Round 1: score all candidates ---
+        scores1 = _rescore_catboost(
             features_df,
             intrinsic_present,
             train_fdr=train_fdr,
@@ -859,21 +932,48 @@ def rescore(
             init_isotope_threshold=init_isotope_threshold,
         )
         if verbose:
-            logger.debug(
-                f"Writing CatBoost scores to {output_dir}/16_debug_catboost_scores.pkl"
-            )
-            with open(f"{output_dir}/16_debug_catboost_scores.pkl", "wb") as f:
-                pickle.dump(scores, f)
+            with open(f"{output_dir}/16_debug_catboost_scores_r1.pkl", "wb") as f:
+                pickle.dump(scores1, f)
+
+        # --- Per-feature winner selection ---
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        logger.info(
+            f"  Round-1 winner selection: {len(winners_df)} candidates retained "
+            f"({int(winners_df['is_decoy'].sum())} decoys)"
+        )
+
+        # --- Round 2: retrain on winner subset ---
+        scores2 = _rescore_catboost(
+            winners_df,
+            intrinsic_present,
+            train_fdr=train_fdr,
+            init_ppm_threshold=init_ppm_threshold,
+            init_isotope_threshold=init_isotope_threshold,
+        )
+        if verbose:
+            with open(f"{output_dir}/16_debug_catboost_scores_r2.pkl", "wb") as f:
+                pickle.dump(scores2, f)
+
+        # --- Standard TDC FDR on winners ---
+        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+        q2 = _tdc_qvalues(scores2, is_decoy_w)
+        lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
+        reweighted2 = scores2 * lcms_prior_w
+        rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+
+        # --- Map back to full candidate table ---
+        is_winner_full = np.zeros(len(features_df), dtype=bool)
+        is_winner_full[winner_pos] = True
+        scores2_full = np.full(len(features_df), np.nan)
+        scores2_full[winner_pos] = scores2
+        q_full = np.full(len(features_df), np.nan)
+        q_full[winner_pos] = q2
+        rw_full = np.full(len(features_df), np.nan)
+        rw_full[winner_pos] = reweighted2
+        rw_q_full = np.full(len(features_df), np.nan)
+        rw_q_full[winner_pos] = rw_q2
 
         is_decoy = features_df["is_decoy"].values.astype(bool)
-        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
-        q_values, is_winner = _feature_level_tdc(features_df, scores, feature_col)
-
-        # LC-MS/MS prior reweight
-        lcms_prior = compute_lcms_prior(features_df, lcms_present)
-        reweighted_scores = scores * lcms_prior
-        reweighted_q, is_winner = _feature_level_tdc(features_df, reweighted_scores, feature_col)
-
         result_df = pd.DataFrame(
             {
                 "peptide": features_df["peptide"].values,
@@ -883,17 +983,18 @@ def rescore(
                     "feature_idx", pd.Series(range(len(features_df)))
                 ).values,
                 "is_decoy": is_decoy,
-                "catboost_score": scores,
-                "q_value": q_values,
-                "is_tdc_winner": is_winner,
-                "reweighted_score": reweighted_scores,
-                "reweighted_q_value": reweighted_q,
+                "catboost_score_r1": scores1,
+                "catboost_score_r2": scores2_full,
+                "q_value": q_full,
+                "is_tdc_winner": is_winner_full,
+                "reweighted_score": rw_full,
+                "reweighted_q_value": rw_q_full,
             }
         )
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = (is_winner & ~is_decoy & (q_values <= fdr_threshold)).sum()
-            n_rw = (is_winner & ~is_decoy & (reweighted_q <= fdr_threshold)).sum()
+            n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
+            n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
                 f"{n_rw} target features (reweighted)"
