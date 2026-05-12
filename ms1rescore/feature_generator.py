@@ -134,6 +134,9 @@ _LCMS_ID_FEATURES = [
 
 LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_ID_FEATURES
 
+# Alias kept separate so LDA-specific feature selection can diverge later.
+LDA_FEATURES = MALDI_INTRINSIC_FEATURES
+
 # ---------------------------------------------------------------------------
 # Optional-feature membership sets (used by get_feature_names)
 # ---------------------------------------------------------------------------

@@ -246,6 +246,89 @@ def _rescore_catboost(
     return scores
 
 
+def _rescore_lda(
+    features_df: pd.DataFrame,
+    intrinsic_feature_names: list[str],
+    init_ppm_threshold: float,
+    init_isotope_threshold: float,
+) -> np.ndarray:
+    """
+    Semi-supervised LDA on MALDI-intrinsic features.
+
+    Pre-processing: ±inf replaced with NaN, then median imputation and
+    StandardScaler inside a sklearn Pipeline.  Pseudo-label iteration
+    follows the same structure as _rescore_catboost.
+
+    Returns a score array (higher = more likely correct).
+    """
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    df = features_df.reset_index(drop=True)
+    present = [f for f in intrinsic_feature_names if f in df.columns]
+    X_raw = df[present].values.astype(np.float64)
+    X = np.where(np.isfinite(X_raw), X_raw, np.nan)  # ±inf → nan for imputer
+
+    is_decoy = df["is_decoy"].values.astype(bool)
+    is_target = ~is_decoy
+
+    seed_mask = (
+        is_target
+        & (
+            df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+            < init_ppm_threshold
+        )
+        & (
+            df.get("theo_isotope_cosine", pd.Series(0.0, index=df.index))
+            > init_isotope_threshold
+        )
+    ).values
+
+    n_seed = seed_mask.sum()
+    logger.info(f"  LDA: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
+    if n_seed == 0:
+        logger.warning("  LDA: no seed positives — falling back to top-ppm init")
+        ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+        seed_mask = (is_target & (ppm_col < ppm_col[is_target].quantile(0.10))).values
+
+    scores = np.zeros(len(df))
+    prev_pos_size = -1
+
+    for iteration in range(5):
+        pos_idx = np.where(seed_mask)[0]
+        dec_idx = np.where(is_decoy)[0]
+        train_idx = np.concatenate([pos_idx, dec_idx])
+        y_train = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(dec_idx))])
+
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("lda", LinearDiscriminantAnalysis()),
+        ])
+        pipe.fit(X[train_idx], y_train)
+        scores = pipe.decision_function(X).ravel()  # ensure 1-D for binary case
+
+        q_values = _tdc_qvalues(scores, is_decoy)
+        new_seed = is_target & (q_values <= 0.05)
+        n_new = new_seed.sum()
+
+        logger.info(
+            f"  LDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size})"
+        )
+
+        change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
+        if prev_pos_size >= 0 and change < 0.01:
+            logger.info("  LDA: converged")
+            break
+
+        prev_pos_size = n_new
+        seed_mask = new_seed.values if hasattr(new_seed, "values") else new_seed
+
+    return scores
+
+
 def _feature_level_tdc(
     features_df: pd.DataFrame,
     scores: np.ndarray,
@@ -589,106 +672,108 @@ def rescore(
         f"{candidates['feature_mz'].nunique()} features"
     )
 
-    # --- Step 2: Load LC-MS/MS data ---
-    logger.info("Step 2: Loading LC-MS/MS data...")
-    lcms_data = load_lcms_data(mzml_paths, cache_path=_cache("lcms_data.pkl"))
-    # Write to file in human-readable format for debugging (in case of issues with the LC-MS/MS loading)
-    if verbose:
-        logger.debug(f"Writing LC-MS/MS data to {output_dir}/10_debug_lcms_data.pkl")
-        with open(f"{output_dir}/10_debug_lcms_data.pkl", "wb") as f:
-            pickle.dump(lcms_data, f)
-
-    # --- Step 3: MS2PIP predictions ---
-    logger.info("Step 3: Finding MS2 matches and running MS2PIP...")
-    from ms1rescore.lcms_evidence import _find_matching_ms2_scans
-    from ms1rescore.utils import mz_to_mass
-
-    # For each unique MALDI feature m/z, find matching MS2 scans within ppm tolerance.
-    feature_ms2_charges = {}
-    for mz in candidates["feature_mz"].unique():
-        neutral_mass = mz_to_mass(mz, charge=1)
-        scan_idxs = _find_matching_ms2_scans(neutral_mass, lcms_data, ppm_tolerance)
-        if scan_idxs:
-            # Store the set of observed precursor charges for this feature's MS2 matches
-            feature_ms2_charges[mz] = set(
-                int(lcms_data.ms2_precursor_charge[i]) for i in scan_idxs
-            )
-    logger.info(
-        f"  {len(feature_ms2_charges)}/{candidates['feature_mz'].nunique()} features have MS2 matches"
-    )
-
-    peptide_charge_pairs = set()
-    # For each feature with MS2 matches, get the candidate peptides and observed charges to run MS2PIP on.
-    for mz, charges in feature_ms2_charges.items():
-        peps = candidates[candidates["feature_mz"] == mz]["peptide"].unique()
-        for pep in peps:
-            for c in charges:
-                peptide_charge_pairs.add((pep, c))
-    logger.info(
-        f"  {len(peptide_charge_pairs)} unique (peptide, charge) pairs for MS2PIP"
-    )
-
-    ms2pip_cache = get_ms2pip_predictions(
-        list(peptide_charge_pairs),
-        model="HCD",
-        cache_path=_cache("ms2pip_predictions.pkl"),
-    )
-
-    # --- Step 4: DeepLC predictions ---
-    logger.info("Step 4: Computing DeepLC predictions...")
-    unique_peptides = candidates["peptide"].unique().tolist()
-    deeplc_model = None
-    # If a PD .msf file is provided, finetune DeepLC on the identified peptides from that file. Otherwise, use the pretrained model.
-    if msf_path:
-        deeplc_model = finetune_deeplc(msf_path, cache_path=_cache("deeplc_model.pt"))
-    deeplc_cache = get_deeplc_predictions(
-        unique_peptides,
-        model=deeplc_model,
-        cache_path=_cache("deeplc_predictions.pkl"),
-    )
-
-    # --- Step 5: Compute LC-MS/MS evidence ---
-    logger.info("Step 5: Computing LC-MS/MS evidence features...")
-    lcms_evidence = compute_all_lcms_evidence(
-        candidates,
-        lcms_data,
-        ms2pip_cache,
-        deeplc_cache,
-        ppm_tolerance=ppm_tolerance,
-    )
-
-    if verbose:
-        logger.debug(
-            f"Writing LC-MS/MS evidence to {output_dir}/11_debug_lcms_evidence.tsv"
-        )
-        pd.DataFrame(lcms_evidence).T.to_csv(
-            f"{output_dir}/11_debug_lcms_evidence.tsv", sep="\t", index=True
-        )
-
-    # --- Step 6: Extract LC-MS/MS envelopes from XIC best scans ---
+    # --- Steps 2–6: LC-MS/MS data (skipped entirely when no mzML is provided) ---
+    lcms_evidence = {}
     lcms_envelopes_xic = None
-    if maldi_envelopes is not None:
-        logger.info("Step 6: Extracting LC-MS/MS envelopes from XIC scans...")
-        from ms1rescore.lcms_evidence import _extract_ms1_envelope
 
-        unique_feature_mzs = candidates["feature_mz"].unique()
-        xic_cache = extract_all_xics(unique_feature_mzs, lcms_data, ppm_tolerance)
+    if mzml_paths:
+        # --- Step 2: Load LC-MS/MS data ---
+        logger.info("Step 2: Loading LC-MS/MS data...")
+        lcms_data = load_lcms_data(mzml_paths, cache_path=_cache("lcms_data.pkl"))
         if verbose:
-            logger.debug(f"Writing extracted XICs to {output_dir}/12_debug_xic_cache.pkl")
-            with open(f"{output_dir}/12_debug_xic_cache.pkl", "wb") as f:
-                pickle.dump(xic_cache, f)
-        lcms_envelopes_xic = {}
-        for mz in unique_feature_mzs:
-            rts, ints = xic_cache.get(mz, (np.array([]), np.array([])))
-            if len(ints) > 0 and ints.max() > 0:
-                best_xic_idx = np.argmax(ints)
-                best_rt = rts[best_xic_idx]
-                best_ms1_idx = np.argmin(np.abs(lcms_data.ms1_rts - best_rt))
-                env = _extract_ms1_envelope(
-                    mz, best_ms1_idx, lcms_data, charge=1, n_peaks=3
+            logger.debug(f"Writing LC-MS/MS data to {output_dir}/10_debug_lcms_data.pkl")
+            with open(f"{output_dir}/10_debug_lcms_data.pkl", "wb") as f:
+                pickle.dump(lcms_data, f)
+
+        # --- Step 3: MS2PIP predictions ---
+        logger.info("Step 3: Finding MS2 matches and running MS2PIP...")
+        from ms1rescore.lcms_evidence import _find_matching_ms2_scans
+        from ms1rescore.utils import mz_to_mass
+
+        feature_ms2_charges = {}
+        for mz in candidates["feature_mz"].unique():
+            neutral_mass = mz_to_mass(mz, charge=1)
+            scan_idxs = _find_matching_ms2_scans(neutral_mass, lcms_data, ppm_tolerance)
+            if scan_idxs:
+                feature_ms2_charges[mz] = set(
+                    int(lcms_data.ms2_precursor_charge[i]) for i in scan_idxs
                 )
-                if env.sum() > 0:
-                    lcms_envelopes_xic[mz] = env
+        logger.info(
+            f"  {len(feature_ms2_charges)}/{candidates['feature_mz'].nunique()} features have MS2 matches"
+        )
+
+        peptide_charge_pairs = set()
+        for mz, charges in feature_ms2_charges.items():
+            peps = candidates[candidates["feature_mz"] == mz]["peptide"].unique()
+            for pep in peps:
+                for c in charges:
+                    peptide_charge_pairs.add((pep, c))
+        logger.info(
+            f"  {len(peptide_charge_pairs)} unique (peptide, charge) pairs for MS2PIP"
+        )
+
+        ms2pip_cache = get_ms2pip_predictions(
+            list(peptide_charge_pairs),
+            model="HCD",
+            cache_path=_cache("ms2pip_predictions.pkl"),
+        )
+
+        # --- Step 4: DeepLC predictions ---
+        logger.info("Step 4: Computing DeepLC predictions...")
+        unique_peptides = candidates["peptide"].unique().tolist()
+        deeplc_model = None
+        if msf_path:
+            deeplc_model = finetune_deeplc(msf_path, cache_path=_cache("deeplc_model.pt"))
+        deeplc_cache = get_deeplc_predictions(
+            unique_peptides,
+            model=deeplc_model,
+            cache_path=_cache("deeplc_predictions.pkl"),
+        )
+
+        # --- Step 5: Compute LC-MS/MS evidence ---
+        logger.info("Step 5: Computing LC-MS/MS evidence features...")
+        lcms_evidence = compute_all_lcms_evidence(
+            candidates,
+            lcms_data,
+            ms2pip_cache,
+            deeplc_cache,
+            ppm_tolerance=ppm_tolerance,
+        )
+
+        if verbose:
+            logger.debug(
+                f"Writing LC-MS/MS evidence to {output_dir}/11_debug_lcms_evidence.tsv"
+            )
+            pd.DataFrame(lcms_evidence).T.to_csv(
+                f"{output_dir}/11_debug_lcms_evidence.tsv", sep="\t", index=True
+            )
+
+        # --- Step 6: Extract LC-MS/MS envelopes from XIC best scans ---
+        if maldi_envelopes is not None:
+            logger.info("Step 6: Extracting LC-MS/MS envelopes from XIC scans...")
+            from ms1rescore.lcms_evidence import _extract_ms1_envelope
+
+            unique_feature_mzs = candidates["feature_mz"].unique()
+            xic_cache = extract_all_xics(unique_feature_mzs, lcms_data, ppm_tolerance)
+            if verbose:
+                logger.debug(f"Writing extracted XICs to {output_dir}/12_debug_xic_cache.pkl")
+                with open(f"{output_dir}/12_debug_xic_cache.pkl", "wb") as f:
+                    pickle.dump(xic_cache, f)
+            lcms_envelopes_xic = {}
+            for mz in unique_feature_mzs:
+                rts, ints = xic_cache.get(mz, (np.array([]), np.array([])))
+                if len(ints) > 0 and ints.max() > 0:
+                    best_xic_idx = np.argmax(ints)
+                    best_rt = rts[best_xic_idx]
+                    best_ms1_idx = np.argmin(np.abs(lcms_data.ms1_rts - best_rt))
+                    env = _extract_ms1_envelope(
+                        mz, best_ms1_idx, lcms_data, charge=1, n_peaks=3
+                    )
+                    if env.sum() > 0:
+                        lcms_envelopes_xic[mz] = env
+
+    else:
+        logger.info("Steps 2–6: No mzML files provided — skipping LC-MS/MS evidence.")
 
     # --- Step 7: Compute all features ---
     logger.info("Step 7: Computing all features...")
@@ -1007,5 +1092,79 @@ def rescore(
 
         return psm_list, result_df, feature_names
 
+    elif model == "lda":
+        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
+
+        # --- Round 1: score all candidates ---
+        scores1 = _rescore_lda(
+            features_df,
+            intrinsic_present,
+            init_ppm_threshold=init_ppm_threshold,
+            init_isotope_threshold=init_isotope_threshold,
+        )
+
+        # --- Per-feature winner selection ---
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        logger.info(
+            f"  Round-1 winner selection: {len(winners_df)} candidates retained "
+            f"({int(winners_df['is_decoy'].sum())} decoys)"
+        )
+
+        # --- Round 2: retrain on winner subset ---
+        scores2 = _rescore_lda(
+            winners_df,
+            intrinsic_present,
+            init_ppm_threshold=init_ppm_threshold,
+            init_isotope_threshold=init_isotope_threshold,
+        )
+
+        # --- Standard TDC FDR on winners ---
+        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+        q2 = _tdc_qvalues(scores2, is_decoy_w)
+        lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
+        reweighted2 = scores2 * lcms_prior_w
+        rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+
+        # --- Map back to full candidate table ---
+        is_winner_full = np.zeros(len(features_df), dtype=bool)
+        is_winner_full[winner_pos] = True
+        scores2_full = np.full(len(features_df), np.nan)
+        scores2_full[winner_pos] = scores2
+        q_full = np.full(len(features_df), np.nan)
+        q_full[winner_pos] = q2
+        rw_full = np.full(len(features_df), np.nan)
+        rw_full[winner_pos] = reweighted2
+        rw_q_full = np.full(len(features_df), np.nan)
+        rw_q_full[winner_pos] = rw_q2
+
+        is_decoy = features_df["is_decoy"].values.astype(bool)
+        result_df = pd.DataFrame(
+            {
+                "peptide": features_df["peptide"].values,
+                "protein": features_df["protein"].values if "protein" in features_df.columns else "",
+                "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
+                "feature_idx": features_df.get(
+                    "feature_idx", pd.Series(range(len(features_df)))
+                ).values,
+                "is_decoy": is_decoy,
+                "lda_score_r1": scores1,
+                "lda_score_r2": scores2_full,
+                "q_value": q_full,
+                "is_tdc_winner": is_winner_full,
+                "reweighted_score": rw_full,
+                "reweighted_q_value": rw_q_full,
+            }
+        )
+
+        for fdr_threshold in [0.01, 0.05, 0.10]:
+            n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
+            n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
+            logger.info(
+                f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
+                f"{n_rw} target features (reweighted)"
+            )
+
+        return psm_list, result_df, feature_names
+
     else:
-        raise ValueError(f"Unknown model '{model}'. Choose 'svm', 'catboost', or 'generative'.")
+        raise ValueError(f"Unknown model '{model}'. Choose 'svm', 'catboost', 'lda', or 'generative'.")

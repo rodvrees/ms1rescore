@@ -288,7 +288,7 @@ The most complex module. Handles all LC-MS/MS evidence extraction.
 
 #### `LCMSData` dataclass
 
-Holds all MS1 and MS2 scan data loaded from mzML. Lazily computes:
+Holds all MS1 and MS2 scan data loaded from mzML or Bruker `.d` files. Lazily computes:
 - `_ms2_neutral_mass`: neutral mass from `ms2_precursor_mz * charge - charge * PROTON`
 - `_ms2_mass_sort_idx`: argsort for binary search over neutral masses
 
@@ -296,7 +296,8 @@ Holds all MS1 and MS2 scan data loaded from mzML. Lazily computes:
 
 | Function | Description |
 |---|---|
-| `load_lcms_data(mzml_paths, cache_path)` | Load mzML via pyteomics, cache to pickle |
+| `load_lcms_data(mzml_paths, cache_path)` | Load mzML via pyteomics or Bruker `.d` via alphatims; routes based on extension |
+| `load_lcms_data_from_d(d_path, cache_path)` | Load timsTOF `.d` folder with alphatims; MS1 per-frame, MS2 vectorised via `index_precursors()` |
 | `_find_matching_ms2_scans(neutral_mass, lcms_data, ppm)` | Binary search over MS2 neutral masses |
 | `get_ms2pip_predictions(pairs, model, cache_path)` | Batch MS2PIP predictions for `(peptide, charge)` pairs. Import: `from ms2pip.core import predict_batch` |
 | `finetune_deeplc(msf_path, cache_path)` | Fine-tune DeepLC on PD TargetPsms (q≤0.01) |
@@ -577,7 +578,7 @@ The Rust `target/` directory can be 1-2 GB. Delete it with `rm -rf ms1rescore/ms
 
 - Python: `/home/robbe/.pyenv/versions/MSIscore`
 - Notebook kernel: MSIscore
-- Key packages: `ms2pip>=4.0.0a1`, `deeplc>=4.0.0a1`, `mokapot>=0.10`, `pyteomics>=4.7`, `psm_utils>=1.1`, `brain-isotopic-distribution>=1.5` (PyPI name for `brainpy`), `catboost>=1.2` (optional, for `model="catboost"`)
+- Key packages: `ms2pip>=4.0.0a1`, `deeplc>=4.0.0a1`, `mokapot>=0.10`, `pyteomics>=4.7`, `psm_utils>=1.1`, `brain-isotopic-distribution>=1.5` (PyPI name for `brainpy`), `catboost>=1.2` (optional, for `model="catboost"`), `alphatims>=1.0` (optional, for reading Bruker `.d` files directly)
 - ms2pip import: `from ms2pip.core import predict_batch` (not `from ms2pip import predict_batch`)
 - `brain-isotopic-distribution` is a transitive dependency of `ms-deisotope` but is listed explicitly in `pyproject.toml` as a core dependency because `theoretical_isotope_distribution()` in `utils.py` imports `from brainpy import isotopic_variants` directly.
 
@@ -586,6 +587,8 @@ Install the package in editable mode:
 pip install -e ms1rescore/
 # With CatBoost support:
 pip install -e "ms1rescore/[catboost]"
+# With Bruker timsTOF .d support:
+pip install -e "ms1rescore/[timstof]"
 ```
 
 ---

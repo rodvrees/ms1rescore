@@ -199,10 +199,16 @@ def build_parser() -> argparse.ArgumentParser:
     req.add_argument(
         "--mzml",
         "-l",
-        required=True,
+        required=False,
+        default=[],
         action="append",
         metavar="PATH",
-        help="LC-MS/MS mzML file path. Repeat for multiple files: -l a.mzML -l b.mzML",
+        help=(
+            "LC-MS/MS mzML file path. Repeat for multiple files: -l a.mzML -l b.mzML. "
+            "Optional: omit when no LC-MS/MS mzML is available. XIC, spectral angle, "
+            "and RT residual features will not be computed, but ID-derived prior "
+            "features (from --lcms-peptides) are still used."
+        ),
     )
 
     # --- MALDI input (mutually exclusive, one required) ---
@@ -545,14 +551,15 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp = parser.add_argument_group("rescoring")
     rescore_grp.add_argument(
         "--model",
-        choices=("svm", "catboost", "generative"),
+        choices=("svm", "catboost", "lda", "generative"),
         default="svm",
         help=(
             "Rescoring backend. 'svm': mokapot PercolatorModel trained on "
             "MALDI-intrinsic features (default). 'catboost': semi-supervised "
             "CatBoostRanker with pseudo-label iteration (requires "
-            "pip install ms1rescore[catboost]). 'generative': probabilistic "
-            "generative scorer, no training required."
+            "pip install ms1rescore[catboost]). 'lda': sklearn LDA with "
+            "median imputation and standardization; no extra dependencies. "
+            "'generative': probabilistic generative scorer, no training required."
         ),
     )
     rescore_grp.add_argument(

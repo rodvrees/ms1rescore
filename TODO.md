@@ -1,2 +1,6 @@
 - Move MSF parser to psm_utils
 - LC-MS/MS prior features should just be MS2Rescore features
+- Implement LDA
+- Feature importance visualization
+- Debug output: a folder of figures showing ion images of matches and their protein-level colocalization
+- cleanup: classes of scoring algos? with a base class?

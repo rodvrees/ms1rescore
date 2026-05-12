@@ -63,12 +63,16 @@ def load_lcms_data(
     cache_path: str | None = None,
 ) -> LCMSData:
     """
-    Load MS1 and MS2 scans from mzML files into indexed arrays.
+    Load MS1 and MS2 scans from mzML or Bruker .d files into indexed arrays.
+
+    When a path ends with ``.d``, ``load_lcms_data_from_d`` is used (requires
+    alphatims).  Otherwise the path is treated as mzML (pyteomics).  Mixed
+    lists (some mzML, some .d) are not supported — use one format per run.
 
     Parameters
     ----------
     mzml_paths
-        Paths to mzML files.
+        Paths to mzML files or a single Bruker .d folder.
     cache_path
         If provided, cache loaded data to this pickle file for fast reloading.
     """
@@ -76,6 +80,10 @@ def load_lcms_data(
         logger.info(f"Loading cached LC-MS/MS data from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
+
+    # Route Bruker .d files to the alphatims loader
+    if len(mzml_paths) == 1 and mzml_paths[0].rstrip("/\\").endswith(".d"):
+        return load_lcms_data_from_d(mzml_paths[0], cache_path=cache_path)
 
     from pyteomics import mzml
 
@@ -161,6 +169,117 @@ def load_lcms_data(
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     return data
+
+
+def load_lcms_data_from_d(
+    d_path: str,
+    cache_path: str | None = None,
+) -> LCMSData:
+    """
+    Load MS1 and MS2 scan data from a Bruker timsTOF .d folder using alphatims.
+
+    Supports ddaPASEF and diaPASEF acquisition modes.  MS1 frames are summed
+    across the mobility dimension (all scan ranges) to produce conventional
+    1-D spectra.  MS2 precursor spectra are extracted via
+    ``TimsTOF.index_precursors()`` (vectorised; no per-precursor Python loop).
+
+    Requires: ``pip install alphatims``
+    """
+    if cache_path and os.path.exists(cache_path):
+        logger.info(f"Loading cached LC-MS/MS data from {cache_path}")
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+
+    try:
+        import alphatims.bruker as atb
+    except ImportError as exc:
+        raise ImportError(
+            "alphatims is required to read Bruker .d files. "
+            "Install with: pip install alphatims"
+        ) from exc
+
+    logger.info(f"Loading timsTOF data from {d_path} ...")
+    tims = atb.TimsTOF(d_path)
+    logger.info(f"  Acquisition mode: {tims.acquisition_mode}")
+
+    # --- MS1: one summed spectrum per MS1 frame ---
+    ms1_frame_ids = tims.frames.loc[tims.frames["MsMsType"] == 0, "Id"].values
+    logger.info(f"  Extracting {len(ms1_frame_ids)} MS1 frames...")
+    ms1_rts = []
+    ms1_mz_arrays = []
+    ms1_int_arrays = []
+    for fid in ms1_frame_ids:
+        fd = tims[int(fid), :, :]
+        if len(fd) == 0:
+            continue
+        ms1_rts.append(tims.rt_values[fid])
+        ms1_mz_arrays.append(fd["mz_values"].values.astype(np.float64))
+        ms1_int_arrays.append(fd["intensity_values"].values.astype(np.float64))
+
+    # --- MS2: vectorised spectrum extraction via index_precursors() ---
+    prec_df = tims.precursors
+    if prec_df is not None and len(prec_df) > 0:
+        logger.info(f"  Extracting {len(prec_df)} MS2 precursor spectra...")
+        indptr, tof_indices, int_values = tims.index_precursors()
+
+        prec_ids = prec_df["Id"].values.astype(int)
+        starts = indptr[prec_ids]
+        ends = indptr[prec_ids + 1]
+        has_peaks = ends > starts
+
+        ms2_precursor_mz = np.where(
+            prec_df["MonoisotopicMz"].values > 0,
+            prec_df["MonoisotopicMz"].values,
+            prec_df["AverageMz"].values,
+        )[has_peaks]
+        ms2_precursor_charge = np.where(
+            prec_df["Charge"].values > 0,
+            prec_df["Charge"].values,
+            2,
+        )[has_peaks].astype(int)
+        parent_frame_ids = prec_df["Parent"].values.astype(int)[has_peaks]
+        ms2_precursor_rt = tims.rt_values[parent_frame_ids]
+
+        ms2_mz_arrays = [
+            tims.mz_values[tof_indices[s:e]].astype(np.float64)
+            for s, e in zip(starts[has_peaks], ends[has_peaks])
+        ]
+        ms2_int_arrays = [
+            int_values[s:e].astype(np.float64)
+            for s, e in zip(starts[has_peaks], ends[has_peaks])
+        ]
+    else:
+        logger.warning("  No precursors found — MS2 spectral features will not be computed.")
+        ms2_precursor_mz = np.array([])
+        ms2_precursor_charge = np.array([], dtype=int)
+        ms2_precursor_rt = np.array([])
+        ms2_mz_arrays = []
+        ms2_int_arrays = []
+
+    result = LCMSData(
+        ms1_rts=np.array(ms1_rts),
+        ms1_mz_arrays=ms1_mz_arrays,
+        ms1_int_arrays=ms1_int_arrays,
+        ms2_precursor_mz=ms2_precursor_mz,
+        ms2_precursor_charge=ms2_precursor_charge,
+        ms2_precursor_rt=ms2_precursor_rt,
+        ms2_mz_arrays=ms2_mz_arrays,
+        ms2_int_arrays=ms2_int_arrays,
+    )
+    result.build_index()
+
+    logger.info(
+        f"  Loaded {len(result.ms1_rts)} MS1 frames, "
+        f"{len(result.ms2_precursor_mz)} MS2 precursors from {d_path}"
+    )
+
+    if cache_path:
+        logger.info(f"Caching LC-MS/MS data to {cache_path}")
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
