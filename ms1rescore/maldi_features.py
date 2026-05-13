@@ -903,7 +903,7 @@ def compute_im2deep_features(
                     })
 
                     if calibration_method == "spline":
-                        cal = _SplineCal(n_knots=5, degree=3)
+                        cal = _SplineCal(n_knots=3, degree=2)
                         cal.fit(psm_df_target, psm_df_source)
                         predicted_cal = cal.transform(df_transform).astype(float)
                         logger.info(

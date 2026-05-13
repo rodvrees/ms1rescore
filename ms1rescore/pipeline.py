@@ -530,6 +530,7 @@ def rescore(
     debug_seed: int = 42,
     observed_ccs_per_feature: dict | None = None,
     im2deep_calibration: str = "linear",
+    digest: bool = False,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -627,12 +628,12 @@ def rescore(
         return os.path.join(cache_dir, name) if cache_dir else None
 
     # --- Step 1: Candidate generation ---
+    # Default (digest=False): use only LC-MS/MS identified peptides as candidates.
+    # With digest=True: also digest the provided FASTA for additional candidates.
     if lcms_peptides_path is not None:
         from ms1rescore.lcms_ids import parse_lcms_ids
 
-        logger.info(
-            "Step 1: Strategy C — parsing LC-MS/MS IDs and digesting identified proteins..."
-        )
+        logger.info("Step 1: Parsing LC-MS/MS identifications...")
         lcms_ids = parse_lcms_ids(
             proteins_path=lcms_proteins_path,
             peptides_path=lcms_peptides_path,
@@ -647,8 +648,18 @@ def rescore(
             lcms_ids.peptides.to_csv(
                 f"{output_dir}/5_debug_lcms_ids.tsv", sep="\t", index=False
             )
+
+        # Pass fasta_path only when --digest is active; None = LC-MS/MS peptides only.
+        _digest_fasta_arg = fasta_path if digest else None
+        if digest:
+            logger.info(
+                f"  --digest active: digesting identified proteins from {fasta_path}"
+            )
+        else:
+            logger.info("  Using LC-MS/MS identified peptides only (pass --digest to also digest FASTA).")
+
         peptide_db = digest_identified_proteins(
-            fasta_path,
+            _digest_fasta_arg,
             lcms_ids,
             missed_cleavages=missed_cleavages,
             min_length=min_length,
@@ -656,14 +667,14 @@ def rescore(
         )
         if verbose:
             logger.debug(
-                f"Writing digested peptide database from identified proteins to {output_dir}/6_debug_peptide_db.tsv"
+                f"Writing peptide database to {output_dir}/6_debug_peptide_db.tsv"
             )
             pd.DataFrame(peptide_db).to_csv(
                 f"{output_dir}/6_debug_peptide_db.tsv", sep="\t", index=False
             )
-        if len(peptide_db) == 0:
+        if len(peptide_db) == 0 and digest and fasta_path:
             logger.warning(
-                "  Strategy C returned 0 candidates — falling back to Strategy A (full FASTA)"
+                "  No candidates from identified proteins — falling back to full FASTA digest."
             )
             peptide_db = digest_fasta(
                 fasta_path,
@@ -672,15 +683,8 @@ def rescore(
                 max_length=max_length,
                 generate_decoys=True,
             )
-            if verbose:
-                logger.debug(
-                    f"Writing digested peptide database from full FASTA to {output_dir}/7_debug_peptide_db_full.tsv"
-                )
-                pd.DataFrame(peptide_db).to_csv(
-                    f"{output_dir}/7_debug_peptide_db_full.tsv", sep="\t", index=False
-                )
-    else:
-        logger.info("Step 1: Strategy A — digesting full FASTA...")
+    elif digest and fasta_path:
+        logger.info("Step 1: --digest active, no LC-MS/MS IDs — digesting full FASTA...")
         peptide_db = digest_fasta(
             fasta_path,
             missed_cleavages=missed_cleavages,
@@ -689,12 +693,15 @@ def rescore(
             generate_decoys=True,
         )
         if verbose:
-            logger.debug(
-                f"Writing digested peptide database from full FASTA to {output_dir}/8_debug_peptide_db_full.tsv"
-            )
             pd.DataFrame(peptide_db).to_csv(
-                f"{output_dir}/8_debug_peptide_db_full.tsv", sep="\t", index=False
+                f"{output_dir}/7_debug_peptide_db_full.tsv", sep="\t", index=False
             )
+    else:
+        raise ValueError(
+            "No candidate source available. Provide --lcms-peptides (or --msf) "
+            "to use LC-MS/MS identified peptides as candidates, or add --digest "
+            "with --fasta to perform an in-silico digest."
+        )
 
     # --- Step 1b: Merge extra FASTA (contaminants / spike-ins) ---
     if extra_fasta_path is not None:

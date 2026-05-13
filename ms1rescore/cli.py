@@ -231,9 +231,24 @@ def build_parser() -> argparse.ArgumentParser:
     req.add_argument(
         "--fasta",
         "-f",
-        required=True,
+        required=False,
+        default=None,
         metavar="PATH",
-        help="Protein FASTA file (forward sequences only; decoys are generated).",
+        help=(
+            "Protein FASTA file (forward sequences only; decoys are generated). "
+            "Required when --digest is specified. Ignored otherwise."
+        ),
+    )
+    req.add_argument(
+        "--digest",
+        action="store_true",
+        default=False,
+        help=(
+            "Digest the provided --fasta to create additional candidates beyond "
+            "the LC-MS/MS identified peptides. Requires --fasta. Without this flag, "
+            "only LC-MS/MS identified peptides (--lcms-peptides or --msf) are used "
+            "as candidates and --fasta is not needed."
+        ),
     )
     req.add_argument(
         "--extra-fasta",
@@ -818,6 +833,18 @@ def main() -> None:
                    "matplotlib.backends", "PIL"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
+    # --- Validate argument combinations ---
+    if args.digest and not args.fasta:
+        parser.error("--digest requires --fasta.")
+
+    lcms_id_source = args.lcms_peptides if hasattr(args, "lcms_peptides") else None
+    if not args.digest and not lcms_id_source and not args.msf:
+        parser.error(
+            "No candidate source: provide --lcms-peptides (or --msf) to use "
+            "LC-MS/MS identified peptides, or add --digest with --fasta to "
+            "perform an in-silico digest."
+        )
+
     # --- Load MALDI data ---
     spatial_features = None
     maldi_envelopes = None
@@ -1054,6 +1081,7 @@ def main() -> None:
         debug_seed=args.debug_seed,
         observed_ccs_per_feature=observed_ccs,
         im2deep_calibration=args.im2deep_calibration,
+        digest=args.digest,
     )
 
     # --- Write results ---
