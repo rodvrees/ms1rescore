@@ -23,7 +23,7 @@ LCMSIds = namedtuple("LCMSIds", ["proteins", "peptides"])
 _PEP_COLS = [
     "sequence", "peptidoform", "protein",
     "q_value", "pep", "score", "n_psms",
-    "charge", "rt_mean", "lcms_intensity",
+    "charge", "rt_mean", "lcms_intensity", "lcms_ccs",
 ]
 
 
@@ -451,6 +451,20 @@ def _parse_psm_utils(
                 except (TypeError, ValueError):
                     pass
 
+            ion_mobility = np.nan
+            if psm.ion_mobility is not None:
+                try:
+                    ion_mobility = float(psm.ion_mobility)
+                except (TypeError, ValueError):
+                    pass
+
+            precursor_mz = np.nan
+            if psm.precursor_mz is not None:
+                try:
+                    precursor_mz = float(psm.precursor_mz)
+                except (TypeError, ValueError):
+                    pass
+
             records.append({
                 "sequence": sequence,
                 "peptidoform": str(psm.peptidoform),
@@ -461,6 +475,8 @@ def _parse_psm_utils(
                 "charge": int(charge) if charge is not None else np.nan,
                 "rt": float(psm.retention_time) if psm.retention_time is not None else np.nan,
                 "lcms_intensity": intensity,
+                "ion_mobility": ion_mobility,
+                "precursor_mz": precursor_mz,
             })
         except Exception:
             continue
@@ -483,9 +499,29 @@ def _parse_psm_utils(
             charge=("charge", lambda x: x.mode().iloc[0] if len(x) > 0 else np.nan),
             rt_mean=("rt", "mean"),
             lcms_intensity=("lcms_intensity", "max"),
+            ion_mobility_mean=("ion_mobility", "mean"),
+            precursor_mz_mean=("precursor_mz", "mean"),
         )
         .reset_index()
     )
+
+    # Convert mean 1/K0 → CCS using the Mason-Schamp equation.
+    # ion_mobility is 1/K0 in Vs/cm² (timsTOF convention); im2ccs expects the same.
+    lcms_ccs = np.full(len(pep_agg), np.nan)
+    has_mob = pep_agg["ion_mobility_mean"].notna() & pep_agg["precursor_mz_mean"].notna()
+    if has_mob.any():
+        try:
+            from im2deep.utils import im2ccs
+        except ImportError:
+            im2ccs = None
+        if im2ccs is not None:
+            mob = pep_agg.loc[has_mob, "ion_mobility_mean"].values
+            mz = pep_agg.loc[has_mob, "precursor_mz_mean"].values
+            chg = pep_agg.loc[has_mob, "charge"].fillna(2).astype(float).values
+            lcms_ccs[has_mob] = im2ccs(mob, mz=mz, charge=chg)
+            n_mob = int(has_mob.sum())
+            logger.info(f"  LC-MS/MS CCS computed for {n_mob}/{len(pep_agg)} peptides from ion mobility")
+    pep_agg["lcms_ccs"] = lcms_ccs
 
     # When q_value is absent for all PSMs (raw search output), skip FDR filter
     all_nan_q = pep_agg["q_value"].isna().all()

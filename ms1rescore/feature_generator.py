@@ -20,6 +20,7 @@ from ms1rescore.maldi_features import (
     compute_colocalization_features,
     compute_envelope_similarity,
     compute_im2deep_features,
+    compute_lcms_ccs_features,
     compute_isotopologue_colocalization,
     compute_maldi_ionization_features,
     compute_maldi_signal_features,
@@ -127,7 +128,10 @@ _LCMS_ID_FEATURES = [
     "n_psms", "lcms_intensity", "source_lcms_confirmed",
 ]
 
-LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_ID_FEATURES
+# MALDI-vs-LC-MS/MS CCS comparison (optional: requires ion mobility in LC-MS/MS data).
+_LCMS_CCS_FEATURES = ["lcms_ccs_delta", "lcms_ccs_abs_pct"]
+
+LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_ID_FEATURES + _LCMS_CCS_FEATURES
 
 # Spatial prior features: ion-image-level quality signals applied as a
 # multiplicative prior after scoring (analogous to LCMS_PRIOR_FEATURES).
@@ -243,8 +247,7 @@ def compute_all_features(
     pixel_coords: np.ndarray | None = None,
     maldi_mzs: np.ndarray | None = None,
     observed_ccs_per_feature: dict | None = None,
-    im2deep_calibration_slope: float = 1.0,
-    im2deep_calibration_intercept: float = 0.0,
+    im2deep_calibration: str = "linear",
 ) -> pd.DataFrame:
     """
     Compute all features on the candidate DataFrame.
@@ -273,8 +276,6 @@ def compute_all_features(
         for A3 if pixel_coords is provided).
     observed_ccs_per_feature
         Dict mapping feature_idx → observed CCS value for IM2Deep features (optional).
-    im2deep_calibration_slope / im2deep_calibration_intercept
-        Linear calibration parameters for IM2Deep predictions.
 
     Returns
     -------
@@ -323,6 +324,12 @@ def compute_all_features(
     else:
         df["source_lcms_confirmed"] = 0.0
 
+    # --- MALDI vs LC-MS/MS CCS features (optional) ---
+    df = compute_lcms_ccs_features(df, observed_ccs_per_feature=observed_ccs_per_feature)
+    for feat in _LCMS_CCS_FEATURES:
+        if feat not in df.columns:
+            df[feat] = 0.0
+
     # --- Theoretical isotope (adds monoisotopic_confidence, A8) ---
     df = compute_theoretical_isotope_features(
         df,
@@ -344,8 +351,7 @@ def compute_all_features(
         df = compute_im2deep_features(
             df,
             observed_ccs_per_feature=observed_ccs_per_feature,
-            calibration_slope=im2deep_calibration_slope,
-            calibration_intercept=im2deep_calibration_intercept,
+            calibration_method=im2deep_calibration,
         )
 
     # --- Spatial (optional) ---

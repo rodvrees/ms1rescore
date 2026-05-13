@@ -529,8 +529,7 @@ def rescore(
     n_debug: int = 50,
     debug_seed: int = 42,
     observed_ccs_per_feature: dict | None = None,
-    im2deep_calibration_slope: float = 1.0,
-    im2deep_calibration_intercept: float = 0.0,
+    im2deep_calibration: str = "linear",
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -866,8 +865,7 @@ def rescore(
         maldi_envelopes=maldi_envelopes,
         lcms_envelopes=lcms_envelopes_xic,
         observed_ccs_per_feature=observed_ccs_per_feature,
-        im2deep_calibration_slope=im2deep_calibration_slope,
-        im2deep_calibration_intercept=im2deep_calibration_intercept,
+        im2deep_calibration=im2deep_calibration,
     )
     if verbose:
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")

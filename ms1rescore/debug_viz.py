@@ -893,6 +893,7 @@ def plot_ccs_scatter(
     features_df: pd.DataFrame,
     result_df: pd.DataFrame,
     out_dir: str,
+    fdr_threshold: float = 0.01,
 ) -> None:
     """
     Scatter plot of observed vs predicted CCS for all candidates.
@@ -901,9 +902,10 @@ def plot_ccs_scatter(
     ``features_df`` (added by ``compute_im2deep_features``). Silently skips if
     neither column is present.
 
-    Points are coloured by target/decoy status; round-2 winners are drawn on
-    top with a larger marker.  A y = x reference line and a linear regression
-    line are overlaid.  Saved to ``{out_dir}/ccs_scatter.png``.
+    Points are coloured by target/decoy status. "R2 winner" means the feature's
+    best candidate AND reweighted_q_value <= fdr_threshold. R1 winners (best
+    candidate but below FDR threshold) are shown at intermediate size.
+    Saved to ``{out_dir}/ccs_scatter.png``.
     """
     if "im2deep_observed_ccs" not in features_df.columns:
         return
@@ -919,6 +921,13 @@ def plot_ccs_scatter(
     pred = pd.to_numeric(feat["im2deep_predicted_ccs"], errors="coerce").values
     is_decoy = feat.get("is_decoy", pd.Series(False, index=feat.index)).fillna(False).astype(bool).values
     is_winner = res.get("is_tdc_winner", pd.Series(False, index=res.index)).fillna(False).astype(bool).values
+    rw_q = pd.to_numeric(
+        res.get("reweighted_q_value", pd.Series(float("nan"), index=res.index)),
+        errors="coerce",
+    ).values
+    # R2 winner = round-2 TDC winner AND passes FDR; R1 = winner but below FDR
+    passes_fdr = is_winner & (rw_q <= fdr_threshold)
+    r1_only = is_winner & ~passes_fdr
 
     valid = np.isfinite(obs) & np.isfinite(pred)
     if not valid.any():
@@ -926,31 +935,43 @@ def plot_ccs_scatter(
 
     obs_v, pred_v = obs[valid], pred[valid]
     decoy_v = is_decoy[valid]
-    winner_v = is_winner[valid]
+    fdr_v = passes_fdr[valid]
+    r1_v = r1_only[valid]
+    bg_v = ~fdr_v & ~r1_v
 
     fig, ax = plt.subplots(figsize=(7, 6))
 
-    # Background: all non-winner candidates
-    bg_mask = ~winner_v
+    # Background: non-winner candidates
     ax.scatter(
-        pred_v[bg_mask & ~decoy_v], obs_v[bg_mask & ~decoy_v],
+        pred_v[bg_v & ~decoy_v], obs_v[bg_v & ~decoy_v],
         s=6, alpha=0.25, color="steelblue", linewidths=0, label="Target",
     )
     ax.scatter(
-        pred_v[bg_mask & decoy_v], obs_v[bg_mask & decoy_v],
+        pred_v[bg_v & decoy_v], obs_v[bg_v & decoy_v],
         s=6, alpha=0.25, color="tomato", linewidths=0, label="Decoy",
     )
 
-    # Foreground: round-2 winners
+    # Mid-layer: R1 winners (best per feature, but below FDR)
+    if r1_v.any():
+        ax.scatter(
+            pred_v[r1_v & ~decoy_v], obs_v[r1_v & ~decoy_v],
+            s=15, alpha=0.5, color="steelblue", linewidths=0, label="Target (R1 winner)",
+        )
+        ax.scatter(
+            pred_v[r1_v & decoy_v], obs_v[r1_v & decoy_v],
+            s=15, alpha=0.5, color="tomato", linewidths=0, label="Decoy (R1 winner)",
+        )
+
+    # Foreground: FDR-passing winners
     ax.scatter(
-        pred_v[winner_v & ~decoy_v], obs_v[winner_v & ~decoy_v],
-        s=30, alpha=0.75, color="steelblue", edgecolors="navy", linewidths=0.5,
-        label="Target (R2 winner)", zorder=5,
+        pred_v[fdr_v & ~decoy_v], obs_v[fdr_v & ~decoy_v],
+        s=50, alpha=0.9, color="steelblue", edgecolors="navy", linewidths=0.7,
+        label=f"Target (FDR ≤ {fdr_threshold:.0%})", zorder=5,
     )
     ax.scatter(
-        pred_v[winner_v & decoy_v], obs_v[winner_v & decoy_v],
-        s=30, alpha=0.75, color="tomato", edgecolors="darkred", linewidths=0.5,
-        label="Decoy (R2 winner)", zorder=5,
+        pred_v[fdr_v & decoy_v], obs_v[fdr_v & decoy_v],
+        s=50, alpha=0.9, color="tomato", edgecolors="darkred", linewidths=0.7,
+        label=f"Decoy (FDR ≤ {fdr_threshold:.0%})", zorder=5,
     )
 
     # y = x reference line
@@ -970,9 +991,9 @@ def plot_ccs_scatter(
 
     # Correlation annotation
     corr_all = float(np.corrcoef(pred_v, obs_v)[0, 1]) if len(pred_v) > 1 else float("nan")
-    if winner_v.sum() > 1:
-        corr_win = float(np.corrcoef(pred_v[winner_v], obs_v[winner_v])[0, 1])
-        corr_str = f"r (all) = {corr_all:.3f}   r (R2 winners) = {corr_win:.3f}"
+    if fdr_v.sum() > 1:
+        corr_fdr = float(np.corrcoef(pred_v[fdr_v], obs_v[fdr_v])[0, 1])
+        corr_str = f"r (all) = {corr_all:.3f}   r (FDR ≤ {fdr_threshold:.0%}) = {corr_fdr:.3f}"
     else:
         corr_str = f"r = {corr_all:.3f}"
 

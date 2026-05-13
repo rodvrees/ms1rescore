@@ -298,6 +298,7 @@ def digest_identified_proteins(
         "charge": "lcms_charge",
         "rt_mean": "lcms_rt_mean",
         "lcms_intensity": "lcms_intensity",
+        "lcms_ccs": "lcms_ccs",
     }
     _EMPTY_COLS = [
         "peptide", "protein", "is_decoy", "mass", "mh_mz",

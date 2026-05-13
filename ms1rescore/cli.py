@@ -740,6 +740,20 @@ def build_parser() -> argparse.ArgumentParser:
     # --- Optional extras ---
     extras = parser.add_argument_group("optional extras")
     extras.add_argument(
+        "--im2deep-calibration",
+        choices=["linear", "spline", "finetune"],
+        default="linear",
+        metavar="METHOD",
+        help=(
+            "CCS calibration strategy for IM2Deep predictions when observed CCS "
+            "values are provided (via --feature-mzs or --maldi-imzml). "
+            "'linear' applies a global additive shift (default); "
+            "'spline' fits a piecewise spline for non-linear bias correction; "
+            "'finetune' adapts the neural network weights to the observed MALDI CCS "
+            "via transfer learning (requires ≥ 100 single-candidate calibration peptides)."
+        ),
+    )
+    extras.add_argument(
         "--spatial-features",
         metavar="PATH",
         help=(
@@ -798,9 +812,10 @@ def main() -> None:
         datefmt="%H:%M:%S",
         stream=sys.stderr,
     )
-    # numba JIT compilation emits thousands of DEBUG lines via its own loggers;
-    # keep them silent unless the user explicitly wants them.
-    for _noisy in ("numba", "numba.core", "imzy", "koyo"):
+    # Third-party loggers that emit excessive DEBUG noise regardless of user intent.
+    for _noisy in ("numba", "numba.core", "imzy", "koyo",
+                   "matplotlib", "matplotlib.font_manager", "matplotlib.pyplot",
+                   "matplotlib.backends", "PIL"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     # --- Load MALDI data ---
@@ -1038,6 +1053,7 @@ def main() -> None:
         n_debug=args.n_debug,
         debug_seed=args.debug_seed,
         observed_ccs_per_feature=observed_ccs,
+        im2deep_calibration=args.im2deep_calibration,
     )
 
     # --- Write results ---

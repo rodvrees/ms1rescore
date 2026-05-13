@@ -748,11 +748,66 @@ def compute_calibrated_ppm_features(
 # B — IM2Deep CCS features
 # ---------------------------------------------------------------------------
 
+def _finetune_and_predict(
+    unique_seqs: list,
+    cal_dedup: pd.DataFrame,
+    pred_dict: dict,
+    df: pd.DataFrame,
+    n_cal: int,
+    n_cal_rows: int,
+) -> np.ndarray:
+    """
+    Fine-tune the IM2Deep model on single-candidate MALDI CCS observations
+    (transfer learning) and return re-predicted CCS for all rows in *df*.
+
+    Requires ≥ 5 calibration peptides; logs a warning and returns the
+    uncalibrated predictions if fewer are available or finetuning fails.
+    """
+    import tempfile
+    from im2deep.core import finetune as _im2deep_finetune
+    from im2deep.core import predict as _predict
+    from psm_utils.psm import PSM
+    from psm_utils.psm_list import PSMList
+    from psm_utils.peptidoform import Peptidoform
+
+    # Build calibration PSMList with observed CCS in metadata
+    cal_psms = []
+    for _, row in cal_dedup.iterrows():
+        seq = row["peptide"]
+        ccs_obs = float(row["ccs_obs"])
+        psm = PSM(
+            peptidoform=Peptidoform(f"{seq}/1"),
+            precursor_charge=1,
+            spectrum_id=seq,
+            metadata={"CCS": ccs_obs},
+        )
+        cal_psms.append(psm)
+    cal_psm_list = PSMList(psm_list=cal_psms)
+
+    with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as tmp:
+        model_path = tmp.name
+
+    finetuned_model = _im2deep_finetune(cal_psm_list, model_save_path=model_path)
+    logger.info(
+        f"  IM2Deep transfer learning on {n_cal} unique peptides "
+        f"({n_cal_rows} single-candidate features): model saved to {model_path}"
+    )
+
+    # Re-predict all unique sequences with the finetuned model
+    all_psms = [
+        PSM(peptidoform=Peptidoform(f"{seq}/1"), precursor_charge=1, spectrum_id=seq)
+        for seq in unique_seqs
+    ]
+    preds = _predict(PSMList(psm_list=all_psms), model=finetuned_model)
+    preds_arr = np.asarray(preds).flatten()
+    ft_pred_dict = {seq: float(preds_arr[i]) for i, seq in enumerate(unique_seqs)}
+    return df["peptide"].map(ft_pred_dict).values.astype(float)
+
+
 def compute_im2deep_features(
     df: pd.DataFrame,
     observed_ccs_per_feature: dict | None = None,
-    calibration_slope: float = 1.0,
-    calibration_intercept: float = 0.0,
+    calibration_method: str = "linear",
 ) -> pd.DataFrame:
     """
     Compute IM2Deep CCS prediction features (B1–B6).
@@ -774,7 +829,10 @@ def compute_im2deep_features(
         return df
 
     try:
-        from im2deep.predict import predict_ccs
+        from im2deep.core import predict as _im2deep_predict
+        from psm_utils.psm import PSM
+        from psm_utils.psm_list import PSMList as _PSMList
+        from psm_utils.peptidoform import Peptidoform
     except ImportError:
         logger.debug("im2deep not installed — skipping CCS features (B)")
         return df
@@ -783,10 +841,9 @@ def compute_im2deep_features(
     pred_dict: dict[str, float] = {}
 
     try:
-        import pandas as _pd
-        pred_input = _pd.DataFrame({"peptide": unique_seqs, "charge": [1] * len(unique_seqs)})
-        preds = predict_ccs(pred_input)
-        # Support array-like or Series output
+        psms = [PSM(peptidoform=Peptidoform(f"{seq}/1"), precursor_charge=1, spectrum_id=seq) for seq in unique_seqs]
+        psm_list = _PSMList(psm_list=psms)
+        preds = _im2deep_predict(psm_list)
         preds_arr = np.asarray(preds).flatten()
         for i, seq in enumerate(unique_seqs):
             pred_dict[seq] = float(preds_arr[i])
@@ -795,12 +852,77 @@ def compute_im2deep_features(
         return df
 
     predicted = df["peptide"].map(pred_dict).values.astype(float)
-    predicted_cal = calibration_slope * predicted + calibration_intercept
     observed = (
         df["feature_idx"]
         .map(observed_ccs_per_feature)
         .values.astype(float)
     )
+
+    # Calibrate predicted CCS using single-candidate features (n_candidates == 1)
+    # as unambiguous reference points.  Three methods:
+    #   linear  — global additive shift (LinearCCSCalibration, default)
+    #   spline  — piecewise spline mapping (SplineCCSCalibration)
+    #   finetune — transfer-learning re-training of the neural network weights
+    predicted_cal = predicted.copy()
+    if "n_candidates" in df.columns:
+        try:
+            single_mask = df["n_candidates"].values == 1
+            valid_cal = single_mask & np.isfinite(observed) & np.isfinite(predicted)
+
+            if valid_cal.sum() >= 5:
+                cal_df = df.loc[valid_cal, ["peptide", "feature_idx"]].copy()
+                cal_df["ccs_obs"] = cal_df["feature_idx"].map(observed_ccs_per_feature)
+                cal_df = cal_df.dropna(subset=["ccs_obs"])
+
+                # Deduplicate: one row per unique peptide sequence (mean observed CCS)
+                cal_dedup = cal_df.groupby("peptide")["ccs_obs"].mean().reset_index()
+                n_cal = len(cal_dedup)
+
+                if calibration_method == "finetune":
+                    predicted_cal = _finetune_and_predict(
+                        unique_seqs, cal_dedup, pred_dict, df,
+                        n_cal, int(valid_cal.sum()),
+                    )
+                else:
+                    from im2deep.calibration import (
+                        LinearCCSCalibration as _LinearCal,
+                        SplineCCSCalibration as _SplineCal,
+                    )
+
+                    psm_df_target = pd.DataFrame({
+                        "peptidoform": cal_dedup["peptide"].apply(lambda s: f"{s}/1"),
+                        "CCS": cal_dedup["ccs_obs"].values,
+                    })
+                    psm_df_source = pd.DataFrame({
+                        "peptidoform": cal_dedup["peptide"].apply(lambda s: f"{s}/1"),
+                        "CCS": cal_dedup["peptide"].map(pred_dict).values,
+                    })
+                    df_transform = pd.DataFrame({
+                        "peptidoform": df["peptide"].apply(lambda s: f"{s}/1"),
+                        "predicted_CCS_uncalibrated": predicted,
+                    })
+
+                    if calibration_method == "spline":
+                        cal = _SplineCal(n_knots=5, degree=3)
+                        cal.fit(psm_df_target, psm_df_source)
+                        predicted_cal = cal.transform(df_transform).astype(float)
+                        logger.info(
+                            f"  IM2Deep spline calibration on {n_cal} unique peptides "
+                            f"({valid_cal.sum()} single-candidate features)"
+                        )
+                    else:  # linear (default)
+                        cal = _LinearCal(per_charge=False, use_charge_state=1)
+                        cal.fit(psm_df_target, psm_df_source)
+                        predicted_cal = np.array(
+                            list(cal.transform(df_transform)), dtype=float
+                        )
+                        logger.info(
+                            f"  IM2Deep linear calibration on {n_cal} unique peptides "
+                            f"({valid_cal.sum()} single-candidate features): "
+                            f"shift={cal.general_shift:.2f} Å²"
+                        )
+        except Exception as exc:
+            logger.warning(f"IM2Deep calibration failed ({exc}) — using uncalibrated predictions")
 
     delta = observed - predicted_cal
     abs_pct = np.abs(delta) / np.where(np.abs(predicted_cal) > 1e-6, np.abs(predicted_cal), 1.0) * 100.0
@@ -857,6 +979,54 @@ def compute_im2deep_features(
 
     logger.info(
         f"IM2Deep CCS features (B): scored {(~np.isnan(observed)).sum()}/{len(df)} candidates"
+    )
+    return df
+
+
+def compute_lcms_ccs_features(
+    df: pd.DataFrame,
+    observed_ccs_per_feature: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Compare MALDI-observed CCS to LC-MS/MS-observed CCS per candidate.
+
+    Requires ``lcms_ccs`` column in *df* (populated from LC-MS/MS ion mobility
+    data via ``lcms_ids._parse_psm_utils``) and ``observed_ccs_per_feature``
+    (MALDI CCS from the SCiLS Lab CSV).  Skips silently if either is absent.
+
+    Note: MALDI CCS is measured at charge 1 ([M+H]+); LC-MS/MS CCS is measured
+    at the search charge (typically 2–4) and converted via the Mason-Schamp
+    equation.  The delta is therefore not zero for the correct identification,
+    but it is consistent across correct assignments and inconsistent for
+    misassignments.
+
+    Features added
+    --------------
+    lcms_ccs_delta      MALDI CCS − LC-MS/MS CCS  (Å²)
+    lcms_ccs_abs_pct    |delta| / LC-MS/MS CCS × 100  (%)
+    """
+    if not observed_ccs_per_feature:
+        return df
+    if "lcms_ccs" not in df.columns or df["lcms_ccs"].isna().all():
+        return df
+
+    maldi_ccs = df["feature_idx"].map(observed_ccs_per_feature).values.astype(float)
+    lcms_ccs = df["lcms_ccs"].values.astype(float)
+
+    delta = maldi_ccs - lcms_ccs
+    abs_pct = np.abs(delta) / np.where(np.abs(lcms_ccs) > 1e-6, np.abs(lcms_ccs), 1.0) * 100.0
+
+    df["lcms_ccs_delta"] = delta
+    df["lcms_ccs_abs_pct"] = abs_pct
+
+    for col in ["lcms_ccs_delta", "lcms_ccs_abs_pct"]:
+        valid = df[col].dropna()
+        fill = float(valid.median()) if len(valid) > 0 else 0.0
+        df[col] = df[col].fillna(fill)
+
+    n_valid = int(np.isfinite(delta).sum())
+    logger.info(
+        f"MALDI vs LC-MS/MS CCS features: {n_valid}/{len(df)} candidates with both CCS values"
     )
     return df
 

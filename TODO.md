@@ -7,3 +7,4 @@
 - Finetuning/calibration correct?
 - Set right MS2PIP model, currently using HCD
 - New release of psm_utils
+- Check: why are MS2 scans found in only-MS1 data?
