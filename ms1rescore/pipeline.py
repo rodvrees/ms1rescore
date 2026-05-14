@@ -24,23 +24,14 @@ from ms1rescore.feature_generator import (
 )
 from ms1rescore.lcms_evidence import (
     compute_all_lcms_evidence,
-    extract_all_xics,
     finetune_deeplc,
+    finetune_deeplc_from_df,
     get_deeplc_predictions,
     get_ms2pip_predictions,
     load_lcms_data,
 )
 
 logger = logging.getLogger(__name__)
-
-# Features where lower = better: invert (1 - value) before normalization
-_LCMS_INVERT_FEATURES = frozenset(["lcms_q_value", "lcms_pep"])
-
-# NaN fill values before inversion/normalization (1.0 = worst for lower-is-better)
-_LCMS_NAN_FILL: dict[str, float] = {"lcms_q_value": 1.0, "lcms_pep": 1.0}
-
-# Relative weights for the weighted average in compute_lcms_prior
-_LCMS_PRIOR_WEIGHTS: dict[str, float] = {"source_lcms_confirmed": 2.0}
 
 # Spatial prior: Geary's C is lower-is-better (< 1 = positive autocorrelation)
 _SPATIAL_INVERT_FEATURES = frozenset(["spatial_gearys_c"])
@@ -55,35 +46,24 @@ def compute_lcms_prior(
     available LC-MS/MS evidence.
 
     Each feature is min-max normalized to [0, 1]. Features where all values
-    are identical (no information) are skipped. Features in
-    ``_LCMS_INVERT_FEATURES`` (q-value, PEP) are inverted so that
-    lower-is-better becomes higher-is-better before normalization, with NaN
-    filled at 1.0 (worst possible value). ``source_lcms_confirmed`` receives
-    2x weight (``_LCMS_PRIOR_WEIGHTS``). Returns the weighted mean of
-    normalized features, or 1.0 if no informative features are present.
+    are identical (no information) are skipped. Returns the mean of normalized
+    features, or 1.0 if no informative features are present.
     """
     normed: list[np.ndarray] = []
-    weights: list[float] = []
 
     for feat in present_lcms_features:
         if feat not in candidates_df.columns:
             continue
-        nan_fill = _LCMS_NAN_FILL.get(feat, 0.0)
-        col = candidates_df[feat].fillna(nan_fill).values.astype(float)
-        if feat in _LCMS_INVERT_FEATURES:
-            col = 1.0 - np.clip(col, 0.0, 1.0)
+        col = candidates_df[feat].fillna(0.0).values.astype(float)
         col_min, col_max = col.min(), col.max()
         if col_max - col_min < 1e-12:
             continue
         normed.append((col - col_min) / (col_max - col_min))
-        weights.append(_LCMS_PRIOR_WEIGHTS.get(feat, 1.0))
 
     if not normed:
         return np.ones(len(candidates_df))
 
-    weights_arr = np.array(weights, dtype=float)
-    stacked = np.stack(normed, axis=0)  # (n_features, n_candidates)
-    return (weights_arr[:, None] * stacked).sum(axis=0) / weights_arr.sum()
+    return np.stack(normed, axis=0).mean(axis=0)
 
 
 def compute_spatial_prior(
@@ -630,6 +610,7 @@ def rescore(
     # --- Step 1: Candidate generation ---
     # Default (digest=False): use only LC-MS/MS identified peptides as candidates.
     # With digest=True: also digest the provided FASTA for additional candidates.
+    lcms_ids = None  # set below if lcms_peptides_path is provided
     if lcms_peptides_path is not None:
         from ms1rescore.lcms_ids import parse_lcms_ids
 
@@ -758,9 +739,8 @@ def rescore(
         f"{candidates['feature_mz'].nunique()} features"
     )
 
-    # --- Steps 2–6: LC-MS/MS data (skipped entirely when no mzML is provided) ---
+    # --- Steps 2–5: LC-MS/MS data (skipped entirely when no mzML is provided) ---
     lcms_evidence = {}
-    lcms_envelopes_xic = None
 
     if mzml_paths:
         # --- Step 2: Load LC-MS/MS data ---
@@ -800,7 +780,7 @@ def rescore(
 
         ms2pip_cache = get_ms2pip_predictions(
             list(peptide_charge_pairs),
-            model="HCD",
+            model="timsTOF2024",
             cache_path=_cache("ms2pip_predictions.pkl"),
         )
 
@@ -808,22 +788,56 @@ def rescore(
         logger.info("Step 4: Computing DeepLC predictions...")
         unique_peptides = candidates["peptide"].unique().tolist()
         deeplc_model = None
+        _model_cache = _cache("deeplc_model.pt")
+        _model_was_cached = _model_cache is not None and os.path.exists(_model_cache)
         if msf_path:
-            deeplc_model = finetune_deeplc(msf_path, cache_path=_cache("deeplc_model.pt"))
+            deeplc_model = finetune_deeplc(msf_path, cache_path=_model_cache)
+        elif lcms_ids is not None:
+            # rt_mean is in minutes after unit auto-detection in _join_psm_rt_intensity.
+            deeplc_model = finetune_deeplc_from_df(
+                lcms_ids.peptides, cache_path=_model_cache
+            )
+        _pred_cache = _cache("deeplc_predictions.pkl")
+        # If model was freshly trained (not loaded from cache), the existing
+        # predictions cache is stale — delete it so predictions are recomputed.
+        if not _model_was_cached and _pred_cache is not None and os.path.exists(_pred_cache):
+            os.remove(_pred_cache)
+            logger.info("  Deleted stale DeepLC predictions cache (model was retrained)")
         deeplc_cache = get_deeplc_predictions(
             unique_peptides,
             model=deeplc_model,
-            cache_path=_cache("deeplc_predictions.pkl"),
+            cache_path=_pred_cache,
         )
 
+        # Estimate MS1 RT window from fine-tuning calibration error.
+        # Window = 2 × 95th-percentile |predicted - observed| RT for calibration peptides.
+        # This adapts to dataset-specific DeepLC calibration quality.
+        rt_window_min = 0.0
+        if deeplc_cache and lcms_ids is not None:
+            ft_df = lcms_ids.peptides[["sequence", "rt_mean"]].dropna(subset=["rt_mean"])
+            pred_rts_cal = np.array([deeplc_cache.get(seq, np.nan) for seq in ft_df["sequence"]])
+            obs_rts_cal = ft_df["rt_mean"].values.astype(float)
+            valid = ~np.isnan(pred_rts_cal) & ~np.isnan(obs_rts_cal)
+            if valid.sum() > 10:
+                p95_mae = float(np.percentile(np.abs(pred_rts_cal[valid] - obs_rts_cal[valid]), 95))
+                rt_window_min = 2.0 * p95_mae
+                logger.info(
+                    f"  DeepLC RT window: 2 × p95 MAE = {rt_window_min:.3f} min "
+                    f"({valid.sum()} calibration peptides, p95={p95_mae:.3f} min)"
+                )
+
         # --- Step 5: Compute LC-MS/MS evidence ---
+        # MS1 features are anchored by DeepLC predicted RT (fully symmetric:
+        # targets and decoys receive identical treatment).
         logger.info("Step 5: Computing LC-MS/MS evidence features...")
         lcms_evidence = compute_all_lcms_evidence(
             candidates,
             lcms_data,
             ms2pip_cache,
             deeplc_cache,
+            maldi_envelopes=maldi_envelopes,
             ppm_tolerance=ppm_tolerance,
+            rt_window_min=rt_window_min,
         )
 
         if verbose:
@@ -834,35 +848,11 @@ def rescore(
                 f"{output_dir}/11_debug_lcms_evidence.tsv", sep="\t", index=True
             )
 
-        # --- Step 6: Extract LC-MS/MS envelopes from XIC best scans ---
-        if maldi_envelopes is not None:
-            logger.info("Step 6: Extracting LC-MS/MS envelopes from XIC scans...")
-            from ms1rescore.lcms_evidence import _extract_ms1_envelope
-
-            unique_feature_mzs = candidates["feature_mz"].unique()
-            xic_cache = extract_all_xics(unique_feature_mzs, lcms_data, ppm_tolerance)
-            if verbose:
-                logger.debug(f"Writing extracted XICs to {output_dir}/12_debug_xic_cache.pkl")
-                with open(f"{output_dir}/12_debug_xic_cache.pkl", "wb") as f:
-                    pickle.dump(xic_cache, f)
-            lcms_envelopes_xic = {}
-            for mz in unique_feature_mzs:
-                rts, ints = xic_cache.get(mz, (np.array([]), np.array([])))
-                if len(ints) > 0 and ints.max() > 0:
-                    best_xic_idx = np.argmax(ints)
-                    best_rt = rts[best_xic_idx]
-                    best_ms1_idx = np.argmin(np.abs(lcms_data.ms1_rts - best_rt))
-                    env = _extract_ms1_envelope(
-                        mz, best_ms1_idx, lcms_data, charge=1, n_peaks=3
-                    )
-                    if env.sum() > 0:
-                        lcms_envelopes_xic[mz] = env
-
     else:
-        logger.info("Steps 2–6: No mzML files provided — skipping LC-MS/MS evidence.")
+        logger.info("Steps 2–5: No mzML files provided — skipping LC-MS/MS evidence.")
 
-    # --- Step 7: Compute all features ---
-    logger.info("Step 7: Computing all features...")
+    # --- Step 6: Compute all features ---
+    logger.info("Step 6: Computing all features...")
     features_df = compute_all_features(
         candidates,
         lcms_evidence=lcms_evidence,
@@ -870,7 +860,6 @@ def rescore(
         ion_images=ion_images,
         ion_image_mzs=ion_image_mzs,
         maldi_envelopes=maldi_envelopes,
-        lcms_envelopes=lcms_envelopes_xic,
         observed_ccs_per_feature=observed_ccs_per_feature,
         im2deep_calibration=im2deep_calibration,
     )
@@ -878,12 +867,12 @@ def rescore(
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
         features_df.to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
-    # --- Step 7b: Generative scoring (optional pre-step) ---
+    # --- Step 6b: Generative scoring (optional pre-step) ---
     has_generative = False
     if (model in ("svm", "catboost") and compute_generative) or model == "generative":
         from ms1rescore.probabilistic_scorer import run_generative_scoring
 
-        logger.info("Step 7b: Running generative scorer...")
+        logger.info("Step 6b: Running generative scorer...")
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
         features_df = run_generative_scoring(features_df, feature_col=feature_col)
         has_generative = True
@@ -899,7 +888,6 @@ def rescore(
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
         has_ion_images=ion_images is not None,
-        has_envelopes=maldi_envelopes is not None and lcms_envelopes_xic is not None,
         has_generative=has_generative,
         has_ccs=observed_ccs_per_feature is not None,
     )
@@ -922,7 +910,7 @@ def rescore(
             estimate_noise_params,
         )
 
-        logger.info("Step 9: Generative backend — two-pass scoring...")
+        logger.info("Step 8: Generative backend — two-pass scoring...")
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
 
         # Round-1 scores already computed by run_generative_scoring (step 7b)
@@ -1002,7 +990,7 @@ def rescore(
 
         return psm_list, result_df, feature_names
 
-    # --- Step 8: Build PSMList ---
+    # --- Step 7: Build PSMList ---
     logger.info("Step 8: Building PSMList...")
     psm_list = candidates_to_psm_list(features_df)
     if verbose:
@@ -1019,7 +1007,7 @@ def rescore(
     )
 
     # --- Step 9: Rescoring ---
-    logger.info(f"Step 9: Running rescoring (model='{model}')...")
+    logger.info(f"Step 8: Running rescoring (model='{model}')...")
 
     if model == "svm":
         feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"

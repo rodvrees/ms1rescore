@@ -277,7 +277,9 @@ def _join_psm_rt_intensity(pep_df: pd.DataFrame, psms_path: str) -> pd.DataFrame
     try:
         psm_df = pd.read_csv(psms_path, sep="\t")
         seqcol = _find_col(psm_df, "peptide", "sequence")
-        rtcol = _find_col(psm_df, "rt", "retention_time", "retentiontime")
+        # "retention" must come before "rt" — partial match for "rt" would otherwise
+        # hit "Protein Start" (contains "rt" at positions 11-12) before "Retention".
+        rtcol = _find_col(psm_df, "retention_time", "retentiontime", "retention", "rt")
         intcol = _find_col(psm_df, "intensity", "ms1_intensity", "precursorintensity")
         chargecol = _find_col(psm_df, "charge", "precursor_charge")
 
@@ -301,6 +303,16 @@ def _join_psm_rt_intensity(pep_df: pd.DataFrame, psms_path: str) -> pd.DataFrame
 
         psm_agg = psm_df.groupby("_seq").agg(**agg).reset_index()
         psm_agg = psm_agg.rename(columns={"_seq": "sequence"})
+
+        # FragPipe (and some other tools) report RT in seconds; everything else
+        # in the pipeline uses minutes. Detect by median: >200 → seconds.
+        if "rt_mean" in psm_agg.columns:
+            rt_median = psm_agg["rt_mean"].median()
+            if rt_median > 200:
+                logger.info(
+                    "PSM RT median %.0f s — converting to minutes (divide by 60)", rt_median
+                )
+                psm_agg["rt_mean"] = psm_agg["rt_mean"] / 60.0
 
         pep_df = pep_df.merge(psm_agg, on="sequence", how="left", suffixes=("", "_psm"))
         for col in ["rt_mean", "lcms_intensity", "charge", "n_psms"]:
@@ -504,6 +516,16 @@ def _parse_psm_utils(
         )
         .reset_index()
     )
+
+    # FragPipe and some other tools report RT in seconds; normalise to minutes.
+    # Detect by median: >200 almost certainly means seconds.
+    if pep_agg["rt_mean"].notna().any():
+        rt_median = pep_agg["rt_mean"].median()
+        if rt_median > 200:
+            logger.info(
+                "PSM RT median %.0f s — converting to minutes (divide by 60)", rt_median
+            )
+            pep_agg["rt_mean"] = pep_agg["rt_mean"] / 60.0
 
     # Convert mean 1/K0 → CCS using the Mason-Schamp equation.
     # ion_mobility is 1/K0 in Vs/cm² (timsTOF convention); im2ccs expects the same.

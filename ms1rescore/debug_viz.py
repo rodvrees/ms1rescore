@@ -427,10 +427,11 @@ def plot_feature_diagnostics(
         # ------------------------------------------------------------------
         _lcms_cols = [
             ("lcms_ms2_spectral_angle", "MS2 spectral angle"),
+            ("lcms_ms1_intensity", "MS1 intensity"),
+            ("lcms_ms1_snr", "MS1 SNR"),
             ("lcms_ms1_isotope_cosine", "MS1 iso cosine"),
-            ("lcms_xic_max_intensity", "XIC max intensity"),
-            ("lcms_xic_snr", "XIC SNR"),
-            ("lcms_rt_residual", "RT residual"),
+            ("theo_m1_ratio_diff_lcms", "M+1 ratio diff (LC-MS)"),
+            ("isotope_envelope_cosine", "Envelope cosine"),
             ("lcms_q_value", "LC-MS q-value"),
             ("im2deep_delta_ccs", "Δ CCS (Å²)"),
             ("im2deep_abs_delta_ccs_pct", "|Δ CCS| (%)"),

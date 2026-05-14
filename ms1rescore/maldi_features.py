@@ -438,7 +438,6 @@ def compute_colocalization_features(
 def compute_theoretical_isotope_features(
     df: pd.DataFrame,
     maldi_envelopes: dict | None = None,
-    lcms_envelopes: dict | None = None,
 ) -> pd.DataFrame:
     """
     Compute sequence-specific theoretical isotope features.
@@ -498,122 +497,41 @@ def compute_theoretical_isotope_features(
     theo_kl = np.zeros(n)
     theo_m1_diff = np.zeros(n)
     theo_m2_diff = np.zeros(n)
-    theo_m1_diff_lcms = np.zeros(n)
-    theo_m2_diff_lcms = np.zeros(n)
 
-    if maldi_envelopes or lcms_envelopes:
+    if maldi_envelopes:
         feature_mzs = df["feature_mz"].values
         for i in range(n):
             t = np.array([theo_m0[i], theo_m1[i], theo_m2[i]])
             nt = norm_t[i]
 
-            if maldi_envelopes:
-                maldi_env = maldi_envelopes.get(feature_mzs[i])
-                if maldi_env is not None and len(maldi_env) >= 3:
-                    obs = np.array(maldi_env[:3], dtype=np.float64)
-                    no_val = np.linalg.norm(obs)
-                    if no_val > 0 and nt > 0:
-                        theo_cosine[i] = np.dot(obs, t) / (no_val * nt)
-                    expected = t * obs.sum()
-                    mask = expected > 0
-                    if mask.any():
-                        theo_chi2[i] = np.sum((obs[mask] - expected[mask]) ** 2 / expected[mask])
-                    obs_s = obs.sum()
-                    if obs_s > 0:
-                        obs_norm = obs / obs_s
-                        theo_safe = np.clip(t, 1e-10, None)
-                        obs_safe = np.clip(obs_norm, 1e-10, None)
-                        theo_kl[i] = np.sum(obs_safe * np.log(obs_safe / theo_safe))
-                    if obs[0] > 0 and t[0] > 0:
-                        theo_m1_diff[i] = abs(obs[1] / obs[0] - t[1] / t[0])
-                        theo_m2_diff[i] = abs(obs[2] / obs[0] - t[2] / t[0])
-
-            if lcms_envelopes:
-                lcms_env = lcms_envelopes.get(feature_mzs[i])
-                if lcms_env is not None and len(lcms_env) >= 3 and t[0] > 0:
-                    lobs = np.array(lcms_env[:3], dtype=np.float64)
-                    if lobs[0] > 0:
-                        theo_m1_diff_lcms[i] = abs(lobs[1] / lobs[0] - t[1] / t[0])
-                        theo_m2_diff_lcms[i] = abs(lobs[2] / lobs[0] - t[2] / t[0])
+            maldi_env = maldi_envelopes.get(feature_mzs[i])
+            if maldi_env is not None and len(maldi_env) >= 3:
+                obs = np.array(maldi_env[:3], dtype=np.float64)
+                no_val = np.linalg.norm(obs)
+                if no_val > 0 and nt > 0:
+                    theo_cosine[i] = np.dot(obs, t) / (no_val * nt)
+                expected = t * obs.sum()
+                mask = expected > 0
+                if mask.any():
+                    theo_chi2[i] = np.sum((obs[mask] - expected[mask]) ** 2 / expected[mask])
+                obs_s = obs.sum()
+                if obs_s > 0:
+                    obs_norm = obs / obs_s
+                    theo_safe = np.clip(t, 1e-10, None)
+                    obs_safe = np.clip(obs_norm, 1e-10, None)
+                    theo_kl[i] = np.sum(obs_safe * np.log(obs_safe / theo_safe))
+                if obs[0] > 0 and t[0] > 0:
+                    theo_m1_diff[i] = abs(obs[1] / obs[0] - t[1] / t[0])
+                    theo_m2_diff[i] = abs(obs[2] / obs[0] - t[2] / t[0])
 
     df["theo_isotope_cosine"] = theo_cosine
     df["theo_isotope_chi2"] = theo_chi2
     df["theo_isotope_kl"] = theo_kl
     df["theo_m1_ratio_diff"] = theo_m1_diff
     df["theo_m2_ratio_diff"] = theo_m2_diff
-    df["theo_m1_ratio_diff_lcms"] = theo_m1_diff_lcms
-    df["theo_m2_ratio_diff_lcms"] = theo_m2_diff_lcms
     df["monoisotopic_confidence"] = mono_conf
 
     logger.info(f"Theoretical isotope features: {(theo_cosine > 0).sum()}/{n} scored")
-    return df
-
-
-def compute_envelope_similarity(
-    df: pd.DataFrame,
-    maldi_envelopes: dict | None = None,
-    lcms_envelopes: dict | None = None,
-) -> pd.DataFrame:
-    """
-    Compute MALDI vs LC-MS/MS isotope envelope similarity.
-
-    lcms_envelopes should be XIC-derived (per feature_mz), not PD-derived.
-    Both targets and decoys with matching XIC peaks get real comparisons;
-    those without get median fill.
-    """
-    from scipy.stats import pearsonr
-
-    n = len(df)
-    cosine = np.full(n, np.nan)
-    pearson_arr = np.full(n, np.nan)
-    mse_arr = np.full(n, np.nan)
-    m1_diff = np.full(n, np.nan)
-    m2_diff = np.full(n, np.nan)
-    n_matched = np.zeros(n)
-
-    for i, (_, row) in enumerate(df.iterrows()):
-        maldi_env = maldi_envelopes.get(row["feature_mz"]) if maldi_envelopes else None
-        lcms_env = lcms_envelopes.get(row["feature_mz"]) if lcms_envelopes else None
-
-        if maldi_env is None or lcms_env is None:
-            continue
-
-        k = min(len(maldi_env), len(lcms_env))
-        a = np.array(maldi_env[:k], dtype=np.float64)
-        b = np.array(lcms_env[:k], dtype=np.float64)
-
-        matched = int(np.sum((a > 0) & (b > 0)))
-        n_matched[i] = matched
-
-        na, nb = np.linalg.norm(a), np.linalg.norm(b)
-        if na > 0 and nb > 0:
-            cosine[i] = float(np.dot(a, b) / (na * nb))
-        if a.std() > 0 and b.std() > 0 and k >= 2:
-            r, _ = pearsonr(a, b)
-            pearson_arr[i] = float(r)
-        mse_arr[i] = float(np.mean((a - b) ** 2))
-
-        if a[0] > 0 and b[0] > 0 and k >= 2:
-            m1_diff[i] = abs(a[1] / a[0] - b[1] / b[0])
-        if a[0] > 0 and b[0] > 0 and k >= 3:
-            m2_diff[i] = abs(a[2] / a[0] - b[2] / b[0])
-
-    # Fill NaN with median
-    for name, arr in [
-        ("isotope_envelope_cosine", cosine),
-        ("isotope_envelope_pearson", pearson_arr),
-        ("isotope_envelope_mse", mse_arr),
-        ("isotope_m1_ratio_diff", m1_diff),
-        ("isotope_m2_ratio_diff", m2_diff),
-    ]:
-        valid = arr[~np.isnan(arr)]
-        fill = float(np.median(valid)) if len(valid) > 0 else 0.0
-        df[name] = np.where(np.isnan(arr), fill, arr)
-
-    df["isotope_n_matched"] = n_matched
-
-    n_scored = np.sum(~np.isnan(cosine))
-    logger.info(f"Envelope similarity: {n_scored}/{n} candidates scored")
     return df
 
 

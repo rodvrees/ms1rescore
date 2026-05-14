@@ -18,7 +18,6 @@ from ms1rescore.maldi_features import (
     compute_candidate_ambiguity_features,
     compute_chca_cluster_features,
     compute_colocalization_features,
-    compute_envelope_similarity,
     compute_im2deep_features,
     compute_lcms_ccs_features,
     compute_isotopologue_colocalization,
@@ -87,10 +86,6 @@ MALDI_INTRINSIC_FEATURES = [
     "isotope_image_colocalization_mean",
     # --- adduct co-localization (E2) — optional, requires ion_images ---
     "adduct_colocalization_na", "adduct_colocalization_k", "adduct_colocalization_chca",
-    # --- observed isotope envelope similarity MALDI vs LC-MS/MS — optional ---
-    "isotope_envelope_cosine", "isotope_envelope_pearson",
-    "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
-    "isotope_n_matched",
 ]
 
 # Protein-level features: aggregate signal across all candidates sharing a protein,
@@ -117,10 +112,15 @@ PROTEIN_LEVEL_FEATURES = [
 
 _LCMS_MZML_FEATURES = [
     "lcms_ms2_spectral_angle", "lcms_ms2_n_matches",
-    "lcms_xic_max_intensity", "lcms_xic_n_scans", "lcms_xic_snr",
-    "lcms_xic_best_charge", "lcms_rt_residual",
+    # DeepLC-anchored MS1 signal features
+    "lcms_ms1_intensity", "lcms_ms1_snr",
+    # DeepLC-anchored MS1 isotope features (per-candidate, fully symmetric)
     "lcms_ms1_isotope_cosine",
     "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
+    # MALDI vs LC-MS/MS isotope envelope similarity (requires maldi_envelopes)
+    "isotope_envelope_cosine", "isotope_envelope_pearson",
+    "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
+    "isotope_n_matched",
 ]
 
 _LCMS_ID_FEATURES = [
@@ -131,7 +131,7 @@ _LCMS_ID_FEATURES = [
 # MALDI-vs-LC-MS/MS CCS comparison (optional: requires ion mobility in LC-MS/MS data).
 _LCMS_CCS_FEATURES = ["lcms_ccs_delta", "lcms_ccs_abs_pct"]
 
-LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_ID_FEATURES + _LCMS_CCS_FEATURES
+LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_CCS_FEATURES
 
 # Spatial prior features: ion-image-level quality signals applied as a
 # multiplicative prior after scoring (analogous to LCMS_PRIOR_FEATURES).
@@ -158,11 +158,6 @@ _COLOC_FEATS = frozenset([
     "protein_colocalization", "protein_colocalization_max",
     "protein_colocalization_median", "protein_colocalization_n_partners",
 ])
-_ENVELOPE_FEATS = frozenset([
-    "isotope_envelope_cosine", "isotope_envelope_pearson",
-    "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
-    "isotope_n_matched",
-])
 _PIXEL_FEATS = frozenset(["ppm_error_calibrated_z"])
 _CCS_FEATS = frozenset([
     "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
@@ -185,7 +180,7 @@ _GENERATIVE_FEATS = frozenset([
 def get_feature_names(
     has_spatial: bool = False,  # kept for backwards compatibility; no longer used
     has_ion_images: bool = False,
-    has_envelopes: bool = False,
+    has_envelopes: bool = False,  # kept for backwards compatibility; no longer used
     has_pixel_coords: bool = False,
     has_ccs: bool = False,
     has_generative: bool = False,
@@ -201,7 +196,6 @@ def get_feature_names(
         if (f not in _COLOC_FEATS or has_ion_images)
         and (f not in _ISOTOPOLOGUE_COLOC_FEATS or has_ion_images)
         and (f not in _ADDUCT_COLOC_FEATS or has_ion_images)
-        and (f not in _ENVELOPE_FEATS or has_envelopes)
         and (f not in _PIXEL_FEATS or has_pixel_coords)
         and (f not in _CCS_FEATS or has_ccs)
         and (f not in _GENERATIVE_FEATS or has_generative)
@@ -243,7 +237,6 @@ def compute_all_features(
     ion_images: np.ndarray | None = None,
     ion_image_mzs: np.ndarray | None = None,
     maldi_envelopes: dict | None = None,
-    lcms_envelopes: dict | None = None,
     pixel_coords: np.ndarray | None = None,
     maldi_mzs: np.ndarray | None = None,
     observed_ccs_per_feature: dict | None = None,
@@ -266,8 +259,6 @@ def compute_all_features(
         m/z values aligned with ion_images (optional).
     maldi_envelopes
         MALDI isotope envelopes: feature_mz → array (optional).
-    lcms_envelopes
-        LC-MS/MS isotope envelopes: feature_mz → array (optional).
     pixel_coords
         (N_features,) or (N_features, 2) pixel coordinates aligned with
         maldi_mzs, used for LOWESS ppm calibration (A3, optional).
@@ -293,36 +284,33 @@ def compute_all_features(
     df = compute_mass_defect_features(df)               # A11
     df = compute_chca_cluster_features(df)              # A12
 
-    # --- LC-MS/MS mzML evidence (pre-computed per candidate) ---
+    # --- LC-MS/MS mzML evidence (pre-computed per candidate via compute_all_lcms_evidence) ---
+    # All features in _LCMS_MZML_FEATURES are computed symmetrically per-candidate
+    # (targets and decoys receive identical treatment; no is_decoy branching).
+    # Isotope envelope similarity features (isotope_envelope_*) are included here
+    # when maldi_envelopes was passed to compute_all_lcms_evidence.
     if lcms_evidence is not None:
-        # Build a DataFrame from the evidence dict and join on candidate index —
-        # avoids a Python lambda over 707K rows × n_features.
         ev_df = pd.DataFrame.from_dict(lcms_evidence, orient="index", dtype=float)
         ev_df = ev_df.reindex(columns=_LCMS_MZML_FEATURES)
         df = df.join(ev_df, how="left")
         df[_LCMS_MZML_FEATURES] = df[_LCMS_MZML_FEATURES].fillna(0.0)
-        for feat in ["lcms_rt_residual", "lcms_ms1_isotope_cosine"]:
+        # For similarity/ratio features, replace 0-fill with column median so that
+        # candidates without signal are not penalised relative to the median.
+        _median_fill_feats = [
+            "lcms_ms1_isotope_cosine",
+            "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
+            "isotope_envelope_cosine", "isotope_envelope_pearson",
+            "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
+        ]
+        for feat in _median_fill_feats:
+            if feat not in df.columns:
+                continue
             valid = df[feat].replace(0.0, np.nan).dropna()
             fill = float(valid.median()) if len(valid) > 0 else 0.0
             df[feat] = df[feat].replace(0.0, fill)
     else:
         for feat in _LCMS_MZML_FEATURES:
             df[feat] = 0.0
-
-    # --- LC-MS/MS ID features (Strategy C) ---
-    # These are pre-populated by digest_identified_proteins(); default to 0.0
-    # if using the full-FASTA Strategy A path (no lcms_ids).
-    for feat in _LCMS_ID_FEATURES:
-        if feat == "source_lcms_confirmed":
-            continue  # computed from source column below
-        if feat not in df.columns:
-            df[feat] = 0.0
-
-    # source_lcms_confirmed: 1.0 for Strategy C confirmed peptides, 0.0 otherwise
-    if "source" in df.columns:
-        df["source_lcms_confirmed"] = (df["source"] == "lcms_confirmed").astype(float)
-    else:
-        df["source_lcms_confirmed"] = 0.0
 
     # --- MALDI vs LC-MS/MS CCS features (optional) ---
     df = compute_lcms_ccs_features(df, observed_ccs_per_feature=observed_ccs_per_feature)
@@ -334,7 +322,6 @@ def compute_all_features(
     df = compute_theoretical_isotope_features(
         df,
         maldi_envelopes=maldi_envelopes,
-        lcms_envelopes=lcms_envelopes,
     )
 
     # --- MALDI ionization ---
@@ -369,11 +356,6 @@ def compute_all_features(
         df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)  # E1
         df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)        # E2
         df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs)                         # E5/E6
-
-    # --- Envelope similarity MALDI vs LC-MS/MS (optional) ---
-    if maldi_envelopes is not None and lcms_envelopes is not None:
-        logger.debug("Computing envelope similarity features (MALDI vs LC-MS/MS) using pre-computed envelopes")
-        df = compute_envelope_similarity(df, maldi_envelopes, lcms_envelopes)
 
     return df
 

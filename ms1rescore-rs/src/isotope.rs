@@ -23,17 +23,8 @@ fn extract_envelope_single(
         let hi = mz_arr.partition_point(|&x| x <= expected_mz + tol);
 
         if lo < hi {
-            // Closest to expected m/z
-            let mut best_dist = f64::MAX;
-            let mut best_int = 0.0f64;
-            for i in lo..hi {
-                let dist = (mz_arr[i] - expected_mz).abs();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_int = int_arr[i];
-                }
-            }
-            intensities[k] = best_int;
+            // Sum all peaks in window: accumulates signal across ion mobility scans.
+            intensities[k] = int_arr[lo..hi].iter().sum();
         }
     }
 

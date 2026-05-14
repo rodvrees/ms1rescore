@@ -1113,6 +1113,14 @@ def main() -> None:
         logger.debug("Writing complete result DataFrame to debug_result_df.tsv")
         result_df.to_csv(f"{args.output_dir}/5_debug_result_df.tsv", sep="\t", index=False)
     _write_results(result_df, args.output_dir)
+    if gt_peptides and "is_tdc_winner" in result_df.columns:
+        gt_set = set(gt_peptides)
+        winners = result_df[result_df["is_tdc_winner"] & ~result_df["is_decoy"].astype(bool)]
+        n_gt_winners = winners["peptide"].isin(gt_set).sum()
+        logger.info(
+            "%d/%d GT peptides are round-2 (feature-level) winners.",
+            n_gt_winners, len(gt_set),
+        )
     logger.info("Done.")
 
 

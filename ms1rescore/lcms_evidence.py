@@ -218,8 +218,13 @@ def load_lcms_data_from_d(
         if len(fd) == 0:
             continue
         ms1_rts.append(tims.rt_values[fid] / 60.0)  # alphatims rt_values is in seconds
-        ms1_mz_arrays.append(fd["mz_values"].values.astype(np.float64))
-        ms1_int_arrays.append(fd["intensity_values"].values.astype(np.float64))
+        mz_vals = fd["mz_values"].values.astype(np.float64)
+        int_vals = fd["intensity_values"].values.astype(np.float64)
+        # alphatims returns peaks interleaved by mobility scan, not sorted by m/z.
+        # Sort so that searchsorted-based XIC and envelope extraction works correctly.
+        sort_idx = np.argsort(mz_vals, kind="stable")
+        ms1_mz_arrays.append(mz_vals[sort_idx])
+        ms1_int_arrays.append(int_vals[sort_idx])
 
     # --- MS2: vectorised spectrum extraction via index_precursors() ---
     prec_df = tims.precursors
@@ -362,7 +367,7 @@ def _match_and_score_spectrum(
 
 def get_ms2pip_predictions(
     peptide_charge_pairs: list[tuple[str, int]],
-    model: str = "HCD",
+    model: str = "timsTOF2024",
     cache_path: str | None = None,
 ) -> dict[tuple[str, int], tuple[np.ndarray, np.ndarray]]:
     """
@@ -416,6 +421,14 @@ def get_ms2pip_predictions(
             all_mz = np.concatenate([mz_b, mz_y])
             all_int = np.concatenate([int_b, int_y])
 
+            # MS2PIP returns log2 intensities (can be negative). Convert to
+            # linear scale and normalise to [0, 1] so that spectral angle
+            # comparisons against raw observed intensities are meaningful.
+            all_int = np.exp2(all_int)
+            max_int = all_int.max()
+            if max_int > 0:
+                all_int = all_int / max_int
+
             sort_order = np.argsort(all_mz)
             cache[(pep, charge)] = (all_mz[sort_order], all_int[sort_order])
 
@@ -457,10 +470,12 @@ def _extract_xic(
         hi = np.searchsorted(mz_arr, target_mz + tol, side="right")
 
         if lo < hi:
-            # Take the highest intensity peak within tolerance
-            best_idx = lo + np.argmax(int_arr[lo:hi])
+            # Sum all peaks in the window: accumulates signal across ion mobility scans
+            # (timsTOF frames contain multiple mobility scans at the same m/z; summing
+            # gives the total intensity at this m/z, equivalent to a conventional
+            # 2-D LC-MS projection). For mzML centroid data this equals the single peak.
             rts.append(lcms_data.ms1_rts[scan_idx])
-            intensities.append(int_arr[best_idx])
+            intensities.append(float(int_arr[lo:hi].sum()))
 
     return np.array(rts), np.array(intensities)
 
@@ -573,6 +588,56 @@ def finetune_deeplc(
     return model
 
 
+def finetune_deeplc_from_df(
+    rt_df: "pd.DataFrame",
+    cache_path: str | None = None,
+):
+    """
+    Finetune DeepLC on a DataFrame with columns ``sequence`` and ``rt_mean``
+    (retention time in **minutes**).
+
+    Used when an MSF file is not available (e.g. FragPipe output).
+    ``rt_df`` is typically ``lcms_ids.peptides[["sequence", "rt_mean"]].dropna()``.
+    """
+    import torch
+
+    if cache_path and os.path.exists(cache_path):
+        logger.info(f"Loading cached DeepLC model from {cache_path}")
+        return torch.load(cache_path, weights_only=False)
+
+    from deeplc.core import finetune
+    from psm_utils import PSM, PSMList, Peptidoform
+
+    df = rt_df[["sequence", "rt_mean"]].dropna(subset=["rt_mean"])
+
+    if len(df) < 50:
+        logger.warning(
+            f"Only {len(df)} peptides with RT for DeepLC finetuning — using default model"
+        )
+        return None
+
+    logger.info(f"Finetuning DeepLC on {len(df)} peptides (RT in minutes)...")
+    psm_list = PSMList(
+        psm_list=[
+            PSM(
+                peptidoform=Peptidoform(f"{row['sequence']}/2"),
+                spectrum_id=f"cal_{i}",
+                retention_time=float(row["rt_mean"]),
+            )
+            for i, (_, row) in enumerate(df.iterrows())
+        ]
+    )
+
+    model = finetune(psm_list)
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        torch.save(model, cache_path)
+        logger.info(f"Saved finetuned DeepLC model to {cache_path}")
+
+    return model
+
+
 def get_deeplc_predictions(
     unique_peptides: list[str],
     model=None,
@@ -622,11 +687,14 @@ def _extract_ms1_envelope(
     charge: int = 1,
     n_peaks: int = 3,
     ppm_tolerance: float = 20.0,
+    normalize: bool = True,
 ) -> np.ndarray:
     """
     Extract isotope envelope [M0, M+1, M+2, ...] from an MS1 scan.
 
-    Returns normalized intensities. Zeros if peaks not found.
+    Returns normalized intensities by default. Pass normalize=False to get raw
+    summed counts (needed when accumulating across multiple scans before normalizing).
+    Zeros if peaks not found.
     """
     mz_arr = lcms_data.ms1_mz_arrays[scan_idx]
     int_arr = lcms_data.ms1_int_arrays[scan_idx]
@@ -641,14 +709,12 @@ def _extract_ms1_envelope(
         hi = np.searchsorted(mz_arr, expected_mz + tol, side="right")
 
         if lo < hi:
-            # Closest to expected m/z
-            dists = np.abs(mz_arr[lo:hi] - expected_mz)
-            best = lo + np.argmin(dists)
-            intensities[k] = int_arr[best]
+            intensities[k] = float(int_arr[lo:hi].sum())
 
-    total = intensities.sum()
-    if total > 0:
-        intensities /= total
+    if normalize:
+        total = intensities.sum()
+        if total > 0:
+            intensities /= total
     return intensities
 
 
@@ -741,7 +807,9 @@ def compute_lcms_evidence(
         if len(nonzero) > 0:
             noise = np.percentile(nonzero, 5)
             result["lcms_xic_n_scans"] = int((xic_ints > 0.1 * xic_ints.max()).sum())
-            result["lcms_xic_snr"] = float(xic_ints.max() / noise) if noise > 0 else 0.0
+            result["lcms_xic_snr"] = (
+                float(np.log10(xic_ints.max() / noise)) if noise > 0 else 0.0
+            )
 
             # Best scan for RT and isotope extraction
             best_xic_idx = np.argmax(xic_ints)
@@ -775,94 +843,61 @@ def compute_all_lcms_evidence(
     lcms_data: LCMSData,
     ms2pip_cache: dict,
     deeplc_cache: dict | None = None,
+    maldi_envelopes: dict | None = None,
     ppm_tolerance: float = 20.0,
     fragment_tol_da: float = 0.02,
+    rt_window_min: float = 0.0,
 ) -> dict[int, dict[str, float]]:
     """
     Compute LC-MS/MS evidence features for all candidates.
 
-    Optimized: pre-computes per-feature data (XIC, MS2 scan matches, best MS1 scan)
-    once per unique m/z, then only peptide-specific work (spectral angle, RT residual,
-    isotope cosine) is done per candidate.
+    MS1 features are DeepLC-anchored: the predicted RT for each peptide is used
+    to locate the nearest MS1 scan (or a window of scans when rt_window_min > 0),
+    then signal, SNR, and isotope features are extracted at the precursor m/z.
+    This is fully symmetric — targets and decoys receive identical treatment;
+    no is_decoy branching occurs anywhere.
+
+    rt_window_min
+        When > 0, sum signal across all MS1 scans within ±rt_window_min minutes
+        of the predicted RT instead of using only the single nearest scan. Falls
+        back to nearest scan if no scans fall within the window. Typical value:
+        0.5–2.0 min.
+
+    MS2 features (spectral angle, n_matches) use neutral-mass matching of MS2
+    scans and are pre-computed once per unique feature m/z.
     """
     unique_mzs = candidates_df["feature_mz"].unique()
-    xic_charges = [1, 2, 3, 4]
 
-    # --- Pre-compute per-feature (shared across all candidates at same m/z) ---
-    # For XIC: search at charge 1-4 m/z for the same neutral mass, take best signal.
-    logger.info(f"  Pre-computing per-feature data for {len(unique_mzs)} features...")
-
-    # Build all m/z values to extract XICs for (each feature × each charge)
-    from ms1rescore.utils import mass_to_mz
-    all_xic_mzs = []
-    mz_to_feature = {}  # (xic_mz, charge) → feature_mz
+    # Pre-compute MS2 scan indices per feature m/z (shared across all candidates)
+    logger.info(f"  Pre-computing MS2 matches for {len(unique_mzs)} features...")
+    from ms1rescore.utils import mz_to_mass
+    feature_ms2_scans: dict[float, list[int]] = {}
     for mz in unique_mzs:
         neutral_mass = mz_to_mass(mz, charge=1)
-        for c in xic_charges:
-            xic_mz = mass_to_mz(neutral_mass, c)
-            all_xic_mzs.append(xic_mz)
-            mz_to_feature[(xic_mz, c)] = mz
+        feature_ms2_scans[mz] = _find_matching_ms2_scans(neutral_mass, lcms_data, ppm_tolerance)
 
-    xic_cache = extract_all_xics(np.array(all_xic_mzs), lcms_data, ppm_tolerance)
+    n_with_ms2 = sum(1 for v in feature_ms2_scans.values() if v)
+    logger.info(f"  {n_with_ms2}/{len(unique_mzs)} features have MS2 matches")
 
-    feature_data = {}  # feature_mz → dict with shared XIC features + MS2 scan indices
-    for mz in unique_mzs:
-        neutral_mass = mz_to_mass(mz, charge=1)
-
-        # Find the best XIC across all charge states
-        best_max_int = 0.0
-        best_rts = np.array([])
-        best_ints = np.array([])
-        best_charge = 1
-        for c in xic_charges:
-            xic_mz = mass_to_mz(neutral_mass, c)
-            rts, ints = xic_cache.get(xic_mz, (np.array([]), np.array([])))
-            if len(ints) > 0 and ints.max() > best_max_int:
-                best_max_int = ints.max()
-                best_rts = rts
-                best_ints = ints
-                best_charge = c
-
-        fd = {
-            "lcms_xic_max_intensity": 0.0,
-            "lcms_xic_n_scans": 0,
-            "lcms_xic_snr": 0.0,
-            "best_xic_rt": None,
-            "best_ms1_idx": None,
-            "best_xic_charge": best_charge,
-            "best_xic_mz": mass_to_mz(neutral_mass, best_charge),
-            "ms2_scan_indices": _find_matching_ms2_scans(
-                neutral_mass, lcms_data, ppm_tolerance
-            ),
-        }
-
-        if len(best_ints) > 0 and best_ints.max() > 0:
-            fd["lcms_xic_max_intensity"] = float(np.log1p(best_ints.max()))
-            nonzero = best_ints[best_ints > 0]
-            if len(nonzero) > 0:
-                noise = np.percentile(nonzero, 5)
-                fd["lcms_xic_n_scans"] = int((best_ints > 0.1 * best_ints.max()).sum())
-                fd["lcms_xic_snr"] = float(best_ints.max() / noise) if noise > 0 else 0.0
-                best_idx = np.argmax(best_ints)
-                fd["best_xic_rt"] = float(best_rts[best_idx])
-                fd["best_ms1_idx"] = int(
-                    np.argmin(np.abs(lcms_data.ms1_rts - best_rts[best_idx]))
-                )
-
-        feature_data[mz] = fd
-
-    n_with_xic = sum(1 for fd in feature_data.values() if fd["best_xic_rt"] is not None)
-    logger.info(f"  {n_with_xic}/{len(unique_mzs)} features have XIC signal (searched charges {xic_charges})")
-
-    # --- Per-candidate: only peptide-specific work ---
+    # Per-candidate computation
     logger.info(f"  Computing per-candidate evidence for {len(candidates_df)} candidates...")
-    evidence = {}
+    evidence: dict[int, dict[str, float]] = {}
     n_total = len(candidates_df)
 
-    # Use itertuples for speed
     peptides = candidates_df["peptide"].values
     feature_mzs = candidates_df["feature_mz"].values
-    n_C = candidates_df["n_C"].values if "n_C" in candidates_df.columns else None
+    has_comp = "n_C" in candidates_df.columns
+    if has_comp:
+        n_C_arr = candidates_df["n_C"].values
+        n_H_arr = candidates_df["n_H"].values
+        n_N_arr = candidates_df["n_N"].values
+        n_O_arr = candidates_df["n_O"].values
+        n_S_arr = candidates_df["n_S"].values
+
+    has_ms1 = len(lcms_data.ms1_rts) > 0
+
+    # Cache peptide → nearest MS1 scan index (same peptide → same DeepLC RT → same scan)
+    peptide_scan_cache: dict[str, int] = {}
 
     for i in range(n_total):
         if (i + 1) % 50000 == 0:
@@ -870,22 +905,27 @@ def compute_all_lcms_evidence(
 
         mz = feature_mzs[i]
         peptide = peptides[i]
-        fd = feature_data[mz]
+        ms2_scan_indices = feature_ms2_scans[mz]
 
-        result = {
-            "lcms_xic_max_intensity": fd["lcms_xic_max_intensity"],
-            "lcms_xic_n_scans": fd["lcms_xic_n_scans"],
-            "lcms_xic_snr": fd["lcms_xic_snr"],
-            "lcms_xic_best_charge": fd["best_xic_charge"],
-            "lcms_ms2_n_matches": len(fd["ms2_scan_indices"]),
+        result: dict[str, float] = {
+            "lcms_ms2_n_matches": float(len(ms2_scan_indices)),
             "lcms_ms2_spectral_angle": 0.0,
-            "lcms_rt_residual": np.nan,
+            "lcms_ms1_intensity": 0.0,
+            "lcms_ms1_snr": 0.0,
             "lcms_ms1_isotope_cosine": np.nan,
+            "theo_m1_ratio_diff_lcms": np.nan,
+            "theo_m2_ratio_diff_lcms": np.nan,
+            "isotope_envelope_cosine": np.nan,
+            "isotope_envelope_pearson": np.nan,
+            "isotope_envelope_mse": np.nan,
+            "isotope_m1_ratio_diff": np.nan,
+            "isotope_m2_ratio_diff": np.nan,
+            "isotope_n_matched": 0.0,
         }
 
-        # Spectral angle (peptide-specific: depends on MS2PIP prediction)
+        # --- MS2 spectral angle ---
         best_angle = 0.0
-        for scan_idx in fd["ms2_scan_indices"]:
+        for scan_idx in ms2_scan_indices:
             scan_charge = int(lcms_data.ms2_precursor_charge[scan_idx])
             pred = ms2pip_cache.get((peptide, scan_charge))
             if pred is None:
@@ -900,31 +940,112 @@ def compute_all_lcms_evidence(
                 best_angle = angle
         result["lcms_ms2_spectral_angle"] = best_angle
 
-        # RT residual (peptide-specific)
-        if fd["best_xic_rt"] is not None and deeplc_cache is not None:
-            predicted_rt = deeplc_cache.get(peptide)
-            if predicted_rt is not None:
-                result["lcms_rt_residual"] = float(abs(predicted_rt - fd["best_xic_rt"]))
+        # --- DeepLC-anchored MS1 features ---
+        if deeplc_cache is None or not has_ms1:
+            evidence[candidates_df.index[i]] = result
+            continue
 
-        # MS1 isotope cosine (peptide-specific: depends on composition)
-        # Use the charge and m/z at which the best XIC was found
-        if fd["best_ms1_idx"] is not None and n_C is not None:
-            observed_env = _extract_ms1_envelope(
-                fd["best_xic_mz"], fd["best_ms1_idx"], lcms_data,
-                charge=fd["best_xic_charge"], n_peaks=3,
-            )
-            if observed_env.sum() > 0:
-                nc, nh, nn, no_val, ns = (
-                    int(n_C[i]),
-                    int(candidates_df["n_H"].values[i]),
-                    int(candidates_df["n_N"].values[i]),
-                    int(candidates_df["n_O"].values[i]),
-                    int(candidates_df["n_S"].values[i]),
+        predicted_rt = deeplc_cache.get(peptide)
+        if predicted_rt is None:
+            evidence[candidates_df.index[i]] = result
+            continue
+
+        # MS1 scan selection (cached per peptide: same sequence → same predicted RT)
+        if peptide not in peptide_scan_cache:
+            if rt_window_min > 0:
+                mask = np.abs(lcms_data.ms1_rts - predicted_rt) <= rt_window_min
+                idxs = np.where(mask)[0]
+                if len(idxs) == 0:
+                    idxs = np.array([int(np.argmin(np.abs(lcms_data.ms1_rts - predicted_rt)))])
+            else:
+                idxs = np.array([int(np.argmin(np.abs(lcms_data.ms1_rts - predicted_rt)))])
+            peptide_scan_cache[peptide] = idxs
+        scan_indices = peptide_scan_cache[peptide]
+
+        # Signal: sum of peaks in ±ppm window across all selected scans
+        tol = mz * ppm_tolerance / 1e6
+        signal = 0.0
+        bg_chunks: list[np.ndarray] = []
+        for scan_idx in scan_indices:
+            mz_arr = lcms_data.ms1_mz_arrays[scan_idx]
+            int_arr = lcms_data.ms1_int_arrays[scan_idx]
+            sig_lo = np.searchsorted(mz_arr, mz - tol, side="left")
+            sig_hi = np.searchsorted(mz_arr, mz + tol, side="right")
+            if sig_lo < sig_hi:
+                signal += float(int_arr[sig_lo:sig_hi].sum())
+            bg_tol = mz * 500.0 / 1e6
+            bg_lo = np.searchsorted(mz_arr, mz - bg_tol, side="left")
+            bg_hi = np.searchsorted(mz_arr, mz + bg_tol, side="right")
+            if sig_lo > bg_lo or sig_hi < bg_hi:
+                bg_chunks.append(np.concatenate([int_arr[bg_lo:sig_lo], int_arr[sig_hi:bg_hi]]))
+
+        result["lcms_ms1_intensity"] = float(np.log1p(signal))
+
+        # SNR: median of non-zero background peaks across all selected scans
+        if signal > 0 and bg_chunks:
+            bg_vals = np.concatenate(bg_chunks)
+            bg_nonzero = bg_vals[bg_vals > 0]
+            if len(bg_nonzero) > 0:
+                background = float(np.median(bg_nonzero))
+                if background > 0:
+                    result["lcms_ms1_snr"] = float(np.log10(signal / background))
+
+        # Isotope envelope: accumulate raw counts across selected scans, then normalize
+        if not has_comp:
+            evidence[candidates_df.index[i]] = result
+            continue
+
+        raw_env = np.zeros(3)
+        for scan_idx in scan_indices:
+            raw_env += _extract_ms1_envelope(mz, scan_idx, lcms_data, charge=1, n_peaks=3, normalize=False)
+        env_total = raw_env.sum()
+        env = raw_env / env_total if env_total > 0 else raw_env
+        if env.sum() > 0:
+            nc = int(n_C_arr[i]); nh = int(n_H_arr[i]); nn = int(n_N_arr[i])
+            no_val = int(n_O_arr[i]); ns = int(n_S_arr[i])
+            theo_env = theoretical_isotope_distribution(nc, nh, nn, no_val, ns, n_peaks=3)
+
+            result["lcms_ms1_isotope_cosine"] = float(cosine_similarity(env, theo_env))
+            if theo_env[0] > 0 and env[0] > 0:
+                result["theo_m1_ratio_diff_lcms"] = float(
+                    abs(env[1] / env[0] - theo_env[1] / theo_env[0])
                 )
-                theo_env = theoretical_isotope_distribution(nc, nh, nn, no_val, ns, n_peaks=3)
-                result["lcms_ms1_isotope_cosine"] = float(
-                    cosine_similarity(observed_env, theo_env)
+                result["theo_m2_ratio_diff_lcms"] = float(
+                    abs(env[2] / env[0] - theo_env[2] / theo_env[0])
                 )
+
+            # MALDI vs LC-MS/MS envelope comparison (if MALDI envelopes available)
+            if maldi_envelopes is not None:
+                maldi_env = maldi_envelopes.get(mz)
+                if maldi_env is not None:
+                    k = min(len(maldi_env), len(env))
+                    if k >= 2:
+                        a = np.array(maldi_env[:k], dtype=np.float64)
+                        b = env[:k].astype(np.float64)
+                        matched = int(np.sum((a > 0) & (b > 0)))
+                        result["isotope_n_matched"] = float(matched)
+                        na_norm = np.linalg.norm(a)
+                        nb_norm = np.linalg.norm(b)
+                        if na_norm > 0 and nb_norm > 0:
+                            result["isotope_envelope_cosine"] = float(
+                                np.dot(a, b) / (na_norm * nb_norm)
+                            )
+                        # Pearson r (numpy, no scipy dependency)
+                        a_c = a - a.mean(); b_c = b - b.mean()
+                        denom = np.sqrt((a_c**2).sum() * (b_c**2).sum())
+                        if denom > 0:
+                            result["isotope_envelope_pearson"] = float(
+                                np.dot(a_c, b_c) / denom
+                            )
+                        result["isotope_envelope_mse"] = float(np.mean((a - b) ** 2))
+                        if a[0] > 0 and b[0] > 0:
+                            result["isotope_m1_ratio_diff"] = float(
+                                abs(a[1] / a[0] - b[1] / b[0])
+                            )
+                            if k >= 3:
+                                result["isotope_m2_ratio_diff"] = float(
+                                    abs(a[2] / a[0] - b[2] / b[0])
+                                )
 
         evidence[candidates_df.index[i]] = result
 

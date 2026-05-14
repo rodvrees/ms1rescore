@@ -34,15 +34,13 @@ fn extract_xic_single(
         let hi = upper_bound(mz_arr, hi_mz);
 
         if lo < hi {
-            // Find the highest intensity peak within tolerance
-            let mut best_int = f64::NEG_INFINITY;
-            for i in lo..hi {
-                if int_arr[i] > best_int {
-                    best_int = int_arr[i];
-                }
-            }
+            // Sum all peaks in the window: accumulates signal across ion mobility scans
+            // (timsTOF frames contain multiple mobility scans at the same m/z after
+            // sorting; summing gives the conventional 2-D LC-MS projection). For
+            // mzML centroid data this equals the single peak intensity.
+            let total: f64 = int_arr[lo..hi].iter().sum();
             rts.push(ms1_rts[scan_idx]);
-            intensities.push(best_int);
+            intensities.push(total);
         }
     }
 

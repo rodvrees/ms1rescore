@@ -72,9 +72,11 @@ Every function that computes features must be blind to `is_decoy`. The symmetry 
 
 MALDI features are detected as [M+H]+ (charge 1). LC-MS/MS MS2 scans are acquired at charge 2, 3, etc. Matching is done by comparing **neutral masses** (`maldi_mz - PROTON` vs `ms2_precursor_mz * charge - charge * PROTON`), not m/z values directly. Matching on m/z alone gives ~88/1398 features with MS2 scans; neutral mass matching gives ~1067/1398.
 
-### 4. Multi-charge XIC extraction
+### 4. DeepLC-anchored MS1 features (fully symmetric)
 
-XICs in LC-MS/MS are extracted at charges 1, 2, 3, 4 for each MALDI feature's neutral mass. The charge producing the highest XIC peak intensity is selected as the "best charge" and stored as a feature (`lcms_xic_best_charge`). Without multi-charge search, only ~595/1398 features have detectable XICs; with it, ~1085/1398 do.
+LC-MS/MS MS1 features are computed using the DeepLC predicted retention time as the anchor for each candidate. For each candidate (target or decoy), the DeepLC RT prediction is used to locate the nearest MS1 scan, and signal, SNR, and isotope envelope features are extracted at that scan. This is fully symmetric: targets and decoys receive identical treatment because DeepLC predictions do not depend on `is_decoy`. No XIC extraction is performed.
+
+**Why not XICs:** XIC extraction is inappropriate for DDA LC-MS/MS data (a peptide may appear in only one or a few MS2 events, and XIC apex selection is unreliable). Using the search engine's identified RT (MS2 scan RT) as the anchor would break TDC symmetry (decoys would never have an identified RT). DeepLC predicted RT is the only symmetric, model-based RT anchor available for all candidates.
 
 ---
 
@@ -303,21 +305,37 @@ Holds all MS1 and MS2 scan data loaded from mzML or Bruker `.d` files. Lazily co
 | `_find_matching_ms2_scans(neutral_mass, lcms_data, ppm)` | Binary search over MS2 neutral masses |
 | `get_ms2pip_predictions(pairs, model, cache_path)` | Batch MS2PIP predictions for `(peptide, charge)` pairs. Import: `from ms2pip.core import predict_batch` |
 | `finetune_deeplc(msf_path, cache_path)` | Fine-tune DeepLC on PD TargetPsms (q≤0.01) |
+| `finetune_deeplc_from_df(rt_df, cache_path)` | Fine-tune DeepLC from a DataFrame with `sequence`/`rt_mean` columns (minutes); used for FragPipe input |
 | `get_deeplc_predictions(peptides, model, cache_path)` | Batch DeepLC RT predictions |
-| `extract_all_xics(unique_mzs, lcms_data, ppm)` | Multi-charge XIC extraction; uses Rust if available |
+| `extract_all_xics(unique_mzs, lcms_data, ppm)` | XIC extraction utility (available but not used in the main pipeline) |
 | `compute_all_lcms_evidence(candidates_df, ...)` | Main entry point: returns dict mapping candidate index → feature dict |
 
 #### `compute_all_lcms_evidence` structure
 
-Restructured to be **feature-first**, not candidate-first:
-1. Pre-compute per MALDI feature (1,398 iterations, not 707K):
+**DeepLC-anchored, fully symmetric.** No XIC extraction. All MS1 features are computed at the nearest MS1 scan to the DeepLC predicted RT.
+
+1. Pre-compute per MALDI feature (1,398 iterations):
    - Matching MS2 scan indices (by neutral mass)
-   - XIC at charges 1-4; select best charge; store `best_xic_mz`, `best_ms1_idx`
-   - XIC features: `xic_max_intensity`, `xic_n_scans`, `xic_snr`
-2. Per-candidate loop (707K iterations): only peptide-specific computations:
+2. Per-candidate loop (707K iterations): all peptide-specific computations:
    - Spectral angle vs MS2PIP prediction (peptide+charge specific)
-   - RT residual (peptide-specific DeepLC prediction)
-   - MS1 isotope cosine at best XIC scan
+   - DeepLC predicted RT → nearest MS1 scan (cached per unique peptide sequence)
+   - `lcms_ms1_intensity`: log1p of summed signal in ±ppm window at precursor m/z
+   - `lcms_ms1_snr`: log10(signal / median background) where background = median of non-zero peaks in ±500 ppm window excluding signal window
+   - Isotope envelope [M0, M+1, M+2] from `_extract_ms1_envelope` at charge 1
+   - `lcms_ms1_isotope_cosine`: cosine similarity of observed vs theoretical envelope
+   - `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`: |obs_ratio − theo_ratio| for M+1/M0 and M+2/M0
+   - If `maldi_envelopes` provided: MALDI vs LC-MS/MS envelope comparison → `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff`, `isotope_n_matched`
+
+**Signature:**
+```python
+compute_all_lcms_evidence(
+    candidates_df, lcms_data, ms2pip_cache,
+    deeplc_cache=None,     # peptide → predicted RT (minutes)
+    maldi_envelopes=None,  # feature_mz → normalized envelope array
+    ppm_tolerance=20.0,
+    fragment_tol_da=0.02,
+) -> dict[int, dict[str, float]]
+```
 
 #### DeepLC finetuning SQL
 
@@ -402,7 +420,6 @@ from ms1rescore.feature_generator import (
 - Theoretical isotope: `theo_isotope_cosine`, `theo_isotope_chi2`, `theo_isotope_kl`, `theo_has_sulfur`, `averagine_deviation`, `averagine_deviation_sulfur`, `theo_m1_ratio_diff`, `theo_m2_ratio_diff`
 - Ionization priors: `n_arginine`, `n_basic_residues`, `n_phenylalanine`, `n_aromatic`, `gravy_score`, `charge_proxy`
 - Spatial (optional): `spatial_autocorrelation`, `fraction_detected`, `intensity_cv`, `log_mean_intensity`, `spatial_entropy`
-- Observed isotope envelope (optional): `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff`, `isotope_n_matched`
 
 **`PROTEIN_LEVEL_FEATURES`** — excluded from the ranker by default; opt-in via `--use-protein-level-feats`:
 - Protein consistency: `protein_n_features`, `log_protein_n_features`, `protein_coverage`, `protein_rank`, `protein_best_ratio`
@@ -410,13 +427,19 @@ from ms1rescore.feature_generator import (
 
 **Why excluded by default:** these features aggregate counts and correlations over all candidates sharing a protein, including decoys. A decoy peptide whose protein happens to have many target matches inherits artificially high `protein_n_features` / colocalization values. This breaks TDC null-model symmetry. Use `--use-protein-level-feats` only if you understand and accept this trade-off.
 
-**`LCMS_PRIOR_FEATURES`** — two sub-groups, both excluded from the ranker:
+**`LCMS_PRIOR_FEATURES`** — excluded from the ranker, applied as a multiplicative prior after scoring. All features are derived symmetrically from raw mzML (no search engine scores):
 
-*mzML-derived* (`_LCMS_MZML_FEATURES`): `lcms_ms2_spectral_angle`, `lcms_ms2_n_matches`, `lcms_xic_max_intensity`, `lcms_xic_n_scans`, `lcms_xic_snr`, `lcms_xic_best_charge`, `lcms_rt_residual`, `lcms_ms1_isotope_cosine`, `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`
+*mzML-derived* (`_LCMS_MZML_FEATURES`):
+- MS2: `lcms_ms2_spectral_angle`, `lcms_ms2_n_matches`
+- DeepLC-anchored MS1 signal: `lcms_ms1_intensity`, `lcms_ms1_snr`
+- DeepLC-anchored MS1 isotope: `lcms_ms1_isotope_cosine`, `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`
+- MALDI vs LC-MS/MS envelope similarity (requires `maldi_envelopes`): `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff`, `isotope_n_matched`
 
-*ID-derived* (`_LCMS_ID_FEATURES`, Strategy C only): `lcms_q_value`, `lcms_pep`, `lcms_score`, `n_psms`, `lcms_intensity`, `source_lcms_confirmed`
+*CCS-derived* (`_LCMS_CCS_FEATURES`, optional): `lcms_ccs_delta`, `lcms_ccs_abs_pct`
 
-**Design rationale:** LC-MS/MS features are explicitly excluded from the ranker/SVM training set. Passing them to the model would cause it to score LC-MS/MS identification quality rather than MALDI match quality. Instead, LC-MS/MS evidence is applied as a multiplicative Bayesian prior *after* MALDI-intrinsic scoring (see `compute_lcms_prior()` in `pipeline.py`). `source_lcms_confirmed` receives 2× weight in the prior because a direct LC-MS/MS identification is very strong evidence. `lcms_q_value` and `lcms_pep` are inverted (1 − value) before normalization since lower values indicate stronger evidence.
+Note: `_LCMS_ID_FEATURES` (`lcms_q_value`, `lcms_pep`, `lcms_score`, `n_psms`, `lcms_intensity`, `source_lcms_confirmed`) are still populated in the candidates DataFrame by Strategy C (Strategy C only) but are **not** included in `LCMS_PRIOR_FEATURES`. Using ID-derived features in the prior would give LC-MS/MS confirmed targets different treatment than decoys, breaking TDC symmetry.
+
+**Design rationale:** LC-MS/MS features are explicitly excluded from the ranker/SVM training set. Instead, LC-MS/MS evidence is applied as a multiplicative Bayesian prior *after* MALDI-intrinsic scoring (see `compute_lcms_prior()` in `pipeline.py`). `compute_lcms_prior` min-max normalizes each mzML feature and returns the column mean as a per-candidate weight.
 
 `get_feature_names()` returns `MALDI_INTRINSIC_FEATURES + LCMS_PRIOR_FEATURES` for backwards compatibility (optional groups included only when data was computed).
 
@@ -500,12 +523,11 @@ P12345  →  P12345
 1. Generate candidates (Strategy A or C) + match to MALDI features
 2. Load LC-MS/MS data
 3. Find MS2 matches by neutral mass; run MS2PIP only for `(peptide, charge)` pairs at features with observed MS2 scans
-4. DeepLC: optionally fine-tune on PD MSF, then predict RT for all unique peptides
-5. Compute LC-MS/MS evidence features
-6. Extract LC-MS/MS envelopes from XIC best scans (if MALDI envelopes provided)
-7. Compute all features
-8. Build PSMList + populate rescoring features
-9. Rescore using selected backend (see "Rescoring backends" below)
+4. DeepLC: optionally fine-tune on PD MSF or FragPipe RT table, then predict RT for all unique peptides
+5. Compute LC-MS/MS evidence features (DeepLC-anchored MS1 features; fully symmetric)
+6. Compute all features
+7. Build PSMList + populate rescoring features
+8. Rescore using selected backend (see "Rescoring backends" below)
 
 ### Two-pass scoring logic
 
@@ -581,10 +603,11 @@ pI values from Rust are bit-for-bit identical to the Python bisection implementa
 
 ```bash
 cd ms1rescore/ms1rescore-rs
-VIRTUAL_ENV=/home/robbe/.pyenv/versions/MSIscore maturin develop --release
+VIRTUAL_ENV=/home/robbe/.pyenv/versions/3.11.11/envs/MSIscore \
+  /home/robbe/.pyenv/versions/3.11.11/envs/MSIscore/bin/maturin develop --release
 ```
 
-**Important:** `maturin develop` must target the same Python environment as the Jupyter kernel. The notebook uses `/home/robbe/.pyenv/versions/MSIscore`. Using `maturin develop` without `VIRTUAL_ENV` will install into the wrong environment.
+**Important:** `maturin develop` must target the same Python environment as the Jupyter kernel. The MSIscore venv lives at `/home/robbe/.pyenv/versions/3.11.11/envs/MSIscore` (the symlink `/home/robbe/.pyenv/versions/MSIscore` also works for `VIRTUAL_ENV`, but call the venv's own `maturin` binary explicitly to avoid picking up the wrong interpreter). Without `VIRTUAL_ENV` and the correct binary, maturin installs into the base pyenv Python, not the venv.
 
 The Rust `target/` directory can be 1-2 GB. Delete it with `rm -rf ms1rescore/ms1rescore-rs/target/` if disk space is low (it is rebuilt on the next `maturin develop`).
 
@@ -640,5 +663,5 @@ With the human FASTA (~20K proteins) and 1,398 MALDI features at 20 ppm:
 - ~707K candidates (target + decoy)
 - ~542K unique peptides
 - ~1,067/1,398 features with MS2 matches
-- ~1,085/1,398 features with detectable XIC (multi-charge)
 - MS2PIP is run for ~683K unique (peptide, charge) pairs (only at features with observed MS2 scans)
+- DeepLC predictions run for all ~542K unique peptide sequences; each candidate is anchored to its peptide's nearest MS1 scan
