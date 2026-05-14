@@ -1,10 +1,15 @@
 - Move MSF parser to psm_utils
 - LC-MS/MS prior features should just be MS2Rescore features
-- Implement LDA
 - cleanup: classes of scoring algos? with a base class?
 - log_mean_intensity and spatial_entropy are empty?
-- Color the R1 winners in the CCS correlation plot
-- Finetuning/calibration correct?
 - Set right MS2PIP model, currently using HCD
 - New release of psm_utils
-- Check: why are MS2 scans found in only-MS1 data?
+- Implement JSON config structure like in MS2Rescore
+- Priority:
+    1. Check features that are deemed to be important:
+        - CHCA stuff
+        - Monoisotope confidence
+        - Isotope envelope (altough it looks okay)
+    2. Check some stuff that looks off:
+        - RT residual
+        - log_mean_intensity and spatial_entropy

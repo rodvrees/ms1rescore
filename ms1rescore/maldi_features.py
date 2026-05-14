@@ -787,7 +787,7 @@ def _finetune_and_predict(
     with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as tmp:
         model_path = tmp.name
 
-    finetuned_model = _im2deep_finetune(cal_psm_list, model_save_path=model_path)
+    finetuned_model = _im2deep_finetune(cal_psm_list, model_save_path=model_path, epochs=20)
     logger.info(
         f"  IM2Deep transfer learning on {n_cal} unique peptides "
         f"({n_cal_rows} single-candidate features): model saved to {model_path}"
@@ -798,7 +798,7 @@ def _finetune_and_predict(
         PSM(peptidoform=Peptidoform(f"{seq}/1"), precursor_charge=1, spectrum_id=seq)
         for seq in unique_seqs
     ]
-    preds = _predict(PSMList(psm_list=all_psms), model=finetuned_model)
+    preds = _predict(PSMList(psm_list=all_psms), model=model_path)
     preds_arr = np.asarray(preds).flatten()
     ft_pred_dict = {seq: float(preds_arr[i]) for i, seq in enumerate(unique_seqs)}
     return df["peptide"].map(ft_pred_dict).values.astype(float)

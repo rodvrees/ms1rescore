@@ -784,6 +784,7 @@ def plot_feature_distributions(
     result_df: pd.DataFrame,
     out_dir: str,
     feature_names: list[str] | None = None,
+    gt_peptides: list[str] | None = None,
 ) -> None:
     """
     Per-feature target/decoy distribution figures.
@@ -793,8 +794,8 @@ def plot_feature_distributions(
       Bottom — round-2 candidates (is_tdc_winner == True)
 
     Overlapping histograms are drawn in steelblue (target) and tomato (decoy)
-    with dashed median lines.  Bins are aligned between the two subplots using
-    the 1st–99th percentile range of the combined all-candidate values.
+    with dashed median lines.  When ``gt_peptides`` is provided, a solid green
+    vertical line is drawn at each GT candidate's value on both subplots.
 
     Files: ``{out_dir}/{feature_name}.png``
     """
@@ -815,6 +816,11 @@ def plot_feature_distributions(
     decoy_mask = is_decoy
     winner_target_mask = is_winner & target_mask
     winner_decoy_mask = is_winner & decoy_mask
+
+    gt_mask = np.zeros(len(feat), dtype=bool)
+    if gt_peptides and "peptide" in feat.columns:
+        gt_set = set(gt_peptides)
+        gt_mask = target_mask & feat["peptide"].isin(gt_set).values
 
     if feature_names is None:
         feature_names = [
@@ -843,6 +849,15 @@ def plot_feature_distributions(
         ax.set_ylabel("Density", fontsize=8)
         ax.tick_params(labelsize=7)
 
+    def _draw_gt(ax: plt.Axes, gt_vals: np.ndarray) -> None:
+        for i, v in enumerate(gt_vals):
+            ax.axvline(
+                v, color="limegreen", lw=1.5, ls="-.", alpha=0.85,
+                label=f"GT (n={len(gt_vals)})" if i == 0 else "_nolegend_",
+            )
+        if len(gt_vals) > 0:
+            ax.legend(fontsize=7)
+
     for feat_col in feature_names:
         col = feat.get(feat_col)
         if col is None:
@@ -854,6 +869,7 @@ def plot_feature_distributions(
         d_all = vals[decoy_mask & finite_mask]
         t_r2 = vals[winner_target_mask & finite_mask]
         d_r2 = vals[winner_decoy_mask & finite_mask]
+        gt_vals = vals[gt_mask & finite_mask]
 
         all_finite = vals[finite_mask]
         if len(all_finite) == 0:
@@ -875,6 +891,9 @@ def plot_feature_distributions(
         _draw(ax_bot, t_r2, d_r2, bins,
               f"Round-2 candidates  (T={len(t_r2)}, D={len(d_r2)})")
 
+        _draw_gt(ax_top, gt_vals)
+        _draw_gt(ax_bot, gt_vals)
+
         ax_bot.set_xlabel(feat_col, fontsize=8)
         plt.tight_layout()
         fig.savefig(
@@ -894,6 +913,7 @@ def plot_ccs_scatter(
     result_df: pd.DataFrame,
     out_dir: str,
     fdr_threshold: float = 0.01,
+    gt_peptides: list[str] | None = None,
 ) -> None:
     """
     Scatter plot of observed vs predicted CCS for all candidates.
@@ -974,6 +994,21 @@ def plot_ccs_scatter(
         label=f"Decoy (FDR ≤ {fdr_threshold:.0%})", zorder=5,
     )
 
+    # GT peptide overlay
+    if gt_peptides:
+        gt_set = set(gt_peptides)
+        pep_col = feat.get("peptide", pd.Series(dtype=str)).values
+        gt_mask = np.array([p in gt_set for p in pep_col], dtype=bool) & valid
+        if gt_mask.any():
+            gt_pred = pred[gt_mask]
+            gt_obs = obs[gt_mask]
+            gt_names = pep_col[gt_mask]
+            ax.scatter(
+                gt_pred, gt_obs,
+                s=150, marker="*", color="black", edgecolors="darkorange", linewidths=0.8,
+                zorder=10,
+            )
+
     # y = x reference line
     lo = min(float(pred_v.min()), float(obs_v.min()))
     hi = max(float(pred_v.max()), float(obs_v.max()))
@@ -1007,6 +1042,83 @@ def plot_ccs_scatter(
 
 
 # ---------------------------------------------------------------------------
+# Ground-truth helpers
+# ---------------------------------------------------------------------------
+
+def _make_gt_subset(
+    gt_peptides: list[str],
+    features_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+) -> tuple["pd.DataFrame | None", list[str]]:
+    """
+    Build a subset DataFrame for GT peptides, parallel to _sample_subset output.
+
+    Returns (gt_subset, not_found) where not_found lists GT peptides absent from
+    features_df entirely.
+    """
+    feat = features_df.reset_index(drop=True)
+    res = result_df.reset_index(drop=True)
+
+    peptide_vals = feat.get("peptide", pd.Series(dtype=str)).values
+    gt_set = set(gt_peptides)
+    not_found = [p for p in gt_peptides if p not in peptide_vals]
+
+    matched_idx = [i for i, p in enumerate(peptide_vals) if p in gt_set]
+    if not matched_idx:
+        return None, list(gt_set)
+
+    subset = feat.iloc[matched_idx].copy().reset_index(drop=True)
+    subset["_group"] = "GT"
+    is_dec = (
+        subset.get("is_decoy", pd.Series(False, index=subset.index))
+        .fillna(False).astype(bool).values
+    )
+    subset["_td"] = np.where(is_dec, "D", "T")
+
+    score_r1_cols = [c for c in result_df.columns if c.endswith("_score_r1")]
+    score_r2_cols = [c for c in result_df.columns if c.endswith("_score_r2")]
+    display_cols = score_r1_cols + score_r2_cols + [
+        c for c in ["q_value", "is_tdc_winner", "reweighted_score", "reweighted_q_value"]
+        if c in result_df.columns
+    ]
+    res_matched = res.iloc[matched_idx][display_cols].reset_index(drop=True)
+    for col in display_cols:
+        subset[col] = res_matched[col].values
+
+    if score_r1_cols:
+        subset["_score_r1"] = subset[score_r1_cols[0]]
+    else:
+        subset["_score_r1"] = np.nan
+
+    subset["_rank"] = (
+        subset["_score_r1"]
+        .rank(ascending=False, method="min", na_option="bottom")
+        .astype(int)
+    )
+    subset["_total"] = len(feat)
+    return subset, not_found
+
+
+def _save_gt_not_found_figures(peptides: list[str], subdirs: list[str]) -> None:
+    """Save a 'not a candidate' placeholder figure for each unfound GT peptide."""
+    for sub in subdirs:
+        os.makedirs(sub, exist_ok=True)
+        for pep in peptides:
+            fig, ax = plt.subplots(figsize=(6, 2))
+            ax.text(
+                0.5, 0.5,
+                f"GT peptide '{pep}' is not a candidate",
+                ha="center", va="center", transform=ax.transAxes,
+                fontsize=12, color="gray",
+            )
+            ax.axis("off")
+            fig.suptitle(f"GT: {pep}", fontsize=10)
+            fname = f"GT_T_000_{_safe_fname(pep)}.png"
+            fig.savefig(os.path.join(sub, fname), dpi=80, bbox_inches="tight")
+            plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1025,6 +1137,7 @@ def save_debug_figures(
     debug_dir: str = "debug",
     n_subset: int = 50,
     seed: int = 42,
+    gt_peptides: list[str] | None = None,
 ) -> None:
     """
     Generate all debug figures and save them under ``debug_dir``.
@@ -1065,8 +1178,54 @@ def save_debug_figures(
 
     if ion_images is not None:
         try:
+            # Build a full (unsampled) set of FDR ≤ 1% winners for ion images.
+            feat_aligned = features_df.reset_index(drop=True)
+            res_aligned = result_df.reset_index(drop=True)
+            _is_winner = (
+                res_aligned.get("is_tdc_winner", pd.Series(False, index=res_aligned.index))
+                .fillna(False).astype(bool)
+            )
+            _rw_q = pd.to_numeric(
+                res_aligned.get("reweighted_q_value", pd.Series(float("nan"), index=res_aligned.index)),
+                errors="coerce",
+            )
+            _id_idx = np.where((_is_winner & (_rw_q <= 0.01)).values)[0].tolist()
+            _score_r1_cols = [c for c in result_df.columns if c.endswith("_score_r1")]
+            _display_cols = _score_r1_cols + [
+                c for c in ["q_value", "is_tdc_winner", "reweighted_score", "reweighted_q_value"]
+                if c in result_df.columns
+            ]
+            id_subset = feat_aligned.iloc[_id_idx].copy().reset_index(drop=True)
+            id_subset["_group"] = "ID"
+            _is_dec = (
+                id_subset.get("is_decoy", pd.Series(False, index=id_subset.index))
+                .fillna(False).astype(bool).values
+            )
+            id_subset["_td"] = np.where(_is_dec, "D", "T")
+            _res_id = res_aligned.iloc[_id_idx][_display_cols].reset_index(drop=True)
+            for _col in _display_cols:
+                id_subset[_col] = _res_id[_col].values
+            id_subset["_score_r1"] = id_subset[_score_r1_cols[0]] if _score_r1_cols else np.nan
+            id_subset["_rank"] = (
+                id_subset["_score_r1"]
+                .rank(ascending=False, method="min", na_option="bottom")
+                .astype(int)
+            )
+            id_subset["_total"] = len(feat_aligned)
+
+            # Combine: all ID rows + sampled R1/L rows from the existing subset.
+            subset_for_images = pd.concat(
+                [id_subset, subset[subset["_group"].isin(["R1", "L"])].copy()],
+                ignore_index=True,
+            )
+            logger.info(
+                "Ion image colocalization: %d FDR winners + %d R1/L sampled = %d total",
+                len(id_subset),
+                len(subset_for_images) - len(id_subset),
+                len(subset_for_images),
+            )
             plot_ion_image_colocalization(
-                subset, features_df, ion_images, ion_image_mzs,
+                subset_for_images, features_df, ion_images, ion_image_mzs,
                 out_dir=os.path.join(debug_dir, "ion_images"),
             )
             logger.info("Ion image colocalization figures saved to %s/ion_images/", debug_dir)
@@ -1096,6 +1255,7 @@ def save_debug_figures(
             features_df, result_df,
             out_dir=os.path.join(debug_dir, "feature_distributions"),
             feature_names=feature_names,
+            gt_peptides=gt_peptides,
         )
         logger.info("Feature distribution figures saved to %s/feature_distributions/", debug_dir)
     except Exception as exc:
@@ -1105,6 +1265,7 @@ def save_debug_figures(
         plot_ccs_scatter(
             features_df, result_df,
             out_dir=debug_dir,
+            gt_peptides=gt_peptides,
         )
         if "im2deep_observed_ccs" in features_df.columns:
             logger.info("CCS scatter saved to %s/ccs_scatter.png", debug_dir)
@@ -1122,3 +1283,49 @@ def save_debug_figures(
             logger.info("Feature importance figures saved to %s/feature_importance/", debug_dir)
         except Exception as exc:
             logger.warning("Feature importance figures failed: %s", exc)
+
+    # --- Ground-truth peptide figures ---
+    if gt_peptides:
+        try:
+            gt_subset, not_found = _make_gt_subset(gt_peptides, features_df, result_df)
+            if not_found:
+                _save_gt_not_found_figures(
+                    not_found,
+                    subdirs=[
+                        os.path.join(debug_dir, "features"),
+                        os.path.join(debug_dir, "isotope_envelopes"),
+                    ],
+                )
+                logger.info(
+                    "GT peptides not found as candidates (%d): %s",
+                    len(not_found), ", ".join(not_found),
+                )
+            if gt_subset is not None:
+                logger.info(
+                    "GT debug viz: %d rows for %d GT peptides",
+                    len(gt_subset), len(gt_peptides) - len(not_found),
+                )
+                try:
+                    plot_feature_diagnostics(
+                        gt_subset, features_df, ion_images, ion_image_mzs, maldi_envelopes,
+                        out_dir=os.path.join(debug_dir, "features"),
+                    )
+                except Exception as exc:
+                    logger.warning("GT feature diagnostic figures failed: %s", exc)
+                try:
+                    plot_isotope_envelope_figures(
+                        gt_subset, maldi_envelopes,
+                        out_dir=os.path.join(debug_dir, "isotope_envelopes"),
+                    )
+                except Exception as exc:
+                    logger.warning("GT isotope envelope figures failed: %s", exc)
+                if ion_images is not None:
+                    try:
+                        plot_ion_image_colocalization(
+                            gt_subset, features_df, ion_images, ion_image_mzs,
+                            out_dir=os.path.join(debug_dir, "ion_images"),
+                        )
+                    except Exception as exc:
+                        logger.warning("GT ion image figures failed: %s", exc)
+        except Exception as exc:
+            logger.warning("GT debug figures failed: %s", exc)

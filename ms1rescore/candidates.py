@@ -121,6 +121,7 @@ def digest_fasta(
 
     # Remove peptides with unknown amino acids (mass=0)
     df = df[df["mass"] > 0].reset_index(drop=True)
+    df["is_decoy"] = df["is_decoy"].astype(bool)
     logger.info(
         f"Digested {fasta_path}: {(~df['is_decoy']).sum()} target, "
         f"{df['is_decoy'].sum()} decoy peptides"
@@ -406,14 +407,55 @@ def digest_identified_proteins(
                 f"— adding as lcms_confirmed targets"
             )
             novel_rows = []
+
+            # Target rows (always the same)
             for seq in novel_seqs:
                 prot_row = lcms_pep_df[lcms_pep_df["sequence"] == seq].iloc[0]
                 prot = str(prot_row.get("protein", ""))
                 novel_rows.append((seq, prot, False))
-                # K/R-preserving peptide-level decoy
-                dec = _shuffle_protein(seq, random_state=42)
-                if dec != seq:
-                    novel_rows.append((dec, f"DECOY_{prot}", True))
+
+            if fasta_path is None:
+                # Concatenated pseudo-protein decoy strategy for LC-only mode.
+                # Per-peptide shuffle produces decoys with identical elemental
+                # composition to their target (same residue multiset, just reordered)
+                # — making isotope envelope features non-discriminative. By
+                # concatenating all target peptides into a pseudo-protein and
+                # shuffling at that level, non-K/R residues are redistributed
+                # across tryptic boundaries, breaking composition conservation.
+                sorted_seqs = sorted(novel_seqs)  # fixed order for reproducibility
+                pseudo_protein = "".join(sorted_seqs)
+                shuffled_pseudo = _shuffle_protein(pseudo_protein, random_state=42)
+                target_set = set(novel_seqs)
+                raw_decoys = list(parser.cleave(
+                    shuffled_pseudo,
+                    parser.expasy_rules.get(enzyme, enzyme),
+                    missed_cleavages=missed_cleavages,
+                ))
+                decoy_peptides = list(dict.fromkeys(
+                    p for p in raw_decoys
+                    if min_length <= len(p) <= max_length and p not in target_set
+                ))
+                n_targets = len(novel_seqs)
+                if len(decoy_peptides) < n_targets:
+                    logger.warning(
+                        "Concatenated pseudo-protein decoy digest produced %d decoys "
+                        "for %d target peptides — TDC ratio will be < 1:1. Consider "
+                        "increasing --missed-cleavages or --max-length.",
+                        len(decoy_peptides), n_targets,
+                    )
+                elif len(decoy_peptides) > n_targets:
+                    decoy_peptides = random.Random(42).sample(decoy_peptides, n_targets)
+                for dec in decoy_peptides:
+                    novel_rows.append((dec, "DECOY_concat", True))
+            else:
+                # Per-peptide K/R-preserving shuffle for novel sequences that are
+                # not reachable from the protein digest (Strategy C hybrid).
+                for seq in novel_seqs:
+                    prot_row = lcms_pep_df[lcms_pep_df["sequence"] == seq].iloc[0]
+                    prot = str(prot_row.get("protein", ""))
+                    dec = _shuffle_protein(seq, random_state=42)
+                    if dec != seq:
+                        novel_rows.append((dec, f"DECOY_{prot}", True))
 
             novel_df = pd.DataFrame(novel_rows, columns=["peptide", "protein", "is_decoy"])
             novel_df = novel_df.drop_duplicates(subset=["peptide", "is_decoy"])
@@ -453,6 +495,7 @@ def digest_identified_proteins(
                     novel_df[col] = novel_mass_df[col].values
 
             novel_df = novel_df[novel_df["mass"] > 0].reset_index(drop=True)
+            novel_df["is_decoy"] = novel_df["is_decoy"].astype(bool)
             novel_df.loc[~novel_df["is_decoy"], "source"] = "lcms_confirmed"
             novel_df.loc[novel_df["is_decoy"], "source"] = "decoy"
             df = pd.concat([df, novel_df], ignore_index=True)
@@ -468,6 +511,7 @@ def digest_identified_proteins(
                 df[new_col] = df["peptide"].map(ev[old_col])
 
     # --- Step 7: Wipe evidence for decoys (symmetric TDC requirement) ---
+    df["is_decoy"] = df["is_decoy"].astype(bool)
     decoy_mask = df["is_decoy"].values
     for new_col in _EV_COLS.values():
         df.loc[decoy_mask, new_col] = np.nan

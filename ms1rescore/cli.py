@@ -686,6 +686,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="INT",
         help="Random seed for debug candidate sampling (default 42).",
     )
+    rescore_grp.add_argument(
+        "--debug-gt",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to a plain-text file with one ground-truth peptide sequence per line. "
+            "If --verbose is set, debug figures are generated for each GT peptide "
+            "found among the candidates (prefixed GT_). Peptides absent from the "
+            "candidate set produce a 'not a candidate' placeholder figure. "
+            "Ignored when --verbose is not set."
+        ),
+    )
 
     # --- Strategy C: LC-MS/MS-guided candidates ---
     strat_c = parser.add_argument_group(
@@ -1043,6 +1055,16 @@ def main() -> None:
                     "CCS features will be skipped"
                 )
 
+    # --- Load GT peptides (only relevant when debug is enabled) ---
+    gt_peptides: list[str] | None = None
+    if args.verbose and args.debug_gt:
+        try:
+            with open(args.debug_gt) as _fh:
+                gt_peptides = [line.strip() for line in _fh if line.strip()]
+            logger.info("GT peptides loaded: %d from %s", len(gt_peptides), args.debug_gt)
+        except Exception as _exc:
+            logger.warning("Could not read --debug-gt file %s: %s", args.debug_gt, _exc)
+
     # --- Run pipeline ---
     from ms1rescore.pipeline import rescore
 
@@ -1082,6 +1104,7 @@ def main() -> None:
         observed_ccs_per_feature=observed_ccs,
         im2deep_calibration=args.im2deep_calibration,
         digest=args.digest,
+        gt_peptides=gt_peptides,
     )
 
     # --- Write results ---

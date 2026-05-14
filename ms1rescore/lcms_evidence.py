@@ -106,6 +106,11 @@ def load_lcms_data(
                     .get("scan", [{}])[0]
                     .get("scan start time", 0.0)
                 )
+                # pyteomics returns a unitfloat; normalize to minutes
+                if getattr(rt, "unit_info", "minute") == "second":
+                    rt = float(rt) / 60.0
+                else:
+                    rt = float(rt)
 
                 if ms_level == 1:
                     mz_arr = spectrum.get("m/z array", np.array([]))
@@ -212,7 +217,7 @@ def load_lcms_data_from_d(
         fd = tims[int(fid), :, :]
         if len(fd) == 0:
             continue
-        ms1_rts.append(tims.rt_values[fid])
+        ms1_rts.append(tims.rt_values[fid] / 60.0)  # alphatims rt_values is in seconds
         ms1_mz_arrays.append(fd["mz_values"].values.astype(np.float64))
         ms1_int_arrays.append(fd["intensity_values"].values.astype(np.float64))
 
@@ -238,7 +243,7 @@ def load_lcms_data_from_d(
             2,
         )[has_peaks].astype(int)
         parent_frame_ids = prec_df["Parent"].values.astype(int)[has_peaks]
-        ms2_precursor_rt = tims.rt_values[parent_frame_ids]
+        ms2_precursor_rt = tims.rt_values[parent_frame_ids] / 60.0  # alphatims rt_values is in seconds
 
         ms2_mz_arrays = [
             tims.mz_values[tof_indices[s:e]].astype(np.float64)

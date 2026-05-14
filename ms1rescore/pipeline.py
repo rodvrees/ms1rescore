@@ -310,7 +310,6 @@ def _rescore_lda(
     features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
     init_ppm_threshold: float,
-    init_isotope_threshold: float,
 ) -> np.ndarray:
     """
     Semi-supervised LDA on MALDI-intrinsic features.
@@ -318,6 +317,9 @@ def _rescore_lda(
     Pre-processing: ±inf replaced with NaN, then median imputation and
     StandardScaler inside a sklearn Pipeline.  Pseudo-label iteration
     follows the same structure as _rescore_catboost.
+
+    Seed positives: targets with ppm_error_abs < init_ppm_threshold OR
+    n_candidates == 1 (unambiguous feature-to-peptide assignment).
 
     Returns ``(scores, importances, feature_names_used)`` where ``scores`` is
     a 1-D array (higher = more likely correct), ``importances`` is
@@ -337,15 +339,13 @@ def _rescore_lda(
     is_decoy = df["is_decoy"].values.astype(bool)
     is_target = ~is_decoy
 
+    ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+    n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
     seed_mask = (
         is_target
         & (
-            df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
-            < init_ppm_threshold
-        )
-        & (
-            df.get("theo_isotope_cosine", pd.Series(0.0, index=df.index))
-            > init_isotope_threshold
+            (ppm_col < init_ppm_threshold)
+            | (n_cand_col == 1)
         )
     ).values
 
@@ -353,7 +353,6 @@ def _rescore_lda(
     logger.info(f"  LDA: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
     if n_seed == 0:
         logger.warning("  LDA: no seed positives — falling back to top-ppm init")
-        ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
         seed_mask = (is_target & (ppm_col < ppm_col[is_target].quantile(0.10))).values
 
     scores = np.zeros(len(df))
@@ -512,7 +511,7 @@ def rescore(
     max_length: int = 30,
     model: str = "svm",
     compute_generative: bool = True,
-    init_ppm_threshold: float = 2.0,
+    init_ppm_threshold: float = 5.0,
     init_isotope_threshold: float = 0.7,
     lcms_proteins_path: str | None = None,
     lcms_peptides_path: str | None = None,
@@ -531,6 +530,7 @@ def rescore(
     observed_ccs_per_feature: dict | None = None,
     im2deep_calibration: str = "linear",
     digest: bool = False,
+    gt_peptides: list[str] | None = None,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -997,6 +997,7 @@ def rescore(
                 maldi_envelopes=maldi_envelopes,
                 feature_names=intrinsic_present, model_name="generative",
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+                gt_peptides=gt_peptides,
             )
 
         return psm_list, result_df, feature_names
@@ -1125,6 +1126,7 @@ def rescore(
                 importances_r1=_imp_r1_svm, importances_r2=svm_imp_r2,
                 importance_names=svm_imp_names_r2 or _imp_names_r1_svm,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+                gt_peptides=gt_peptides,
             )
 
         return psm_list, result_df, feature_names
@@ -1220,6 +1222,7 @@ def rescore(
                 importances_r1=_imp_r1_cb, importances_r2=cb_imp_r2,
                 importance_names=cb_imp_names_r2 or _imp_names_cb,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+                gt_peptides=gt_peptides,
             )
 
         return psm_list, result_df, feature_names
@@ -1232,7 +1235,6 @@ def rescore(
             features_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
-            init_isotope_threshold=init_isotope_threshold,
         )
 
         # --- Per-feature winner selection ---
@@ -1247,7 +1249,6 @@ def rescore(
             winners_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
-            init_isotope_threshold=init_isotope_threshold,
         )
 
         # --- Standard TDC FDR on winners ---
@@ -1307,6 +1308,7 @@ def rescore(
                 importances_r1=_imp_r1_lda, importances_r2=lda_imp_r2,
                 importance_names=lda_imp_names_r2 or _imp_names_lda,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+                gt_peptides=gt_peptides,
             )
 
         return psm_list, result_df, feature_names

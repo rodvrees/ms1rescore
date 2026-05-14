@@ -29,10 +29,12 @@ ms1rescore/
 │   ├── pipeline.py             # End-to-end pipeline function
 │   └── tests/                  # Unit tests (pytest; testpaths configured in pyproject.toml)
 │       ├── fixtures/           # Static test fixtures (e.g. test_maldi.mgf)
+│       ├── test_candidates.py
 │       ├── test_deisotoping.py
 │       ├── test_evidence_score.py
 │       ├── test_isotope_distribution.py
 │       ├── test_lcms_ids.py
+│       ├── test_lda_backend.py
 │       └── test_maldi_extraction.py
 └── ms1rescore-rs/              # Rust extension (PyO3 + rayon)
     ├── Cargo.toml
@@ -438,13 +440,27 @@ The `source` column on the candidates DataFrame encodes the origin of each row:
 |---|---|
 | `"protein_digest"` | From in-silico digest of an identified protein; not directly observed in LC-MS/MS |
 | `"lcms_confirmed"` | Directly identified in LC-MS/MS at the specified FDR; also included in digest when protein is identified |
-| `"decoy"` | K/R-preserving shuffle of an identified protein, or peptide-level shuffle for novel confirmed sequences |
+| `"decoy"` | K/R-preserving shuffle of an identified protein (digest mode), or pseudo-protein concat decoy (LC-only mode) |
 
-Novel `"lcms_confirmed"` sequences (peptides passing FDR but whose parent protein is not in the FASTA, or not reachable by tryptic digestion at the chosen parameters) are added as targets. A K/R-preserving shuffle of the peptide sequence itself is used as their decoy.
+**Decoy generation — two sub-cases:**
+
+*With `--digest` (fasta_path not None):* Identified proteins are shuffled at the protein level (`_shuffle_protein`) and re-digested. Novel confirmed sequences not reachable from the digest get a per-peptide K/R-preserving shuffle as their decoy. `protein = "DECOY_{accession}"`.
+
+*Without `--digest` (fasta_path=None, LC-only mode):* All confirmed peptides are novel. Per-peptide shuffle would produce decoys with identical elemental composition (same residue multiset, just reordered) — making isotope envelope features (`theo_isotope_cosine`, `theo_isotope_chi2`) non-discriminative. Instead, the **concatenated pseudo-protein** strategy is used:
+1. All confirmed sequences are sorted and concatenated into a single pseudo-protein string.
+2. `_shuffle_protein(pseudo_protein, random_state=42)` redistributes non-K/R residues across the entire sequence.
+3. The shuffled pseudo-protein is digested with the same trypsin rules (same `missed_cleavages`, `min_length`, `max_length`).
+4. Exact matches with any target sequence are removed.
+5. If more decoys than targets: subsample to match (seeded). If fewer: warn about sub-1:1 TDC ratio.
+6. All decoys get `protein = "DECOY_concat"` and `source = "decoy"`.
+
+This ensures decoy peptides draw non-K/R residues from across the shuffled pool of all target peptides, breaking the isobaric property of per-peptide shuffle.
 
 LC-MS/MS evidence is joined onto target rows from `lcms_ids.peptides`; decoy rows always get `NaN`. The binary `source_lcms_confirmed` feature is computed in `compute_all_features()` and is 1.0 for any `"lcms_confirmed"` candidate.
 
 **Fallback:** if `digest_identified_proteins()` returns 0 rows (e.g. no FASTA proteins found), `rescore()` falls back to Strategy A with a warning.
+
+**`is_decoy` dtype:** Both `digest_fasta()` and `digest_identified_proteins()` enforce `df["is_decoy"] = df["is_decoy"].astype(bool)` before returning. This prevents pandas `object`-dtype booleans (which arise from `pd.concat` with empty DataFrames) from breaking `~df["is_decoy"]` boolean indexing downstream.
 
 ### `lcms_ids.py`
 
