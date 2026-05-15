@@ -52,26 +52,22 @@ class TestOutputShape:
 
 
 # ---------------------------------------------------------------------------
-# Full-spectrum normalization
+# Normalization (sum-to-1 over the truncated n_peaks)
 # ---------------------------------------------------------------------------
 
 
 class TestNormalization:
-    def test_sum_leq_one_for_truncated_peaks(self):
-        # Full-spectrum norm: values are normalized over all returned brainpy peaks,
-        # then truncated to n_peaks. The truncated sum is < 1 because M+3+ carry
-        # residual signal. Verify this is the case for a mid-mass peptide.
+    def test_sum_equals_one_for_truncated_peaks(self):
+        # Distribution is normalised sum-to-1 over the truncated n_peaks so that
+        # comparisons against sum-to-1 observed envelopes (chi², KL) are unbiased.
         dist = theoretical_isotope_distribution(*VHRIIR, n_peaks=3)
-        assert dist.sum() < 1.0
+        assert dist.sum() == pytest.approx(1.0, abs=1e-6)
 
-    def test_sum_close_to_one_for_small_molecule(self):
-        # GG is ~132 Da. M+3+ are negligible: sum of first 3 peaks ≈ 1.
+    def test_sum_equals_one_for_small_molecule(self):
         dist = theoretical_isotope_distribution(*GG, n_peaks=3)
-        assert dist.sum() == pytest.approx(1.0, abs=0.002)
+        assert dist.sum() == pytest.approx(1.0, abs=1e-6)
 
-    def test_sum_approaches_one_when_requesting_many_peaks(self):
-        # When n_peaks >= _NORM_NPEAKS, the normalization denominator equals the
-        # returned peaks, so the sum equals 1 exactly (up to float precision).
+    def test_sum_equals_one_for_many_peaks(self):
         dist = theoretical_isotope_distribution(*VHRIIR, n_peaks=6)
         assert dist.sum() == pytest.approx(1.0, abs=1e-6)
 
@@ -127,17 +123,17 @@ class TestPhysicalProperties:
 
 
 # ---------------------------------------------------------------------------
-# Known numerical values (brainpy 1.5.x, full-spectrum norm over 6 peaks)
+# Known numerical values (brainpy 1.5.x, normalised sum-to-1 over n_peaks=3)
 # ---------------------------------------------------------------------------
 
 
 class TestKnownValues:
     def test_vhriir_distribution(self):
-        # Verified empirically against brainpy 1.5.19.
+        # Verified empirically against brainpy 1.5.19 with sum-to-1 over 3 peaks.
         dist = theoretical_isotope_distribution(35, 64, 14, 7, 0, n_peaks=3)
-        assert dist[0] == pytest.approx(0.6364, abs=0.001)  # M0
-        assert dist[1] == pytest.approx(0.2798, abs=0.001)  # M+1
-        assert dist[2] == pytest.approx(0.0693, abs=0.001)  # M+2
+        assert dist[0] == pytest.approx(0.6457, abs=0.001)  # M0
+        assert dist[1] == pytest.approx(0.2839, abs=0.001)  # M+1
+        assert dist[2] == pytest.approx(0.0703, abs=0.001)  # M+2
 
     def test_brainpy_differs_from_poisson_approximation(self):
         # The Poisson approximation gives M+1 ≈ 0.294 for VHRIIR.
@@ -163,8 +159,10 @@ class TestCaching:
         dist4 = theoretical_isotope_distribution(*VHRIIR, n_peaks=4)
         assert len(dist3) == 3
         assert len(dist4) == 4
-        # First 3 values must agree
-        assert np.allclose(dist3[:3], dist4[:3])
+        # Each distribution is normalised sum-to-1 over its own n_peaks, so
+        # dist3 and dist4[:3] differ by a constant factor (dist4 puts some
+        # mass on M+3).  The relative shape is identical.
+        assert np.allclose(dist3, dist4[:3] / dist4[:3].sum())
 
     def test_numpy_int_and_python_int_give_same_result(self):
         nc, nh, nn, no_, ns = VHRIIR

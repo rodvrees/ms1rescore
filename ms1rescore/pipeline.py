@@ -290,6 +290,7 @@ def _rescore_lda(
     features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
     init_ppm_threshold: float,
+    seed_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Semi-supervised LDA on MALDI-intrinsic features.
@@ -298,8 +299,11 @@ def _rescore_lda(
     StandardScaler inside a sklearn Pipeline.  Pseudo-label iteration
     follows the same structure as _rescore_catboost.
 
-    Seed positives: targets with ppm_error_abs < init_ppm_threshold OR
-    n_candidates == 1 (unambiguous feature-to-peptide assignment).
+    Seed positives: if ``seed_mask`` is provided (a boolean array aligned to
+    ``features_df``) it is used directly as the initial positive set — intended
+    for Round-2 where the seed is inherited from Round-1 q-values.  Otherwise
+    targets with ppm_error_abs < init_ppm_threshold OR n_candidates == 1 are
+    used.
 
     Returns ``(scores, importances, feature_names_used)`` where ``scores`` is
     a 1-D array (higher = more likely correct), ``importances`` is
@@ -319,21 +323,22 @@ def _rescore_lda(
     is_decoy = df["is_decoy"].values.astype(bool)
     is_target = ~is_decoy
 
-    ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
-    n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
-    seed_mask = (
-        is_target
-        & (
-            (ppm_col < init_ppm_threshold)
-            | (n_cand_col == 1)
-        )
-    ).values
+    if seed_mask is None:
+        ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+        n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
+        seed_mask = (
+            is_target
+            & (
+                (ppm_col < init_ppm_threshold)
+                | (n_cand_col == 1)
+            )
+        ).values
+        if not seed_mask.any():
+            logger.warning("  LDA: no seed positives — falling back to top-ppm init")
+            seed_mask = (is_target & (ppm_col < ppm_col[is_target].quantile(0.10))).values
 
     n_seed = seed_mask.sum()
     logger.info(f"  LDA: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
-    if n_seed == 0:
-        logger.warning("  LDA: no seed positives — falling back to top-ppm init")
-        seed_mask = (is_target & (ppm_col < ppm_col[is_target].quantile(0.10))).values
 
     scores = np.zeros(len(df))
     prev_pos_size = -1
@@ -428,19 +433,21 @@ def _rescore_lda(
 
 def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     """
-    Compute per-candidate target-decoy q-values.
+    Compute per-candidate target-decoy q-values (Storey/Käll TDC).
 
-    Uses standard TDC: sort by descending score, compute cumulative
-    FDR = n_decoy / n_target at each position, then take the minimum
-    FDR seen at or below each score (q-value = rolling min from the bottom).
+    Sort by descending score with a stable sort, compute cumulative
+    FDR = (1 + n_decoy) / max(n_target, 1) at each position (the +1
+    correction is the standard Storey/Käll adjustment for small-N), then
+    take the minimum FDR seen at or below each score (rolling min from
+    the tail).
     """
-    order = np.argsort(-scores)
+    scores = np.asarray(scores)
+    is_decoy = np.asarray(is_decoy).astype(bool)
+    order = np.argsort(-scores, kind="stable")
     n_target_cum = np.cumsum(~is_decoy[order]).astype(float)
     n_decoy_cum = np.cumsum(is_decoy[order]).astype(float)
 
-    # Avoid division by zero
-    with np.errstate(invalid="ignore", divide="ignore"):
-        fdr = np.where(n_target_cum > 0, n_decoy_cum / n_target_cum, 1.0)
+    fdr = (n_decoy_cum + 1.0) / np.maximum(n_target_cum, 1.0)
 
     # q-value: minimum FDR at or below this score (monotone from the tail)
     qval_ordered = np.minimum.accumulate(fdr[::-1])[::-1]
@@ -481,6 +488,7 @@ def rescore(
     spatial_features: pd.DataFrame | None = None,
     ion_images: np.ndarray | None = None,
     ion_image_mzs: np.ndarray | None = None,
+    extra_ion_images: dict | None = None,
     maldi_envelopes: dict | None = None,
     msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
@@ -529,6 +537,11 @@ def rescore(
         MALDI ion images array, shape (n_features, height, width) (optional).
     ion_image_mzs
         m/z values corresponding to ion_images (optional).
+    extra_ion_images
+        Dict of ion images at shifted m/z positions for colocalization features (optional).
+        Keys: "m1", "m2" (isotopologue) and "na", "k", "chca" (adduct).
+        Each value has shape (n_features, H, W). When provided, Pearson r is computed
+        directly without requiring these peaks to be in the feature list.
     maldi_envelopes
         MALDI isotope envelopes: feature_mz → normalized envelope (optional).
     msf_path
@@ -859,6 +872,7 @@ def rescore(
         spatial_features=spatial_features,
         ion_images=ion_images,
         ion_image_mzs=ion_image_mzs,
+        extra_ion_images=extra_ion_images,
         maldi_envelopes=maldi_envelopes,
         observed_ccs_per_feature=observed_ccs_per_feature,
         im2deep_calibration=im2deep_calibration,
@@ -903,6 +917,31 @@ def rescore(
     lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
     spatial_present = [f for f in SPATIAL_PRIOR_FEATURES if f in features_df.columns]
 
+    # Log-transform heavy-tail features in place.  These features span 4+
+    # orders of magnitude on real data; after StandardScaler the few extreme
+    # values dominate and suppress discrimination from well-behaved features.
+    _HEAVY_TAIL_FEATURES = (
+        "chca_cluster_distance_ppm",
+        "theo_isotope_chi2",
+        "ppm_best_ratio",
+        "theo_m1_ratio_diff",
+        "theo_m2_ratio_diff",
+    )
+    for _f in _HEAVY_TAIL_FEATURES:
+        if _f in features_df.columns:
+            features_df[_f] = np.log1p(
+                np.clip(features_df[_f].values.astype(float), 0.0, None)
+            )
+
+    # Drop constant / near-constant features from the ranker input.  A column
+    # with one unique value contributes zero variance and only consumes a slot
+    # in the SVM grid search; in pathological CV folds it can also produce
+    # warnings.
+    _constant = [f for f in intrinsic_present if features_df[f].nunique(dropna=True) <= 1]
+    if _constant:
+        logger.info(f"  Dropping {len(_constant)} constant features from ranker: {_constant}")
+        intrinsic_present = [f for f in intrinsic_present if f not in _constant]
+
     # --- Generative-only backend: two-pass ---
     if model == "generative":
         from ms1rescore.probabilistic_scorer import (
@@ -933,7 +972,17 @@ def rescore(
         q2 = _tdc_qvalues(scores2, is_decoy_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
         spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
-        reweighted2 = scores2 * lcms_prior_w * spatial_prior_w
+        # Additive log-prior: rank-correct for arbitrary-sign scores.
+        # Multiplying a negative score by a prior in [0,1] would invert
+        # the ranking (a bad candidate with low prior becomes less negative,
+        # i.e. higher-ranked).  Adding log(prior) penalises low-prior
+        # candidates uniformly regardless of score sign.
+        _LOG_EPS = 1e-12
+        reweighted2 = (
+            scores2
+            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+        )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
         # Map back to full candidate table
@@ -1010,7 +1059,7 @@ def rescore(
     logger.info(f"Step 8: Running rescoring (model='{model}')...")
 
     if model == "svm":
-        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
+        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
 
         # --- Round 1: score all candidates ---
         populate_psm_features(psm_list, features_df, intrinsic_present)
@@ -1062,7 +1111,17 @@ def rescore(
         q2 = _tdc_qvalues(scores2, is_decoy_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
         spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
-        reweighted2 = scores2 * lcms_prior_w * spatial_prior_w
+        # Additive log-prior: rank-correct for arbitrary-sign scores.
+        # Multiplying a negative score by a prior in [0,1] would invert
+        # the ranking (a bad candidate with low prior becomes less negative,
+        # i.e. higher-ranked).  Adding log(prior) penalises low-prior
+        # candidates uniformly regardless of score sign.
+        _LOG_EPS = 1e-12
+        reweighted2 = (
+            scores2
+            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+        )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
         # --- Map back to full candidate table ---
@@ -1120,7 +1179,7 @@ def rescore(
         return psm_list, result_df, feature_names
 
     elif model == "catboost":
-        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
+        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
 
         # --- Round 1: score all candidates ---
         scores1, _imp_r1_cb, _imp_names_cb = _rescore_catboost(
@@ -1158,7 +1217,17 @@ def rescore(
         q2 = _tdc_qvalues(scores2, is_decoy_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
         spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
-        reweighted2 = scores2 * lcms_prior_w * spatial_prior_w
+        # Additive log-prior: rank-correct for arbitrary-sign scores.
+        # Multiplying a negative score by a prior in [0,1] would invert
+        # the ranking (a bad candidate with low prior becomes less negative,
+        # i.e. higher-ranked).  Adding log(prior) penalises low-prior
+        # candidates uniformly regardless of score sign.
+        _LOG_EPS = 1e-12
+        reweighted2 = (
+            scores2
+            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+        )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
         # --- Map back to full candidate table ---
@@ -1216,7 +1285,7 @@ def rescore(
         return psm_list, result_df, feature_names
 
     elif model == "lda":
-        feature_col = "feature_mz" if "feature_mz" in features_df.columns else "feature_idx"
+        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
 
         # --- Round 1: score all candidates ---
         scores1, _imp_r1_lda, _imp_names_lda = _rescore_lda(
@@ -1233,10 +1302,27 @@ def rescore(
         )
 
         # --- Round 2: retrain on winner subset ---
+        # Seed R2 from the top-20% of target winners by R1 score.  After winner
+        # selection the remaining target winners may have ppm > init_ppm_threshold
+        # (R1 lifted them on other features), so re-seeding from ppm alone would
+        # leave only a handful of seeds, causing the LDA to degenerate.  Using
+        # q-values from R1 has the same problem when R1 itself identified very few
+        # pseudo-positives.  A percentile cut on raw R1 scores is guaranteed to
+        # produce a reasonably sized seed regardless of how well R1 converged.
+        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+        target_scores_w = scores1[winner_pos][~is_decoy_w]
+        score_threshold = np.percentile(target_scores_w, 80)  # top 20% of targets
+        r2_seed_mask = (~is_decoy_w) & (scores1[winner_pos] >= score_threshold)
+        logger.info(
+            f"  LDA R2: seeding from top-20% R1 target scores "
+            f"(score ≥ {score_threshold:.3f}) → {r2_seed_mask.sum()} positives"
+        )
+
         scores2, lda_imp_r2, lda_imp_names_r2 = _rescore_lda(
             winners_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
+            seed_mask=r2_seed_mask,
         )
 
         # --- Standard TDC FDR on winners ---
@@ -1244,7 +1330,17 @@ def rescore(
         q2 = _tdc_qvalues(scores2, is_decoy_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
         spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
-        reweighted2 = scores2 * lcms_prior_w * spatial_prior_w
+        # Additive log-prior: rank-correct for arbitrary-sign scores.
+        # Multiplying a negative score by a prior in [0,1] would invert
+        # the ranking (a bad candidate with low prior becomes less negative,
+        # i.e. higher-ranked).  Adding log(prior) penalises low-prior
+        # candidates uniformly regardless of score sign.
+        _LOG_EPS = 1e-12
+        reweighted2 = (
+            scores2
+            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+        )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
         # --- Map back to full candidate table ---

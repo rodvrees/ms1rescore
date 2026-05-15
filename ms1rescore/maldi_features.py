@@ -1017,19 +1017,36 @@ def compute_peptide_property_features(df: pd.DataFrame) -> pd.DataFrame:
 # E1 — Isotopologue spatial co-localization
 # ---------------------------------------------------------------------------
 
+def _pearson_r_pairwise(images_a: np.ndarray, images_b: np.ndarray) -> np.ndarray:
+    """Per-feature Pearson r between corresponding images in two (N, H, W) arrays."""
+    n = len(images_a)
+    a = images_a.reshape(n, -1).astype(np.float32)
+    b = images_b.reshape(n, -1).astype(np.float32)
+    a -= a.mean(axis=1, keepdims=True)
+    b -= b.mean(axis=1, keepdims=True)
+    num = (a * b).sum(axis=1)
+    denom = np.sqrt((a * a).sum(axis=1)) * np.sqrt((b * b).sum(axis=1))
+    return np.where(denom > 1e-10, num / denom, np.nan).astype(np.float32)
+
+
 def compute_isotopologue_colocalization(
     df: pd.DataFrame,
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
     ppm_tolerance: float = 10.0,
     _corr_cache: tuple | None = None,
+    extra_ion_images: dict | None = None,
 ) -> pd.DataFrame:
     """
     Pearson r between the M0 ion image and the M+1 / M+2 ion images (E1).
 
-    Builds the full feature correlation matrix once via a single BLAS call,
-    then uses vectorized searchsorted to locate M+1/M+2 partners.  No per-
-    feature corrcoef calls or Python loops over features.
+    When ``extra_ion_images`` contains keys ``"m1"`` and ``"m2"``, Pearson r is
+    computed directly per feature without needing M+1/M+2 entries in the feature
+    list.  This is the normal path: MALDI feature lists contain only monoisotopic
+    M0 peaks, so M+1/M+2 images are pre-extracted at ``feature_mzs + NEUTRON``.
+
+    Without pre-extracted images the function falls back to searching for M+1/M+2
+    partners inside the feature list (works only when both M0 and M+1 are listed).
 
     Features added
     --------------
@@ -1043,13 +1060,32 @@ def compute_isotopologue_colocalization(
         corr_matrix, valid_mz_arr, mz_to_idx = _pearson_r_matrix(ion_images, ion_image_mzs)
     n_valid = len(valid_mz_arr)
 
-    # Vectorized partner lookup: all features at once
-    self_idx = np.arange(n_valid, dtype=np.intp)
-    m1_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + NEUTRON,         ppm_tolerance)
-    m2_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + 2.0 * NEUTRON,  ppm_tolerance)
+    m1_images = extra_ion_images.get("m1") if extra_ion_images else None
+    m2_images = extra_ion_images.get("m2") if extra_ion_images else None
 
-    r_m1_arr   = np.where(m1_idx >= 0, corr_matrix[self_idx, np.clip(m1_idx, 0, n_valid - 1)], np.nan)
-    r_m2_arr   = np.where(m2_idx >= 0, corr_matrix[self_idx, np.clip(m2_idx, 0, n_valid - 1)], np.nan)
+    if m1_images is not None and m2_images is not None:
+        # Direct per-feature Pearson r: no partner lookup needed.
+        mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+        valid_mask = ion_images.reshape(len(mz_arr), -1).std(axis=1) > 1e-10
+        r_m1_arr = _pearson_r_pairwise(ion_images[valid_mask], m1_images[valid_mask])
+        r_m2_arr = _pearson_r_pairwise(ion_images[valid_mask], m2_images[valid_mask])
+        n_m1_found = int(np.isfinite(r_m1_arr).sum())
+        logger.info(
+            f"Isotopologue colocalization (E1): direct images — "
+            f"{n_m1_found}/{n_valid} features with finite r(M0, M+1)"
+        )
+    else:
+        # Fallback: partner lookup inside the feature list.
+        self_idx = np.arange(n_valid, dtype=np.intp)
+        m1_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + NEUTRON, ppm_tolerance)
+        m2_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + 2.0 * NEUTRON, ppm_tolerance)
+        r_m1_arr = np.where(m1_idx >= 0, corr_matrix[self_idx, np.clip(m1_idx, 0, n_valid - 1)], np.nan)
+        r_m2_arr = np.where(m2_idx >= 0, corr_matrix[self_idx, np.clip(m2_idx, 0, n_valid - 1)], np.nan)
+        n_m1_found = int((m1_idx >= 0).sum())
+        logger.info(
+            f"Isotopologue colocalization (E1): {n_m1_found}/{n_valid} features with M+1 in feature list"
+        )
+
     import warnings
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -1068,8 +1104,6 @@ def compute_isotopologue_colocalization(
         valid = df[col].dropna()
         df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
 
-    n_m1 = int((m1_idx >= 0).sum())
-    logger.info(f"Isotopologue colocalization (E1): {n_m1}/{n_valid} features with M+1 image")
     return df
 
 
@@ -1083,12 +1117,18 @@ def compute_adduct_colocalization(
     ion_image_mzs: np.ndarray,
     ppm_tolerance: float = 10.0,
     _corr_cache: tuple | None = None,
+    extra_ion_images: dict | None = None,
 ) -> pd.DataFrame:
     """
     Pearson r between the M0 ion image and Na/K/CHCA adduct ion images (E2).
 
-    Builds the full feature correlation matrix once, then uses vectorized
-    searchsorted to locate adduct partners for all features simultaneously.
+    When ``extra_ion_images`` contains keys ``"na"``, ``"k"``, ``"chca"``, Pearson
+    r is computed directly per feature without needing adduct peaks in the feature
+    list.  This is the normal path: adduct peaks are typically absent from
+    monoisotopic-only feature lists.
+
+    Without pre-extracted images the function falls back to searching for adduct
+    partners inside the feature list.
 
     Features added
     --------------
@@ -1101,20 +1141,49 @@ def compute_adduct_colocalization(
     else:
         corr_matrix, valid_mz_arr, mz_to_idx = _pearson_r_matrix(ion_images, ion_image_mzs)
     n_valid = len(valid_mz_arr)
-    self_idx = np.arange(n_valid, dtype=np.intp)
 
-    for adduct_name, delta in _ADDUCT_DELTAS.items():
-        partner_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + delta, ppm_tolerance)
-        r_arr = np.where(
-            partner_idx >= 0,
-            corr_matrix[self_idx, np.clip(partner_idx, 0, n_valid - 1)],
-            np.nan,
+    if extra_ion_images and any(k in extra_ion_images for k in _ADDUCT_DELTAS):
+        # Direct per-feature Pearson r using pre-extracted adduct images.
+        mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+        valid_mask = ion_images.reshape(len(mz_arr), -1).std(axis=1) > 1e-10
+        m0_valid = ion_images[valid_mask]
+        for adduct_name in _ADDUCT_DELTAS:
+            adduct_imgs = extra_ion_images.get(adduct_name)
+            if adduct_imgs is not None:
+                r_arr = _pearson_r_pairwise(m0_valid, adduct_imgs[valid_mask])
+            else:
+                r_arr = np.full(n_valid, np.nan, dtype=np.float32)
+            mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
+            col = f"adduct_colocalization_{adduct_name}"
+            df[col] = df["feature_mz"].map(mapping)
+            valid_col = df[col].dropna()
+            df[col] = df[col].fillna(float(valid_col.median()) if len(valid_col) > 0 else 0.0)
+        logger.info(
+            f"Adduct colocalization (E2): direct images used for "
+            f"{[k for k in _ADDUCT_DELTAS if extra_ion_images.get(k) is not None]}"
         )
-        mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
-        col = f"adduct_colocalization_{adduct_name}"
-        df[col] = df["feature_mz"].map(mapping)
-        valid = df[col].dropna()
-        df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
+    else:
+        # Fallback: partner lookup inside the feature list.
+        self_idx = np.arange(n_valid, dtype=np.intp)
+        for adduct_name, delta in _ADDUCT_DELTAS.items():
+            partner_idx = _find_partner_indices(valid_mz_arr, valid_mz_arr + delta, ppm_tolerance)
+            r_arr = np.where(
+                partner_idx >= 0,
+                corr_matrix[self_idx, np.clip(partner_idx, 0, n_valid - 1)],
+                np.nan,
+            )
+            mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
+            col = f"adduct_colocalization_{adduct_name}"
+            df[col] = df["feature_mz"].map(mapping)
+            valid_col = df[col].dropna()
+            df[col] = df[col].fillna(float(valid_col.median()) if len(valid_col) > 0 else 0.0)
+        n_found = sum(
+            int((_find_partner_indices(valid_mz_arr, valid_mz_arr + d, ppm_tolerance) >= 0).sum())
+            for d in _ADDUCT_DELTAS.values()
+        )
+        logger.info(
+            f"Adduct colocalization (E2): {n_found} total adduct partners found in feature list"
+        )
 
     return df
 

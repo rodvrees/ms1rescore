@@ -1002,19 +1002,41 @@ def extract_maldi_data(
         ion_images = ion_images[detected_mask]
         spatial_df = spatial_df[detected_mask].reset_index(drop=True)
 
+    # Extract M+1, M+2, and adduct ion images for spatial colocalization features (E1/E2).
+    # These peaks are typically absent from the feature list (monoisotopic-only detection),
+    # so extracting images at their exact m/z positions is the only way to compute
+    # isotopologue and adduct colocalization features.
+    # Only done for the RAM path; the memmap path (very large datasets) skips this.
+    _NEUTRON = 1.003355
+    _ADDUCT_DELTAS = {"na": 21.9819, "k": 37.9559, "chca": 171.0320}
+    if images_path is None:
+        logger.info("  Extracting M+1/M+2 and adduct isotopologue images for colocalization...")
+        extra_ion_images: dict | None = {
+            "m1":   extract_ion_images(reader, feature_mzs + _NEUTRON,         ppm=extraction_ppm),
+            "m2":   extract_ion_images(reader, feature_mzs + 2.0 * _NEUTRON,   ppm=extraction_ppm),
+            "na":   extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["na"],   ppm=extraction_ppm),
+            "k":    extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["k"],    ppm=extraction_ppm),
+            "chca": extract_ion_images(reader, feature_mzs + _ADDUCT_DELTAS["chca"], ppm=extraction_ppm),
+        }
+    else:
+        extra_ion_images = None
+
     if output_npz is not None:
         if output_dir and not os.path.isabs(str(output_npz)):
             npz_path = os.path.join(output_dir, output_npz)
         else:
             npz_path = output_npz
         os.makedirs(os.path.dirname(os.path.abspath(npz_path)), exist_ok=True)
-        np.savez_compressed(
-            npz_path,
+        save_kwargs: dict = dict(
             mzs=feature_mzs,
             images=np.asarray(ion_images),
             x_coords=x_coords,
             y_coords=y_coords,
         )
+        if extra_ion_images is not None:
+            for key, arr in extra_ion_images.items():
+                save_kwargs[f"extra_{key}"] = np.asarray(arr)
+        np.savez_compressed(npz_path, **save_kwargs)
         logger.info(f"  Saved NPZ → {npz_path}")
 
     if output_spatial_tsv is not None:
@@ -1041,4 +1063,4 @@ def extract_maldi_data(
     }
     logger.info(f"  {len(maldi_envelopes)}/{len(feature_mzs)} features with M0 signal for envelope scoring")
 
-    return feature_mzs, ion_images, spatial_df, maldi_envelopes
+    return feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes

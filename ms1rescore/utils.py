@@ -8,11 +8,6 @@ from brainpy import isotopic_variants
 NEUTRON = 1.003355
 PROTON = 1.007276
 
-# Request at least this many peaks from brainpy so the normalization denominator
-# captures essentially all isotope signal before truncating to n_peaks.
-_NORM_NPEAKS = 6
-
-
 @lru_cache(maxsize=None)
 def theoretical_isotope_distribution(
     n_C: int,
@@ -25,23 +20,25 @@ def theoretical_isotope_distribution(
     """
     Compute theoretical isotope distribution using brainpy (Mercury algorithm).
 
-    Returns distribution [M0, M1, M2, ...] normalized over all peaks returned
-    by brainpy (full-spectrum norm), then truncated to n_peaks.
+    Returns distribution [M0, M1, M2, ...] truncated to n_peaks, then
+    normalized sum-to-1 over the truncated peaks so downstream comparisons
+    against sum-to-1 observed envelopes (used by chi² and KL) are unbiased.
 
     Results are cached by composition tuple — O(unique compositions) calls
     rather than O(n_candidates) when used in a vectorized loop.
     """
     composition = {"C": n_C, "H": n_H, "N": n_N, "O": n_O, "S": n_S}
     # charge only shifts the .mz axis; .intensity is charge-independent, so charge=0 is fine
-    peaks = isotopic_variants(composition, npeaks=max(n_peaks, _NORM_NPEAKS), charge=0)
+    peaks = isotopic_variants(composition, npeaks=n_peaks, charge=0)
     intensities = np.array([p.intensity for p in peaks], dtype=float)
+    if len(intensities) < n_peaks:
+        intensities = np.pad(intensities, (0, n_peaks - len(intensities)))
+    intensities = intensities[:n_peaks]
     total = intensities.sum()
     if total < 1e-12:
         return np.zeros(n_peaks, dtype=float)
     intensities /= total
-    if len(intensities) < n_peaks:
-        intensities = np.pad(intensities, (0, n_peaks - len(intensities)))
-    return intensities[:n_peaks]
+    return intensities
 
 
 def composition_from_sequence(peptide: str) -> dict[str, int]:

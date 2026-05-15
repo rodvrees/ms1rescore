@@ -2,7 +2,6 @@
 - LC-MS/MS prior features should just be MS2Rescore features
 - cleanup: classes of scoring algos? with a base class?
 - log_mean_intensity and spatial_entropy are empty?
-- Set right MS2PIP model, currently using HCD
 - New release of psm_utils
 - Implement JSON config structure like in MS2Rescore
 - Priority:
@@ -13,3 +12,4 @@
     2. Check some stuff that looks off:
         - RT residual
         - log_mean_intensity and spatial_entropy
+- Isotopologue colocalization (E1): 0/983 features with M+1 image

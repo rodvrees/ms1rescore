@@ -49,8 +49,6 @@ MALDI_INTRINSIC_FEATURES = [
     # --- mass accuracy (A-group) ---
     "ppm_error_abs", "ppm_rank", "ppm_best_ratio",
     "ppm_error_calibrated_z",        # A3  — optional, requires pixel_coords
-    # --- ambiguity ---
-    "n_candidates", "log_n_candidates",
     # --- peptide properties (basic) ---
     "peptide_length", "n_missed_cleavages", "has_modifications",
     # --- peptide properties (extended, C-group) ---
@@ -236,6 +234,7 @@ def compute_all_features(
     spatial_features: pd.DataFrame | None = None,
     ion_images: np.ndarray | None = None,
     ion_image_mzs: np.ndarray | None = None,
+    extra_ion_images: dict | None = None,
     maldi_envelopes: dict | None = None,
     pixel_coords: np.ndarray | None = None,
     maldi_mzs: np.ndarray | None = None,
@@ -353,8 +352,8 @@ def compute_all_features(
         # share it across all three colocalization functions to avoid 3× redundant work.
         corr_cache = _pearson_r_matrix(ion_images, ion_image_mzs)
         df = compute_colocalization_features(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)
-        df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)  # E1
-        df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)        # E2
+        df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images)  # E1
+        df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images)        # E2
         df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs)                         # E5/E6
 
     return df

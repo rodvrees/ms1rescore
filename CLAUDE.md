@@ -90,13 +90,19 @@ Install: `pip install ms1rescore[maldi]` (installs `imzy`).
 
 #### `extract_maldi_data(d_path, ppm_bin, extraction_ppm, matching_ppm, min_fraction, feature_mzs, images_path, image_batch_size, output_npz, output_spatial_tsv, output_dir, verbose)`
 
-Three-step extraction:
+Returns a 5-tuple: `(feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes)`.
+
+`extra_ion_images` is a `dict | None` with keys `"m1"`, `"m2"`, `"na"`, `"k"`, `"chca"`, each an `(N, H, W)` float32 array of ion images extracted at M+1/M+2 and adduct (Na, K, CHCA) shifted m/z positions. Used by `compute_isotopologue_colocalization` and `compute_adduct_colocalization` in `maldi_features.py` to compute direct per-feature Pearson r without requiring isotopologue/adduct peaks to be present in the feature list. Set to `None` when images are loaded from a pre-computed NPZ `images_path` or when data is sourced from imzML (those paths do not have a live reader for extra extraction).
+
+Four-step extraction:
 
 1. **Feature detection** — `detect_features(reader, ppm_bin, min_fraction)`. Streams all pixels, builds a log-ppm histogram, and greedily merges adjacent bins to produce consensus feature m/z values. Works directly on centroid data (instrument-picked peaks). Profile data is not handled here — use `maldi_imzml.py` for profile imzML.
 
 2. **`extract_ion_images(reader, feature_mzs, ppm=25.0)`** — tries fast extraction paths first (`_extract_centroid_fast` for Bruker TSF, `_extract_profile_fast` cumsum trick for profile), then falls back to `reader.get_ion_images()`. Returns `(n_features, H, W)` float32.
 
-3. **`compute_spatial_features(ion_images, feature_mzs, n_pixels_total)`** — computes per-feature: `fraction_detected`, `n_pixels_detected`, `mean_intensity`, `intensity_p90`, `intensity_sum`, `intensity_cv`, Moran's I (`spatial_autocorrelation`).
+3. **Extra ion image extraction** (RAM path only, when `images_path is None`) — calls `extract_ion_images` five more times at `feature_mzs + delta` for M+1 (+1.003355 Da), M+2 (+2.006710 Da), Na adduct (+21.9819 Da), K adduct (+37.9559 Da), and CHCA matrix adduct (+171.0320 Da). Saved to NPZ as `extra_m1`, `extra_m2`, `extra_na`, `extra_k`, `extra_chca` keys alongside `mzs`, `images`, `x_coords`, `y_coords`.
+
+4. **`compute_spatial_features(ion_images, feature_mzs, n_pixels_total)`** — computes per-feature: `fraction_detected`, `n_pixels_detected`, `mean_intensity`, `intensity_p90`, `intensity_sum`, `intensity_cv`, Moran's I (`spatial_autocorrelation`).
 
 **imzy reader API used:**
 - `reader.n_pixels`, `reader.is_centroid`, `reader.mz_min`, `reader.mz_max`
@@ -362,7 +368,9 @@ All four ion-image feature functions are performance-critical. Their design:
 3. Vectorized `corr_matrix[idx_a, idx_b]` lookup on the join result
 4. `groupby(['feature_mz', 'protein']).agg(mean/max/median/count)` → merge back onto candidates
 
-**`compute_isotopologue_colocalization()`** and **`compute_adduct_colocalization()`** — both use `_find_partner_indices` (vectorized `searchsorted` + nearest-neighbour check) to locate M+1/M+2 or Na/K/CHCA adduct images for all features simultaneously, then slice the shared corr matrix.
+**`_pearson_r_pairwise(images_a, images_b)`** — helper used by isotopologue and adduct colocalization. Takes two `(N, H, W)` float32 arrays and returns a length-N array of per-feature Pearson r values. Uses manual mean-centering and dot product (avoids `np.corrcoef` memory overhead). Returns `np.nan` for constant images.
+
+**`compute_isotopologue_colocalization()`** and **`compute_adduct_colocalization()`** — both accept an `extra_ion_images: dict | None` parameter. When provided (keys: `"m1"`, `"m2"`, `"na"`, `"k"`, `"chca"`), they use `_pearson_r_pairwise` to compute direct per-feature Pearson r between M0 images and pre-extracted partner images. This is necessary because MALDI feature lists contain only predefined monoisotopic M0 peaks — M+1/M+2 and adduct peaks are absent from the feature list and cannot be found by index lookup. When `extra_ion_images=None`, the old fallback path uses `_find_partner_indices` (vectorized `searchsorted` + nearest-neighbour check) to locate partner images within the feature list and slices the shared corr matrix — preserved for backwards compatibility (e.g. plain m/z text file or imzML input).
 
 **`compute_spatial_autocorrelation_full()`** — Moran's I and Geary's C:
 - Replaces per-feature `scipy.signal.convolve2d` with `_neighbor_sum_batch`: batched numpy 8-neighbour sum using zero-padded slicing, no scipy dependency.
@@ -496,6 +504,8 @@ Parses LC-MS/MS identification results into an `LCMSIds(proteins, peptides)` nam
 
 **Peptide DataFrame columns:** `sequence`, `peptidoform`, `protein`, `q_value`, `pep`, `score`, `n_psms`, `charge`, `rt_mean`, `lcms_intensity`
 
+**RT unit normalisation** (`_parse_psm_utils`): after aggregating PSMs to peptide level, if the median `rt_mean` exceeds 200 the values are divided by 60 (seconds → minutes). This matches the same pattern used in `_join_psm_rt_intensity`. FragPipe PSM TSV files report `Retention` in seconds (typical range 131–2564 s); all other supported formats report in minutes.
+
 **Supported formats** (pass as `lcms_id_format` to `rescore()`):
 
 | Format | Files needed | Notes |
@@ -518,7 +528,7 @@ P12345  →  P12345
 
 ### `pipeline.py`
 
-`rescore()` is the end-to-end entry point. Steps 1-8 are identical for both backends; step 9 diverges:
+`rescore()` is the end-to-end entry point. Accepts `extra_ion_images: dict | None` (keys: `"m1"`, `"m2"`, `"na"`, `"k"`, `"chca"`) and passes it through to `compute_all_features` → `compute_isotopologue_colocalization` / `compute_adduct_colocalization`. Populated by `_load_maldi` in `cli.py` from the Bruker RAM extraction path or from NPZ `extra_*` keys. Steps 1-8 are identical for both backends; step 9 diverges:
 
 1. Generate candidates (Strategy A or C) + match to MALDI features
 2. Load LC-MS/MS data

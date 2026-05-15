@@ -68,7 +68,7 @@ def _read_feature_mzs(path: str) -> tuple[np.ndarray, np.ndarray | None]:
 def _load_maldi(
     npz_path: str | None,
     mzs_path: str | None,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, dict | None]:
     """
     Load MALDI feature data from disk.
 
@@ -100,15 +100,17 @@ def _load_maldi(
         mzs = data["mzs"]
         images = data["images"] if "images" in data else None
         image_mzs = mzs if images is not None else None
+        _extra_keys = ("m1", "m2", "na", "k", "chca")
+        extra_ion_images: dict | None = (
+            {k: data[f"extra_{k}"] for k in _extra_keys if f"extra_{k}" in data}
+            or None
+        )
         logger.info(
             f"  {len(mzs)} MALDI features"
-            + (
-                f", ion images {images.shape}"
-                if images is not None
-                else ", no ion images"
-            )
+            + (f", ion images {images.shape}" if images is not None else ", no ion images")
+            + (f", extra images: {list(extra_ion_images)}" if extra_ion_images else "")
         )
-        return mzs, images, image_mzs, None
+        return mzs, images, image_mzs, None, extra_ion_images
 
     logger.info(f"Loading MALDI m/z values from text file: {mzs_path}")
     try:
@@ -123,7 +125,7 @@ def _load_maldi(
         )
         sys.exit(1)
     logger.info(f"  {len(mzs)} MALDI features, no ion images")
-    return mzs, None, None, ccs
+    return mzs, None, None, ccs, None
 
 
 # ---------------------------------------------------------------------------
@@ -883,7 +885,7 @@ def main() -> None:
             logger.info(f"  {len(precomputed_mzs)} features loaded (skipping detection)")
 
         logger.info(f"Extracting MALDI features from raw data: {args.maldi_raw}")
-        maldi_mzs, ion_images, spatial_features, maldi_envelopes = extract_maldi_data(
+        maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes = extract_maldi_data(
             args.maldi_raw,
             feature_mzs=precomputed_mzs,
             ppm_bin=args.ppm_bin,
@@ -961,6 +963,7 @@ def main() -> None:
         maldi_mzs = np.array([apex for _, _, apex in intervals])
         ion_images = None
         ion_image_mzs = None
+        extra_ion_images = None
         spatial_features = None
         logger.info(f"  {len(maldi_mzs)} intervals extracted")
         if mean_1_over_k0 is not None and len(mean_1_over_k0) == len(maldi_mzs):
@@ -968,7 +971,7 @@ def main() -> None:
             _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
             logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
     else:
-        maldi_mzs, ion_images, ion_image_mzs, _ccs_arr = _load_maldi(
+        maldi_mzs, ion_images, ion_image_mzs, _ccs_arr, extra_ion_images = _load_maldi(
             args.maldi_npz, args.maldi_mzs
         )
 
@@ -1075,6 +1078,7 @@ def main() -> None:
         mzml_paths=args.mzml,
         ion_images=ion_images,
         ion_image_mzs=ion_image_mzs,
+        extra_ion_images=extra_ion_images,
         spatial_features=spatial_features,
         maldi_envelopes=maldi_envelopes,
         msf_path=args.msf,
