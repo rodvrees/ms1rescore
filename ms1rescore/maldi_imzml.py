@@ -906,6 +906,100 @@ def _parse_mobility_offsets(
 
 
 # ---------------------------------------------------------------------------
+# Ion image reconstruction helpers
+# ---------------------------------------------------------------------------
+
+
+def reconstruct_ion_images_from_intervals(
+    intensity_matrix: np.ndarray,
+    pixel_coords: list[tuple[int, int]],
+    n_intervals: int,
+) -> np.ndarray:
+    """Reconstruct a (n_intervals, H, W) ion image array from the interval matrix.
+
+    Parameters
+    ----------
+    intensity_matrix
+        Shape (n_pixels, n_intervals), float32.  Each row is one pixel; each
+        column is one SCiLS interval.
+    pixel_coords
+        0-based (x, y) tuples, same row order as intensity_matrix.
+    n_intervals
+        Number of intervals (= intensity_matrix.shape[1]).
+
+    Returns
+    -------
+    np.ndarray
+        Shape (n_intervals, H, W), float32.
+    """
+    if n_intervals == 0 or len(pixel_coords) == 0:
+        return np.zeros((0, 1, 1), dtype=np.float32)
+
+    coords = np.asarray(pixel_coords, dtype=np.int32)
+    xs = coords[:, 0]
+    ys = coords[:, 1]
+    W = int(xs.max()) + 1
+    H = int(ys.max()) + 1
+
+    ion_images = np.zeros((n_intervals, H, W), dtype=np.float32)
+    # Vectorised scatter: intensity_matrix.T has shape (n_intervals, n_pixels)
+    ion_images[:, ys, xs] = intensity_matrix.T
+    return ion_images
+
+
+def build_envelopes_from_intervals(
+    intervals: list[tuple[float, float, float]],
+    intensity_matrix: np.ndarray,
+) -> dict[float, list[float]]:
+    """Build approximate maldi_envelopes from SCiLS interval data.
+
+    For each interval apex m0, searches for M+1 and M+2 intervals within 0.5 Da
+    and records their mean intensities.  Intervals not found within tolerance get
+    mean intensity 0.0.
+
+    Parameters
+    ----------
+    intervals
+        List of (mz_start, mz_end, mz_apex) tuples.
+    intensity_matrix
+        Shape (n_pixels, n_intervals), float32.
+
+    Returns
+    -------
+    dict mapping float(mz_apex) → [m0_mean, m1_mean, m2_mean].
+    """
+    NEUTRON = 1.003355
+    if not intervals:
+        return {}
+
+    apices = np.array([iv[2] for iv in intervals])
+    mean_ints = intensity_matrix.mean(axis=0)  # (n_intervals,)
+
+    # Sort apices for efficient nearest-neighbour search
+    order = np.argsort(apices)
+    sorted_apices = apices[order]
+    sorted_means = mean_ints[order]
+
+    def _find_nearest_mean(targets: np.ndarray, tol: float = 0.5) -> np.ndarray:
+        idx = np.searchsorted(sorted_apices, targets)
+        idx = np.clip(idx, 0, len(sorted_apices) - 1)
+        idx_prev = np.clip(idx - 1, 0, len(sorted_apices) - 1)
+        diff_curr = np.abs(sorted_apices[idx] - targets)
+        diff_prev = np.abs(sorted_apices[idx_prev] - targets)
+        best_idx = np.where(diff_curr <= diff_prev, idx, idx_prev)
+        best_diff = np.minimum(diff_curr, diff_prev)
+        return np.where(best_diff < tol, sorted_means[best_idx], 0.0)
+
+    m1_means = _find_nearest_mean(apices + NEUTRON)
+    m2_means = _find_nearest_mean(apices + 2 * NEUTRON)
+
+    return {
+        float(apex): [float(m0_mean), float(m1_mean), float(m2_mean)]
+        for apex, m0_mean, m1_mean, m2_mean in zip(apices, mean_ints, m1_means, m2_means)
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 

@@ -18,15 +18,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _read_feature_mzs(path: str) -> tuple[np.ndarray, np.ndarray | None]:
+def _read_feature_mzs(path: str) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """
     Load feature m/z values from a plain text file or a SCiLS Lab CSV export.
 
-    Plain text: one m/z value per line, no header. Returns (mzs, None).
+    Plain text: one m/z value per line, no header. Returns (mzs, None, None).
     SCiLS CSV: semicolon-delimited; lines starting with '#' are comments;
                the first non-comment line is a header (first column = 'm/z').
-               If a 'CCS [Å²]' column is present, its values are returned as
-               the second element of the tuple. Otherwise returns (mzs, None).
+               If a 'CCS [Å²]' column is present it is returned as the second
+               element. If an 'Intensity' column is present (e.g. the SCiLS
+               'Intensity [Regions]' column) it is returned as the third element.
     """
     with open(path) as fh:
         lines = [ln.rstrip("\n") for ln in fh]
@@ -40,29 +41,43 @@ def _read_feature_mzs(path: str) -> tuple[np.ndarray, np.ndarray | None]:
         header = data_lines[0].split(";")
         rows = data_lines[1:]
         mzs = np.array([float(row.split(";")[0]) for row in rows if row.strip()], dtype=np.float64)
-        # Find CCS column by checking for both 'CCS' and 'Å' in the column name
+
+        def _extract_col(col_idx: int) -> np.ndarray:
+            vals: list[float] = []
+            for row in rows:
+                if row.strip():
+                    parts = row.split(";")
+                    try:
+                        vals.append(float(parts[col_idx]))
+                    except (IndexError, ValueError):
+                        vals.append(np.nan)
+            return np.array(vals, dtype=np.float64)
+
+        # Find CCS column
         ccs_col_idx = None
         for i, col in enumerate(header):
             if "CCS" in col and "Å" in col:  # Å = U+00C5
                 ccs_col_idx = i
                 break
-        if ccs_col_idx is not None:
-            ccs_vals: list[float] = []
-            for row in rows:
-                if row.strip():
-                    parts = row.split(";")
-                    try:
-                        ccs_vals.append(float(parts[ccs_col_idx]))
-                    except (IndexError, ValueError):
-                        ccs_vals.append(np.nan)
-            ccs: np.ndarray | None = np.array(ccs_vals, dtype=np.float64)
-        else:
-            ccs = None
+        ccs: np.ndarray | None = _extract_col(ccs_col_idx) if ccs_col_idx is not None else None
+
+        # Find intensity column — prefer 'Intensity [Regions]', accept any 'Intensity' column
+        # that is not an interval-width or CCS column.
+        intensity_col_idx = None
+        for i, col in enumerate(header):
+            col_lower = col.lower()
+            if "intensity" in col_lower and "interval" not in col_lower and "width" not in col_lower:
+                intensity_col_idx = i
+                break
+        intensities: np.ndarray | None = (
+            _extract_col(intensity_col_idx) if intensity_col_idx is not None else None
+        )
     else:
         mzs = np.array([float(ln) for ln in data_lines], dtype=np.float64)
         ccs = None
+        intensities = None
 
-    return mzs, ccs
+    return mzs, ccs, intensities
 
 
 def _load_maldi(
@@ -83,11 +98,13 @@ def _load_maldi(
 
     Returns
     -------
-    (maldi_mzs, ion_images, ion_image_mzs, ccs)
-        ``ion_images`` and ``ion_image_mzs`` are ``None`` when loading from a
-        plain text file or when the NPZ has no ``"images"`` key.
+    (maldi_mzs, ion_images, ion_image_mzs, ccs, extra_ion_images, maldi_intensities)
+        ``ion_images``, ``ion_image_mzs``, and ``extra_ion_images`` are ``None``
+        when loading from a plain text file or when the NPZ has no ``"images"`` key.
         ``ccs`` is ``None`` unless a SCiLS CSV with a ``CCS [Å²]`` column was
         supplied as ``mzs_path``.
+        ``maldi_intensities`` is ``None`` unless a SCiLS CSV with an ``Intensity``
+        column (e.g. ``Intensity [Regions]``) was supplied as ``mzs_path``.
     """
     if npz_path is not None:
         logger.info(f"Loading MALDI data from NPZ: {npz_path}")
@@ -110,11 +127,11 @@ def _load_maldi(
             + (f", ion images {images.shape}" if images is not None else ", no ion images")
             + (f", extra images: {list(extra_ion_images)}" if extra_ion_images else "")
         )
-        return mzs, images, image_mzs, None, extra_ion_images
+        return mzs, images, image_mzs, None, extra_ion_images, None
 
     logger.info(f"Loading MALDI m/z values from text file: {mzs_path}")
     try:
-        mzs, ccs = _read_feature_mzs(mzs_path)
+        mzs, ccs, intensities = _read_feature_mzs(mzs_path)
     except Exception as exc:
         logger.error(f"Could not read {mzs_path!r}: {exc}")
         sys.exit(1)
@@ -124,8 +141,9 @@ def _load_maldi(
             f"got shape {mzs.shape}. Ensure one value per line."
         )
         sys.exit(1)
-    logger.info(f"  {len(mzs)} MALDI features, no ion images")
-    return mzs, None, None, ccs, None
+    _int_msg = ", intensities loaded from CSV" if intensities is not None else ""
+    logger.info(f"  {len(mzs)} MALDI features, no ion images{_int_msg}")
+    return mzs, None, None, ccs, None, intensities
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +333,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "imzML file (.imzML + .ibd). SCiLS Lab-style interval-based "
             "feature extraction is performed automatically. Ion images and "
-            "spatial features are computed and optionally saved."
+            "spatial features are reconstructed from the interval intensity "
+            "matrix. Use --maldi-d instead when the raw Bruker .d directory "
+            "is available to obtain full adduct/isotope extra images."
+        ),
+    )
+    maldi_exc.add_argument(
+        "--maldi-d",
+        metavar="PATH",
+        help=(
+            "Bruker .d directory (preferred raw path; provides full ion image "
+            "extraction including adduct and isotopologue extra images). Use "
+            "instead of --maldi-imzml when the raw data is available. "
+            "Functionally equivalent to --maldi-raw."
         ),
     )
 
@@ -864,8 +894,11 @@ def main() -> None:
     maldi_envelopes = None
     _ccs_arr: np.ndarray | None = None
     _ccs_source_mzs: np.ndarray | None = None  # mzs aligned with _ccs_arr; may differ from maldi_mzs
+    _mzs_intensities: np.ndarray | None = None  # per-feature intensity from SCiLS CSV
+    _feature_mzs_intensities: np.ndarray | None = None  # set only in --maldi-raw/--maldi-d block
 
-    if args.maldi_raw:
+    _maldi_raw_path: str | None = args.maldi_raw or args.maldi_d
+    if _maldi_raw_path:
         from ms1rescore.maldi_extraction import extract_maldi_data
 
         logger.info(
@@ -877,16 +910,16 @@ def main() -> None:
         if args.feature_mzs:
             logger.info(f"Loading pre-computed feature m/z values from {args.feature_mzs}")
             try:
-                precomputed_mzs, _ccs_arr = _read_feature_mzs(args.feature_mzs)
+                precomputed_mzs, _ccs_arr, _feature_mzs_intensities = _read_feature_mzs(args.feature_mzs)
                 _ccs_source_mzs = precomputed_mzs
             except Exception as exc:
                 logger.error(f"Could not read --feature-mzs {args.feature_mzs!r}: {exc}")
                 sys.exit(1)
             logger.info(f"  {len(precomputed_mzs)} features loaded (skipping detection)")
 
-        logger.info(f"Extracting MALDI features from raw data: {args.maldi_raw}")
+        logger.info(f"Extracting MALDI features from raw data: {_maldi_raw_path}")
         maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes = extract_maldi_data(
-            args.maldi_raw,
+            _maldi_raw_path,
             feature_mzs=precomputed_mzs,
             ppm_bin=args.ppm_bin,
             extraction_ppm=args.extraction_ppm,
@@ -923,12 +956,14 @@ def main() -> None:
             + (f", ion image shape: {ion_images.shape[1:]}" if ion_images is not None else "")
         )
     elif args.maldi_imzml:
-        from ms1rescore.maldi_imzml import SCiLSConfig, extract_scils_features
+        from ms1rescore.maldi_imzml import (
+            SCiLSConfig, extract_scils_features,
+            reconstruct_ion_images_from_intervals, build_envelopes_from_intervals,
+        )
 
         logger.info(
             "MALDI features extracted from imzML data (SCiLS Lab-style interval extraction). "
-            "LC-MS/MS identifications will be used for candidate generation and "
-            "prior features only, not for feature selection."
+            "Ion images reconstructed from interval intensity matrix."
         )
         logger.info(f"Extracting MALDI features from imzML: {args.maldi_imzml}")
         cfg = SCiLSConfig(
@@ -954,24 +989,39 @@ def main() -> None:
             picking_height=args.picking_height,
             local_prominence_window_da=args.local_prominence_window_da,
         )
-        intervals, _, _, mean_1_over_k0 = extract_scils_features(
+        intervals, intensity_matrix, pixel_coords, mean_1_over_k0 = extract_scils_features(
             args.maldi_imzml,
             config=cfg,
             output_dir=args.output_dir,
             visualize=False,
         )
         maldi_mzs = np.array([apex for _, _, apex in intervals])
-        ion_images = None
-        ion_image_mzs = None
-        extra_ion_images = None
-        spatial_features = None
-        logger.info(f"  {len(maldi_mzs)} intervals extracted")
+
+        # Reconstruct 3D ion images from the flat interval intensity matrix
+        ion_images = reconstruct_ion_images_from_intervals(
+            intensity_matrix, pixel_coords, len(intervals)
+        )
+        ion_image_mzs = maldi_mzs if len(intervals) > 0 else None
+        extra_ion_images = None  # adduct images unavailable from pre-integrated intervals
+
+        # Compute spatial features from reconstructed ion images
+        if len(intervals) > 0:
+            from ms1rescore.maldi_extraction import compute_spatial_features as _csf
+            spatial_features = _csf(ion_images, maldi_mzs, len(pixel_coords))
+
+        # Build approximate isotope envelopes from interval mean intensities
+        maldi_envelopes = build_envelopes_from_intervals(intervals, intensity_matrix)
+
+        logger.info(
+            f"  {len(maldi_mzs)} intervals extracted"
+            + (f", ion images {ion_images.shape[1:]}" if len(intervals) > 0 else "")
+        )
         if mean_1_over_k0 is not None and len(mean_1_over_k0) == len(maldi_mzs):
             from ms1rescore.maldi_imzml import one_over_k0_to_ccs
             _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
             logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
     else:
-        maldi_mzs, ion_images, ion_image_mzs, _ccs_arr, extra_ion_images = _load_maldi(
+        maldi_mzs, ion_images, ion_image_mzs, _ccs_arr, extra_ion_images, _mzs_intensities = _load_maldi(
             args.maldi_npz, args.maldi_mzs
         )
 
@@ -1058,6 +1108,32 @@ def main() -> None:
                     "CCS features will be skipped"
                 )
 
+    # --- Align --feature-mzs intensities to maldi_mzs ---
+    # When --maldi-raw + --feature-mzs is used, maldi_mzs may be shorter than
+    # precomputed_mzs (extract_maldi_data can drop zero-signal features).
+    # Re-index using a m/z lookup, the same way CCS is handled above.
+    if _feature_mzs_intensities is not None and _ccs_source_mzs is not None:
+        _mz_to_intensity = {
+            float(mz): float(v)
+            for mz, v in zip(_ccs_source_mzs, _feature_mzs_intensities)
+            if np.isfinite(v)
+        }
+        _aligned = np.array(
+            [_mz_to_intensity.get(float(mz), np.nan) for mz in maldi_mzs],
+            dtype=np.float64,
+        )
+        n_matched = int(np.isfinite(_aligned).sum())
+        if n_matched > 0:
+            _mzs_intensities = _aligned
+            logger.info(
+                f"  SCiLS intensities aligned for {n_matched}/{len(maldi_mzs)} features"
+            )
+        else:
+            logger.warning(
+                "  --feature-mzs intensity column found but no m/z values matched "
+                "maldi_mzs; intensity feature will fall back to raw extraction"
+            )
+
     # --- Load GT peptides (only relevant when debug is enabled) ---
     gt_peptides: list[str] | None = None
     if args.verbose and args.debug_gt:
@@ -1109,6 +1185,7 @@ def main() -> None:
         im2deep_calibration=args.im2deep_calibration,
         digest=args.digest,
         gt_peptides=gt_peptides,
+        maldi_intensities=_mzs_intensities,
     )
 
     # --- Write results ---
@@ -1124,6 +1201,12 @@ def main() -> None:
         logger.info(
             "%d/%d GT peptides are round-2 (feature-level) winners.",
             n_gt_winners, len(gt_set),
+        )
+        winners_fdr = winners[winners['q_value'] < 0.01]
+        n_gt_winners_fdr = winners_fdr["peptide"].isin(gt_set).sum()
+        logger.info(
+            "%d/%d GT peptides are round-2 winners at 1%% FDR.",
+            n_gt_winners_fdr, len(gt_set),
         )
     logger.info("Done.")
 

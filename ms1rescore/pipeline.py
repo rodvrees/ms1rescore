@@ -519,6 +519,7 @@ def rescore(
     im2deep_calibration: str = "linear",
     digest: bool = False,
     gt_peptides: list[str] | None = None,
+    maldi_intensities: np.ndarray | None = None,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -717,7 +718,7 @@ def rescore(
             f"from {extra_fasta_path!r}"
         )
 
-    maldi_intensities = None
+    _maldi_intensities_arr = None
     maldi_intensities_p90 = None
     maldi_intensities_sum = None
     if spatial_features is not None:
@@ -726,16 +727,20 @@ def rescore(
         if "intensity_sum" in spatial_features.columns:
             maldi_intensities_sum = spatial_features["intensity_sum"].to_numpy(dtype=np.float32)
         if "mean_intensity" in spatial_features.columns:
-            maldi_intensities = spatial_features["mean_intensity"].to_numpy(dtype=np.float32)
+            _maldi_intensities_arr = spatial_features["mean_intensity"].to_numpy(dtype=np.float32)
     elif ion_images is not None:
-        maldi_intensities = np.array(
+        _maldi_intensities_arr = np.array(
             [img[img > 0].mean() if (img > 0).any() else 0.0 for img in ion_images]
         )
+    # SCiLS CSV 'Intensity [Regions]' takes priority over raw-derived mean intensity.
+    if maldi_intensities is not None:
+        _maldi_intensities_arr = np.asarray(maldi_intensities, dtype=np.float32)
+        logger.info("  Using SCiLS per-feature intensities for log_maldi_intensity")
     candidates = match_to_maldi_features(
         maldi_mzs,
         peptide_db,
         ppm_tolerance,
-        maldi_intensities=maldi_intensities,
+        maldi_intensities=_maldi_intensities_arr,
         maldi_intensities_p90=maldi_intensities_p90,
         maldi_intensities_sum=maldi_intensities_sum,
     )
@@ -1293,6 +1298,17 @@ def rescore(
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
         )
+        # Output importances
+        if verbose:
+            with open(f"{output_dir}/17_debug_lda_scores_r1.pkl", "wb") as f:
+                pickle.dump(scores1, f)
+            lda_importances_df = pd.DataFrame({
+                "feature": _imp_names_lda,
+                "importance": _imp_r1_lda,
+            }).sort_values("importance", ascending=False)
+            lda_importances_df.to_csv(
+                f"{output_dir}/17_debug_lda_importances_r1.tsv", sep="\t", index=False
+            )
 
         # --- Per-feature winner selection ---
         winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
@@ -1324,6 +1340,17 @@ def rescore(
             init_ppm_threshold=init_ppm_threshold,
             seed_mask=r2_seed_mask,
         )
+        # Output importances
+        if verbose:
+            with open(f"{output_dir}/17_debug_lda_scores_r2.pkl", "wb") as f:
+                pickle.dump(scores2, f)
+            lda_importances_df = pd.DataFrame({
+                "feature": lda_imp_names_r2 or _imp_names_lda,
+                "importance": lda_imp_r2,
+            }).sort_values("importance", ascending=False)
+            lda_importances_df.to_csv(
+                f"{output_dir}/17_debug_lda_importances_r2.tsv", sep="\t", index=False
+            )
 
         # --- Standard TDC FDR on winners ---
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)

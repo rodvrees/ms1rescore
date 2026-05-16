@@ -41,7 +41,7 @@ def _shuffle_protein(seq: str, random_state: int = 42) -> str:
 def digest_fasta(
     fasta_path: str,
     enzyme: str = "trypsin",
-    missed_cleavages: int = 2,
+    missed_cleavages: int = 1,
     min_length: int = 7,
     max_length: int = 30,
     generate_decoys: bool = True,

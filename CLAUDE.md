@@ -249,12 +249,15 @@ When `visualize=True`, saves 4 PNG files to `output_dir`:
 
 #### CLI flags
 
-| Flag | Format | Feature detection | Ion images | Spatial features |
-|---|---|---|---|---|
-| `--maldi-npz PATH` | NumPy NPZ | No | Yes (if `"images"` key) | No |
-| `--maldi-mzs PATH` | Plain text m/z list | No | No | No |
-| `--maldi-raw PATH` | Bruker `.d` | Histogram binning (centroid) | Yes | Yes |
-| `--maldi-imzml PATH` | imzML + ibd | SCiLS interval detection | No (interval matrix) | No |
+| Flag | Format | Feature detection | Ion images | Spatial features | Extra images (adducts) |
+|---|---|---|---|---|---|
+| `--maldi-npz PATH` | NumPy NPZ | No | Yes (if `"images"` key) | No | From NPZ `extra_*` keys |
+| `--maldi-mzs PATH` | Plain text m/z list | No | No | No | No |
+| `--maldi-raw PATH` | Bruker `.d` | Histogram binning (centroid) | Yes | Yes | Yes |
+| `--maldi-d PATH` | Bruker `.d` (alias for `--maldi-raw`) | Histogram binning (centroid) | Yes | Yes | Yes |
+| `--maldi-imzml PATH` | imzML + ibd | SCiLS interval detection | Yes (reconstructed from interval matrix) | Yes | No |
+
+**`--maldi-d` vs `--maldi-imzml`:** When raw Bruker `.d` data is available, prefer `--maldi-d`. It extracts ion images directly from raw spectra, includes adduct/isotopologue extra images (`extra_ion_images`), and is not affected by SCiLS recalibration offsets. `--maldi-imzml` reconstructs ion images from SCiLS-integrated interval intensities — all spatial features are computed, but adduct images (`na`, `k`, `chca`) are unavailable because the interval list covers only detected monoisotopic peaks. Note that SCiLS-exported imzML m/z values may differ from raw Bruker calibration by 10–80+ ppm; verify alignment with `Amy_TMA_MS1.d` before using `--maldi-d` with a SCiLS feature CSV.
 
 ---
 

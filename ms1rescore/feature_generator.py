@@ -78,7 +78,7 @@ MALDI_INTRINSIC_FEATURES = [
     "gravy_score", "charge_proxy",
     # --- ion mobility (B-group) — optional, requires im2deep + observed CCS ---
     "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
-    "im2deep_ccs_zscore", "im2deep_ccs_rank", "im2deep_mahalanobis",
+    "im2deep_ccs_zscore", "im2deep_ccs_rank",
     # --- isotopologue co-localization (E1) — optional, requires ion_images ---
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
     "isotope_image_colocalization_mean",
@@ -159,7 +159,7 @@ _COLOC_FEATS = frozenset([
 _PIXEL_FEATS = frozenset(["ppm_error_calibrated_z"])
 _CCS_FEATS = frozenset([
     "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
-    "im2deep_ccs_zscore", "im2deep_ccs_rank", "im2deep_mahalanobis",
+    "im2deep_ccs_zscore", "im2deep_ccs_rank",
 ])
 _ISOTOPOLOGUE_COLOC_FEATS = frozenset([
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",

@@ -741,7 +741,7 @@ def compute_im2deep_features(
     im2deep_abs_delta_ccs_pct   |residual| / predicted × 100
     im2deep_ccs_zscore          z-score of delta_ccs within each feature group
     im2deep_ccs_rank            rank of abs_delta_ccs_pct within feature group
-    im2deep_mahalanobis         Mahalanobis distance in (ppm_error_abs, delta_ccs) space
+    # im2deep_mahalanobis         Mahalanobis distance in (ppm_error_abs, delta_ccs) space
     """
     if not observed_ccs_per_feature:
         return df
@@ -859,37 +859,37 @@ def compute_im2deep_features(
     )
     df["im2deep_ccs_rank"] = df.groupby("feature_mz")["_im2deep_abspct"].rank(method="min")
 
-    # Mahalanobis distance in (ppm_error_abs, delta_ccs) space per feature
-    mahal = np.full(len(df), np.nan)
-    df_reset = df.reset_index(drop=False)
-    for _, grp in df_reset.groupby("feature_mz"):
-        if len(grp) < 3:
-            continue
-        X = grp[["ppm_error_abs", "_im2deep_delta"]].values.astype(float)
-        valid_mask = ~np.isnan(X).any(axis=1)
-        X_valid = X[valid_mask]
-        if X_valid.shape[0] < 3:
-            continue
-        try:
-            cov = np.cov(X_valid.T)
-            if np.linalg.matrix_rank(cov) < 2:
-                continue
-            cov_inv = np.linalg.inv(cov)
-            mean = X_valid.mean(axis=0)
-            for row_pos, orig_idx in enumerate(grp.index):
-                if valid_mask[row_pos]:
-                    diff = X[row_pos] - mean
-                    mahal[orig_idx] = float(np.sqrt(diff @ cov_inv @ diff))
-        except np.linalg.LinAlgError:
-            continue
+    # # Mahalanobis distance in (ppm_error_abs, delta_ccs) space per feature
+    # mahal = np.full(len(df), np.nan)
+    # df_reset = df.reset_index(drop=False)
+    # for _, grp in df_reset.groupby("feature_mz"):
+    #     if len(grp) < 3:
+    #         continue
+    #     X = grp[["ppm_error_abs", "_im2deep_delta"]].values.astype(float)
+    #     valid_mask = ~np.isnan(X).any(axis=1)
+    #     X_valid = X[valid_mask]
+    #     if X_valid.shape[0] < 3:
+    #         continue
+    #     try:
+    #         cov = np.cov(X_valid.T)
+    #         if np.linalg.matrix_rank(cov) < 2:
+    #             continue
+    #         cov_inv = np.linalg.inv(cov)
+    #         mean = X_valid.mean(axis=0)
+    #         for row_pos, orig_idx in enumerate(grp.index):
+    #             if valid_mask[row_pos]:
+    #                 diff = X[row_pos] - mean
+    #                 mahal[orig_idx] = float(np.sqrt(diff @ cov_inv @ diff))
+    #     except np.linalg.LinAlgError:
+    #         continue
 
-    df["im2deep_mahalanobis"] = mahal
+    # df["im2deep_mahalanobis"] = mahal
     df.drop(columns=["_im2deep_delta", "_im2deep_abspct"], inplace=True, errors="ignore")
 
     # Fill NaN with median (symmetric fill — no target/decoy information)
     for col in [
         "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
-        "im2deep_ccs_zscore", "im2deep_ccs_rank", "im2deep_mahalanobis",
+        "im2deep_ccs_zscore", "im2deep_ccs_rank",
     ]:
         valid = df[col].dropna()
         fill = float(valid.median()) if len(valid) > 0 else 0.0

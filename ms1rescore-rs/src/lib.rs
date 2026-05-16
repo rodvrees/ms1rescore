@@ -1,5 +1,6 @@
 mod digest;
 mod features;
+mod ion_image;
 mod isotope;
 mod maldi_isotope;
 mod spectral;
@@ -193,6 +194,50 @@ fn compute_maldi_isotope_means(
     })
 }
 
+/// Extract feature window integrals from a batch of profile-mode pixel spectra.
+///
+/// Processes pixels in parallel (rayon) using direct window summation
+/// instead of the cumsum trick, which is faster when n_features × window_width
+/// << n_mz (typical for MALDI with narrow extraction windows).
+///
+/// Args:
+///     pixel_matrix: 2-D float32 numpy array of shape (n_pixels, n_mz).
+///                   Must be C-contiguous (row-major).
+///     lo_indices:   Inclusive start index for each feature window (list of int).
+///     hi_indices:   Exclusive end index for each feature window (list of int).
+///
+/// Returns:
+///     1-D float32 numpy array of length n_pixels * n_features (row-major).
+///     Reshape to (n_pixels, n_features) in Python.
+#[pyfunction]
+fn accumulate_profile_chunk<'py>(
+    py: Python<'py>,
+    pixel_matrix: numpy::PyReadonlyArray2<'_, f32>,
+    lo_indices: Vec<usize>,
+    hi_indices: Vec<usize>,
+) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<f32>>> {
+    use numpy::{IntoPyArray, PyUntypedArrayMethods};
+
+    let shape = pixel_matrix.shape();
+    let n_mz = shape[1];
+
+    let mat_slice = pixel_matrix
+        .as_slice()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("pixel_matrix must be C-contiguous"))?;
+
+    let mat_addr = mat_slice.as_ptr() as usize;
+    let mat_len = mat_slice.len();
+
+    let flat_output: Vec<f32> = py.allow_threads(move || {
+        let mat = unsafe { std::slice::from_raw_parts(mat_addr as *const f32, mat_len) };
+        ion_image::accumulate_profile_images(mat, n_mz, &lo_indices, &hi_indices)
+    });
+
+    Ok(numpy::ndarray::Array1::from_vec(flat_output)
+        .into_pyarray(py)
+        .into())
+}
+
 #[pymodule]
 fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_xics_batch, m)?)?;
@@ -204,5 +249,6 @@ fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_property_features, m)?)?;
     m.add_function(wrap_pyfunction!(count_missed_cleavages_batch, m)?)?;
     m.add_function(wrap_pyfunction!(compute_maldi_isotope_means, m)?)?;
+    m.add_function(wrap_pyfunction!(accumulate_profile_chunk, m)?)?;
     Ok(())
 }

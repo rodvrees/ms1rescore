@@ -1,13 +1,16 @@
 """
 Debug visualization for the MALDI-MSI rescoring pipeline.
 
-Six subsystems:
+Eight subsystems:
   1. Ion image colocalization  — per-candidate precursor + protein co-feature images
   2. Feature diagnostics       — per-candidate 3×3 panel figure
   3. Isotope envelopes         — per-candidate spectrum-style envelope comparison
   4. Feature importance        — global sorted bar plots (rounds 1 and 2)
   5. Feature distributions     — per-feature target/decoy histograms (all + R2)
   6. CCS scatter               — observed vs predicted CCS for all candidates
+  7. IDs vs FDR curve          — target identifications as a function of FDR threshold
+  8. Protein colocalization    — colocalization values split by scoring group
+  9. T/D m/z distribution      — target vs decoy m/z coverage and competition status
 
 Entry point: save_debug_figures()
 """
@@ -1043,6 +1046,387 @@ def plot_ccs_scatter(
 
 
 # ---------------------------------------------------------------------------
+# Subsystem 7: IDs vs FDR curve
+# ---------------------------------------------------------------------------
+
+
+def plot_ids_vs_fdr(
+    result_df: pd.DataFrame,
+    out_dir: str,
+    model_name: str = "model",
+    fdr_max: float = 0.20,
+) -> None:
+    """
+    Save a curve of target identifications as a function of FDR threshold.
+
+    Plots both the TDC q-value and the reweighted q-value (when present) so
+    the effect of the LC-MS/MS prior is immediately visible.  Vertical lines
+    mark 1 % and 5 % FDR.  Only TDC winner rows are considered; decoy winners
+    are excluded.
+
+    Output: ``{out_dir}/{model_name}_ids_vs_fdr.png``
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    is_winner = result_df.get("is_tdc_winner", pd.Series(False, index=result_df.index)).fillna(False).astype(bool)
+    is_decoy = result_df.get("is_decoy", pd.Series(False, index=result_df.index)).fillna(False).astype(bool)
+    target_winners = result_df[is_winner & ~is_decoy].copy()
+
+    q_col = "q_value"
+    rw_col = "reweighted_q_value"
+
+    curves: list[tuple[str, str, str]] = []  # (column, label, colour)
+    if q_col in target_winners.columns:
+        curves.append((q_col, "TDC q-value", "steelblue"))
+    if rw_col in target_winners.columns and target_winners[rw_col].notna().any():
+        curves.append((rw_col, "Reweighted q-value", "darkorange"))
+
+    if not curves:
+        logger.warning("plot_ids_vs_fdr: no q_value or reweighted_q_value column — skipping")
+        return
+
+    fdr_grid = np.linspace(0.0, fdr_max, 500)
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+
+    for col, label, colour in curves:
+        vals = pd.to_numeric(target_winners[col], errors="coerce").dropna().values
+        if len(vals) == 0:
+            continue
+        n_ids = np.array([(vals <= t).sum() for t in fdr_grid])
+        ax.plot(fdr_grid * 100, n_ids, label=label, color=colour, lw=2)
+
+        for thresh, ls in [(0.01, "--"), (0.05, ":")]:
+            if thresh <= fdr_max:
+                n_at = int((vals <= thresh).sum())
+                ax.axvline(thresh * 100, color=colour, lw=0.8, ls=ls, alpha=0.6)
+                ax.annotate(
+                    f"{n_at}",
+                    xy=(thresh * 100, n_at),
+                    xytext=(4, 4),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color=colour,
+                )
+
+    ax.set_xlabel("FDR threshold (%)", fontsize=10)
+    ax.set_ylabel("Target identifications", fontsize=10)
+    ax.set_title(f"{model_name} — IDs vs FDR", fontsize=11)
+    ax.set_xlim(0, fdr_max * 100)
+    ax.set_ylim(bottom=0)
+    ax.legend(fontsize=9)
+    ax.grid(True, lw=0.4, alpha=0.4)
+    plt.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, f"{model_name}_ids_vs_fdr.png"),
+        dpi=120, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Subsystem 8: Protein colocalization by scoring group
+# ---------------------------------------------------------------------------
+
+_COLOC_COLS = [
+    ("protein_colocalization",         "Protein coloc. (mean r)"),
+    ("protein_colocalization_max",     "Protein coloc. (max r)"),
+    ("protein_colocalization_median",  "Protein coloc. (median r)"),
+    ("protein_colocalization_n_partners", "Protein coloc. (n partners)"),
+]
+
+_GROUP_ORDER  = ["ID @ 1% FDR", "R1 winner (below FDR)", "Non-winner"]
+_GROUP_COLORS = ["seagreen",     "darkorange",             "steelblue"]
+
+
+def plot_protein_colocalization_by_group(
+    features_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    out_dir: str,
+    fdr_threshold: float = 0.01,
+) -> None:
+    """
+    Box + strip plot of protein-level colocalization values split into three groups:
+      - ID @ 1% FDR  : round-2 TDC winner with reweighted_q_value <= fdr_threshold
+      - R1 winner     : round-2 TDC winner, but reweighted_q_value > fdr_threshold
+      - Non-winner    : did not make it to round 2
+
+    Only target (non-decoy) rows are shown, since decoy colocalization values
+    reflect the null model rather than biology.
+
+    Skips silently if none of the four colocalization columns are present.
+    Output: ``{out_dir}/protein_colocalization_by_group.png``
+    """
+    present = [col for col, _ in _COLOC_COLS if col in features_df.columns]
+    if not present:
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat = features_df.reset_index(drop=True)
+    res  = result_df.reset_index(drop=True)
+
+    is_decoy = (
+        feat.get("is_decoy", pd.Series(False, index=feat.index))
+        .fillna(False).astype(bool).values
+    )
+    is_winner = (
+        res.get("is_tdc_winner", pd.Series(False, index=res.index))
+        .fillna(False).astype(bool).values
+    )
+    rw_q = pd.to_numeric(
+        res.get("reweighted_q_value", pd.Series(float("nan"), index=res.index)),
+        errors="coerce",
+    ).values
+
+    passes_fdr = is_winner & (rw_q <= fdr_threshold)
+    r1_only    = is_winner & ~passes_fdr
+    non_winner = ~is_winner
+
+    group_label = np.where(
+        passes_fdr, _GROUP_ORDER[0],
+        np.where(r1_only, _GROUP_ORDER[1], _GROUP_ORDER[2]),
+    )
+
+    # Restrict to targets only
+    target_mask = ~is_decoy
+
+    n_cols = len(present)
+    fig, axes = plt.subplots(1, n_cols, figsize=(4.5 * n_cols, 5), sharey=False)
+    if n_cols == 1:
+        axes = [axes]
+
+    rng = np.random.default_rng(0)
+
+    for ax, col in zip(axes, present):
+        label = dict(_COLOC_COLS)[col]
+        vals  = pd.to_numeric(feat[col], errors="coerce").values.astype(float)
+
+        group_data: dict[str, np.ndarray] = {}
+        for grp in _GROUP_ORDER:
+            mask = target_mask & (group_label == grp)
+            v = vals[mask]
+            group_data[grp] = v[np.isfinite(v)]
+
+        positions = list(range(len(_GROUP_ORDER)))
+
+        # Box plots
+        bp_data = [group_data[g] for g in _GROUP_ORDER]
+        bp = ax.boxplot(
+            bp_data,
+            positions=positions,
+            widths=0.45,
+            patch_artist=True,
+            showfliers=False,
+            medianprops=dict(color="black", lw=1.8),
+            whiskerprops=dict(lw=1.0),
+            capprops=dict(lw=1.0),
+            boxprops=dict(lw=1.0),
+        )
+        for patch, color in zip(bp["boxes"], _GROUP_COLORS):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.45)
+
+        # Strip (jitter) overlay
+        for pos, (grp, color) in enumerate(zip(_GROUP_ORDER, _GROUP_COLORS)):
+            v = group_data[grp]
+            if len(v) == 0:
+                continue
+            jitter = rng.uniform(-0.18, 0.18, size=len(v))
+            ax.scatter(
+                pos + jitter, v,
+                s=12, alpha=0.55, color=color, linewidths=0, zorder=3,
+            )
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels(
+            [g.replace(" ", "\n") for g in _GROUP_ORDER],
+            fontsize=7,
+        )
+        ax.set_ylabel(label, fontsize=8)
+        ax.set_title(label, fontsize=9)
+        ax.tick_params(axis="y", labelsize=7)
+
+        # Horizontal reference line at r=0 for correlation columns
+        if "n_partners" not in col:
+            ax.axhline(0.0, color="gray", lw=0.8, ls="--", alpha=0.6)
+
+    # Sample size annotations — drawn after tight_layout sets final y limits.
+    for ax, col in zip(axes, present):
+        vals = pd.to_numeric(feat[col], errors="coerce").values.astype(float)
+        y_lo, y_top = ax.get_ylim()
+        y_ann = y_top + (y_top - y_lo) * 0.02
+        for pos, grp in enumerate(_GROUP_ORDER):
+            mask = target_mask & (group_label == grp)
+            n = int(np.isfinite(vals[mask]).sum())
+            ax.text(pos, y_ann, f"n={n}", ha="center", va="bottom", fontsize=7)
+
+    fig.suptitle(
+        f"Protein colocalization by scoring group (targets only, FDR threshold {fdr_threshold:.0%})",
+        fontsize=10, y=1.02,
+    )
+    plt.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, "protein_colocalization_by_group.png"),
+        dpi=120, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Subsystem 9: Target vs Decoy m/z distribution
+# ---------------------------------------------------------------------------
+
+
+def plot_target_decoy_mz_distribution(
+    features_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    out_dir: str,
+    fdr_threshold: float = 0.01,
+    n_bins: int = 60,
+) -> None:
+    """
+    Three-panel figure showing target vs decoy m/z coverage.
+
+    Panel 1 — Per-feature competition status (histogram):
+      Each MALDI feature is counted once:
+        - steelblue  : target-only  (no decoy candidate matched this feature)
+        - mediumpurple: contested   (at least one target AND one decoy)
+        - tomato     : decoy-only   (no target candidate matched this feature)
+
+    Panel 2 — All candidates, per-candidate density (target vs decoy):
+      Overlapping density histograms with dashed median lines.
+
+    Panel 3 — R1 winners only (best candidate per feature):
+      Same layout as Panel 2 but restricted to is_tdc_winner rows.
+      Shows the effective T:D ratio entering FDR estimation.
+
+    Output: ``{out_dir}/target_decoy_mz_distribution.png``
+    """
+    if "feature_mz" not in features_df.columns:
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat = features_df.reset_index(drop=True)
+    res = result_df.reset_index(drop=True)
+
+    is_decoy = (
+        feat.get("is_decoy", pd.Series(False, index=feat.index))
+        .fillna(False).astype(bool).values
+    )
+    is_winner = (
+        res.get("is_tdc_winner", pd.Series(False, index=res.index))
+        .fillna(False).astype(bool).values
+    )
+
+    fmz = pd.to_numeric(feat["feature_mz"], errors="coerce").values
+    finite = np.isfinite(fmz)
+
+    # --- Per-feature competition classification ---
+    target_fmz_set = set(fmz[~is_decoy & finite].tolist())
+    decoy_fmz_set  = set(fmz[is_decoy  & finite].tolist())
+
+    contested_arr   = np.array(sorted(target_fmz_set & decoy_fmz_set))
+    target_only_arr = np.array(sorted(target_fmz_set - decoy_fmz_set))
+    decoy_only_arr  = np.array(sorted(decoy_fmz_set  - target_fmz_set))
+    all_fmz_arr     = np.concatenate([contested_arr, target_only_arr, decoy_only_arr])
+
+    # Per-candidate m/z arrays
+    t_mz     = fmz[~is_decoy & finite]
+    d_mz     = fmz[ is_decoy & finite]
+    t_win    = fmz[~is_decoy & is_winner & finite]
+    d_win    = fmz[ is_decoy & is_winner & finite]
+
+    if len(all_fmz_arr) == 0:
+        return
+
+    lo = float(np.percentile(all_fmz_arr, 1))
+    hi = float(np.percentile(all_fmz_arr, 99))
+    if lo >= hi:
+        lo, hi = float(all_fmz_arr.min()), float(all_fmz_arr.max())
+    bins = np.linspace(lo, hi, n_bins + 1)
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 11))
+
+    # ------------------------------------------------------------------
+    # Panel 1: per-feature competition status
+    # ------------------------------------------------------------------
+    ax = axes[0]
+    if len(target_only_arr):
+        ax.hist(target_only_arr, bins=bins, alpha=0.70, color="steelblue",
+                label=f"Target-only ({len(target_only_arr)})")
+    if len(contested_arr):
+        ax.hist(contested_arr, bins=bins, alpha=0.70, color="mediumpurple",
+                label=f"Contested ({len(contested_arr)})")
+    if len(decoy_only_arr):
+        ax.hist(decoy_only_arr, bins=bins, alpha=0.70, color="tomato",
+                label=f"Decoy-only ({len(decoy_only_arr)})")
+
+    n_total = len(target_only_arr) + len(contested_arr) + len(decoy_only_arr)
+    ax.set_title(
+        f"Per-feature competition status  "
+        f"({n_total} features: {len(target_only_arr)} T-only, "
+        f"{len(contested_arr)} contested, {len(decoy_only_arr)} D-only)",
+        fontsize=9,
+    )
+    ax.set_ylabel("Number of features", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.tick_params(labelsize=8)
+
+    # ------------------------------------------------------------------
+    # Panel 2: all candidates
+    # ------------------------------------------------------------------
+    ax = axes[1]
+    for arr, color, label in [
+        (t_mz, "steelblue", f"Target (n={len(t_mz)})"),
+        (d_mz, "tomato",    f"Decoy (n={len(d_mz)})"),
+    ]:
+        if len(arr):
+            ax.hist(arr, bins=bins, density=True, alpha=0.50, color=color, label=label)
+            ax.axvline(float(np.median(arr)), color=color, lw=1.5, ls="--", alpha=0.85)
+
+    ratio_str = (
+        f"T:D = {len(t_mz)}/{len(d_mz)} = {len(t_mz)/len(d_mz):.2f}:1"
+        if len(d_mz) else f"T:D = {len(t_mz)}/0"
+    )
+    ax.set_title(f"All candidates  ({ratio_str})", fontsize=9)
+    ax.set_ylabel("Density", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.tick_params(labelsize=8)
+
+    # ------------------------------------------------------------------
+    # Panel 3: R1 winners
+    # ------------------------------------------------------------------
+    ax = axes[2]
+    for arr, color, label in [
+        (t_win, "steelblue", f"Target R1 winners (n={len(t_win)})"),
+        (d_win, "tomato",    f"Decoy R1 winners (n={len(d_win)})"),
+    ]:
+        if len(arr):
+            ax.hist(arr, bins=bins, density=True, alpha=0.50, color=color, label=label)
+            ax.axvline(float(np.median(arr)), color=color, lw=1.5, ls="--", alpha=0.85)
+
+    win_ratio_str = (
+        f"T:D = {len(t_win)}/{len(d_win)} = {len(t_win)/len(d_win):.2f}:1"
+        if len(d_win) else f"T:D = {len(t_win)}/0"
+    )
+    ax.set_title(f"R1 winners (best per feature)  ({win_ratio_str})", fontsize=9)
+    ax.set_xlabel("Feature m/z", fontsize=9)
+    ax.set_ylabel("Density", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.tick_params(labelsize=8)
+
+    fig.suptitle("Target vs Decoy m/z Distributions", fontsize=11)
+    plt.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, "target_decoy_mz_distribution.png"),
+        dpi=120, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Ground-truth helpers
 # ---------------------------------------------------------------------------
 
@@ -1272,6 +1656,38 @@ def save_debug_figures(
             logger.info("CCS scatter saved to %s/ccs_scatter.png", debug_dir)
     except Exception as exc:
         logger.warning("CCS scatter failed: %s", exc)
+
+    try:
+        plot_ids_vs_fdr(
+            result_df,
+            out_dir=debug_dir,
+            model_name=model_name,
+        )
+        logger.info("IDs vs FDR curve saved to %s/%s_ids_vs_fdr.png", debug_dir, model_name)
+    except Exception as exc:
+        logger.warning("IDs vs FDR curve failed: %s", exc)
+
+    try:
+        plot_protein_colocalization_by_group(
+            features_df, result_df,
+            out_dir=debug_dir,
+        )
+        if any(col in features_df.columns for col, _ in _COLOC_COLS):
+            logger.info(
+                "Protein colocalization by group saved to %s/protein_colocalization_by_group.png",
+                debug_dir,
+            )
+    except Exception as exc:
+        logger.warning("Protein colocalization by group plot failed: %s", exc)
+
+    try:
+        plot_target_decoy_mz_distribution(
+            features_df, result_df,
+            out_dir=debug_dir,
+        )
+        logger.info("T/D m/z distribution saved to %s/target_decoy_mz_distribution.png", debug_dir)
+    except Exception as exc:
+        logger.warning("T/D m/z distribution plot failed: %s", exc)
 
     if importances_r1 is not None or importances_r2 is not None:
         imp_names = importance_names or feature_names or []
