@@ -7,7 +7,6 @@ and return feature values. No function takes an is_decoy parameter.
 
 import logging
 import os
-import pickle
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -60,7 +59,6 @@ class LCMSData:
 
 def load_lcms_data(
     mzml_paths: list[str],
-    cache_path: str | None = None,
 ) -> LCMSData:
     """
     Load MS1 and MS2 scans from mzML or Bruker .d files into indexed arrays.
@@ -73,17 +71,10 @@ def load_lcms_data(
     ----------
     mzml_paths
         Paths to mzML files or a single Bruker .d folder.
-    cache_path
-        If provided, cache loaded data to this pickle file for fast reloading.
     """
-    if cache_path and os.path.exists(cache_path):
-        logger.info(f"Loading cached LC-MS/MS data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
     # Route Bruker .d files to the alphatims loader
     if len(mzml_paths) == 1 and mzml_paths[0].rstrip("/\\").endswith(".d"):
-        return load_lcms_data_from_d(mzml_paths[0], cache_path=cache_path)
+        return load_lcms_data_from_d(mzml_paths[0])
 
     from pyteomics import mzml
 
@@ -167,18 +158,11 @@ def load_lcms_data(
         f"from {len(mzml_paths)} files"
     )
 
-    if cache_path:
-        logger.info(f"Caching LC-MS/MS data to {cache_path}")
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
     return data
 
 
 def load_lcms_data_from_d(
     d_path: str,
-    cache_path: str | None = None,
 ) -> LCMSData:
     """
     Load MS1 and MS2 scan data from a Bruker timsTOF .d folder using alphatims.
@@ -190,10 +174,6 @@ def load_lcms_data_from_d(
 
     Requires: ``pip install alphatims``
     """
-    if cache_path and os.path.exists(cache_path):
-        logger.info(f"Loading cached LC-MS/MS data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
 
     try:
         import alphatims.bruker as atb
@@ -283,12 +263,6 @@ def load_lcms_data_from_d(
         f"{len(result.ms2_precursor_mz)} MS2 precursors from {d_path}"
     )
 
-    if cache_path:
-        logger.info(f"Caching LC-MS/MS data to {cache_path}")
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
-
     return result
 
 
@@ -368,7 +342,6 @@ def _match_and_score_spectrum(
 def get_ms2pip_predictions(
     peptide_charge_pairs: list[tuple[str, int]],
     model: str = "timsTOF2024",
-    cache_path: str | None = None,
 ) -> dict[tuple[str, int], tuple[np.ndarray, np.ndarray]]:
     """
     Batch predict MS2 spectra for specific (peptide, charge) pairs using MS2PIP.
@@ -381,11 +354,6 @@ def get_ms2pip_predictions(
     Returns dict mapping (peptide, charge) → (mz_array, intensity_array)
     where mz_array and intensity_array are concatenated b+y ions sorted by m/z.
     """
-    if cache_path and os.path.exists(cache_path):
-        logger.info(f"Loading cached MS2PIP predictions from {cache_path}")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
     from ms2pip.core import predict_batch
     from psm_utils import PSM, PSMList, Peptidoform
 
@@ -433,13 +401,6 @@ def get_ms2pip_predictions(
             cache[(pep, charge)] = (all_mz[sort_order], all_int[sort_order])
 
     logger.info(f"MS2PIP: {len(cache)} predictions total")
-
-    if cache_path:
-        logger.info(f"Caching MS2PIP predictions to {cache_path}")
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
-
     return cache
 
 
@@ -526,7 +487,6 @@ def extract_all_xics(
 
 def finetune_deeplc(
     msf_path: str,
-    cache_path: str | None = None,
 ):
     """
     Finetune DeepLC on high-confidence PSMs from PD .msf file.
@@ -534,12 +494,6 @@ def finetune_deeplc(
     Uses only observed retention times for calibration — no target/decoy labels
     are used in the finetuned model.
     """
-    import torch
-
-    if cache_path and os.path.exists(cache_path):
-        logger.info(f"Loading cached DeepLC model from {cache_path}")
-        return torch.load(cache_path, weights_only=False)
-
     import sqlite3
 
     from deeplc.core import finetune
@@ -579,18 +533,11 @@ def finetune_deeplc(
     )
 
     model = finetune(psm_list)
-
-    if cache_path:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        torch.save(model, cache_path)
-        logger.info(f"Saved finetuned DeepLC model to {cache_path}")
-
     return model
 
 
 def finetune_deeplc_from_df(
     rt_df: "pd.DataFrame",
-    cache_path: str | None = None,
 ):
     """
     Finetune DeepLC on a DataFrame with columns ``sequence`` and ``rt_mean``
@@ -599,12 +546,6 @@ def finetune_deeplc_from_df(
     Used when an MSF file is not available (e.g. FragPipe output).
     ``rt_df`` is typically ``lcms_ids.peptides[["sequence", "rt_mean"]].dropna()``.
     """
-    import torch
-
-    if cache_path and os.path.exists(cache_path):
-        logger.info(f"Loading cached DeepLC model from {cache_path}")
-        return torch.load(cache_path, weights_only=False)
-
     from deeplc.core import finetune
     from psm_utils import PSM, PSMList, Peptidoform
 
@@ -629,30 +570,18 @@ def finetune_deeplc_from_df(
     )
 
     model = finetune(psm_list)
-
-    if cache_path:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        torch.save(model, cache_path)
-        logger.info(f"Saved finetuned DeepLC model to {cache_path}")
-
     return model
 
 
 def get_deeplc_predictions(
     unique_peptides: list[str],
     model=None,
-    cache_path: str | None = None,
 ) -> dict[str, float]:
     """
     Batch predict retention times for all unique peptides.
 
     Returns dict mapping peptide → predicted_rt.
     """
-    if cache_path and os.path.exists(cache_path):
-        logger.info(f"Loading cached DeepLC predictions from {cache_path}")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
     from deeplc.core import predict
     from psm_utils import PSM, PSMList, Peptidoform
 
@@ -665,14 +594,7 @@ def get_deeplc_predictions(
     )
 
     predicted_rts = predict(psm_list, model=model)
-    cache = dict(zip(unique_peptides, predicted_rts))
-
-    if cache_path:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    return cache
+    return dict(zip(unique_peptides, predicted_rts))
 
 
 # ---------------------------------------------------------------------------

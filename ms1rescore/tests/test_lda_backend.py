@@ -72,7 +72,8 @@ class TestRescoreLDA:
     def scores(self):
         df = _make_features_df()
         feat = [f for f in MALDI_INTRINSIC_FEATURES if f in df.columns]
-        return _rescore_lda(df, feat, init_ppm_threshold=2.0, init_isotope_threshold=0.7)
+        scores, _, _ = _rescore_lda(df, feat, init_ppm_threshold=2.0)
+        return scores
 
     def test_returns_ndarray(self, scores):
         assert isinstance(scores, np.ndarray)
@@ -100,11 +101,11 @@ def _build_result_df(df: pd.DataFrame) -> pd.DataFrame:
     feat = [f for f in MALDI_INTRINSIC_FEATURES if f in df.columns]
     feature_col = "feature_mz"
 
-    scores1 = _rescore_lda(df, feat, init_ppm_threshold=2.0, init_isotope_threshold=0.7)
+    scores1, _, _ = _rescore_lda(df, feat, init_ppm_threshold=2.0)
 
     winner_pos, winners_df = _select_feature_winners(df, scores1, feature_col)
 
-    scores2 = _rescore_lda(winners_df, feat, init_ppm_threshold=2.0, init_isotope_threshold=0.7)
+    scores2, _, _ = _rescore_lda(winners_df, feat, init_ppm_threshold=2.0)
 
     is_decoy_w = winners_df["is_decoy"].values.astype(bool)
     q2 = _tdc_qvalues(scores2, is_decoy_w)

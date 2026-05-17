@@ -10,6 +10,8 @@ import pandas as pd
 from ms1rescore.candidates import (
     digest_fasta,
     digest_identified_proteins,
+    generate_balanced_shuffle_candidates,
+    generate_mz_shift_candidates,
     match_to_maldi_features,
 )
 from ms1rescore.feature_generator import (
@@ -260,8 +262,8 @@ def _rescore_catboost(
         # Provisional TDC q-values (higher score = better)
         q_values = _tdc_qvalues(scores, is_decoy)
 
-        # Expand pseudo-positives: all targets with q <= 0.05
-        new_seed = is_target & (q_values <= 0.05)
+        # Expand pseudo-positives: all targets with q <= 0.1
+        new_seed = is_target & (q_values <= 0.1)
         n_new = new_seed.sum()
 
         logger.info(
@@ -353,7 +355,7 @@ def _rescore_lda(
         pipe = Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            ("lda", LinearDiscriminantAnalysis()),
+            ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
         ])
         pipe.fit(X[train_idx], y_train)
         scores = pipe.decision_function(X).ravel()  # ensure 1-D for binary case
@@ -493,7 +495,6 @@ def rescore(
     msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
     train_fdr: float = 0.01,
-    cache_dir: str | None = None,
     missed_cleavages: int = 2,
     min_length: int = 7,
     max_length: int = 30,
@@ -520,6 +521,12 @@ def rescore(
     digest: bool = False,
     gt_peptides: list[str] | None = None,
     maldi_intensities: np.ndarray | None = None,
+    decoy_method: str = "shuffle",
+    mz_shift_delta_min: float = 5.0,
+    mz_shift_delta_max: float = 20.0,
+    mz_shift_snap_tolerance_ppm: float = 50.0,
+    max_shuffle_rounds: int = 50,
+    target_ratio: float = 1.0,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -551,8 +558,6 @@ def rescore(
         Mass tolerance for MALDI-to-database matching in ppm.
     train_fdr
         FDR threshold for mokapot training (SVM backend only).
-    cache_dir
-        Directory for caching intermediate results.
     missed_cleavages
         Number of missed cleavages for in-silico digest.
     min_length
@@ -615,12 +620,6 @@ def rescore(
         (targets + decoys). The reweighted values incorporate the LC-MS/MS
         prior multiplicative weight.
     """
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
-
-    def _cache(name):
-        return os.path.join(cache_dir, name) if cache_dir else None
-
     # --- Step 1: Candidate generation ---
     # Default (digest=False): use only LC-MS/MS identified peptides as candidates.
     # With digest=True: also digest the provided FASTA for additional candidates.
@@ -736,14 +735,57 @@ def rescore(
     if maldi_intensities is not None:
         _maldi_intensities_arr = np.asarray(maldi_intensities, dtype=np.float32)
         logger.info("  Using SCiLS per-feature intensities for log_maldi_intensity")
-    candidates = match_to_maldi_features(
-        maldi_mzs,
-        peptide_db,
-        ppm_tolerance,
-        maldi_intensities=_maldi_intensities_arr,
-        maldi_intensities_p90=maldi_intensities_p90,
-        maldi_intensities_sum=maldi_intensities_sum,
-    )
+    if decoy_method == "mz_shift":
+        # Strip any shuffle decoys that may have been added (e.g. from extra_fasta).
+        # generate_mz_shift_candidates() works exclusively with target peptides and
+        # generates its own decoys via shifted m/z queries.
+        target_db = peptide_db[~peptide_db["is_decoy"].astype(bool)].reset_index(drop=True)
+        logger.info(
+            "Step 1c: Generating m/z-shift observation-space decoys "
+            f"(delta {mz_shift_delta_min}–{mz_shift_delta_max} Da)..."
+        )
+        candidates = generate_mz_shift_candidates(
+            target_db,
+            maldi_mzs,
+            matching_ppm=ppm_tolerance,
+            delta_min=mz_shift_delta_min,
+            delta_max=mz_shift_delta_max,
+            snap_tolerance_ppm=mz_shift_snap_tolerance_ppm,
+            maldi_intensities=_maldi_intensities_arr,
+            maldi_intensities_p90=maldi_intensities_p90,
+            maldi_intensities_sum=maldi_intensities_sum,
+        )
+    elif decoy_method == "balanced_shuffle":
+        # Pass fasta_path only when --digest is active (Strategy A or C with digest).
+        # LC-only mode (digest=False, lcms_ids set): fasta_path=None triggers pseudo-protein.
+        _bshuffle_fasta = fasta_path if digest else None
+        logger.info(
+            "Step 1c: Generating balanced shuffle observation-space decoys "
+            f"(max {max_shuffle_rounds} rounds, target_ratio={target_ratio})..."
+        )
+        candidates = generate_balanced_shuffle_candidates(
+            fasta_path=_bshuffle_fasta,
+            lcms_ids=lcms_ids,
+            feature_mzs=maldi_mzs,
+            matching_ppm=ppm_tolerance,
+            max_shuffle_rounds=max_shuffle_rounds,
+            target_ratio=target_ratio,
+            maldi_intensities=_maldi_intensities_arr,
+            maldi_intensities_p90=maldi_intensities_p90,
+            maldi_intensities_sum=maldi_intensities_sum,
+            missed_cleavages=missed_cleavages,
+            min_length=min_length,
+            max_length=max_length,
+        )
+    else:
+        candidates = match_to_maldi_features(
+            maldi_mzs,
+            peptide_db,
+            ppm_tolerance,
+            maldi_intensities=_maldi_intensities_arr,
+            maldi_intensities_p90=maldi_intensities_p90,
+            maldi_intensities_sum=maldi_intensities_sum,
+        )
     if verbose:
         logger.debug(f"Writing matched candidates to {output_dir}/9_debug_candidates.tsv")
         candidates.to_csv(f"{output_dir}/9_debug_candidates.tsv", sep="\t", index=False)
@@ -763,7 +805,7 @@ def rescore(
     if mzml_paths:
         # --- Step 2: Load LC-MS/MS data ---
         logger.info("Step 2: Loading LC-MS/MS data...")
-        lcms_data = load_lcms_data(mzml_paths, cache_path=_cache("lcms_data.pkl"))
+        lcms_data = load_lcms_data(mzml_paths)
         if verbose:
             logger.debug(f"Writing LC-MS/MS data to {output_dir}/10_debug_lcms_data.pkl")
             with open(f"{output_dir}/10_debug_lcms_data.pkl", "wb") as f:
@@ -799,33 +841,18 @@ def rescore(
         ms2pip_cache = get_ms2pip_predictions(
             list(peptide_charge_pairs),
             model="timsTOF2024",
-            cache_path=_cache("ms2pip_predictions.pkl"),
         )
 
         # --- Step 4: DeepLC predictions ---
         logger.info("Step 4: Computing DeepLC predictions...")
         unique_peptides = candidates["peptide"].unique().tolist()
         deeplc_model = None
-        _model_cache = _cache("deeplc_model.pt")
-        _model_was_cached = _model_cache is not None and os.path.exists(_model_cache)
         if msf_path:
-            deeplc_model = finetune_deeplc(msf_path, cache_path=_model_cache)
+            deeplc_model = finetune_deeplc(msf_path)
         elif lcms_ids is not None:
             # rt_mean is in minutes after unit auto-detection in _join_psm_rt_intensity.
-            deeplc_model = finetune_deeplc_from_df(
-                lcms_ids.peptides, cache_path=_model_cache
-            )
-        _pred_cache = _cache("deeplc_predictions.pkl")
-        # If model was freshly trained (not loaded from cache), the existing
-        # predictions cache is stale — delete it so predictions are recomputed.
-        if not _model_was_cached and _pred_cache is not None and os.path.exists(_pred_cache):
-            os.remove(_pred_cache)
-            logger.info("  Deleted stale DeepLC predictions cache (model was retrained)")
-        deeplc_cache = get_deeplc_predictions(
-            unique_peptides,
-            model=deeplc_model,
-            cache_path=_pred_cache,
-        )
+            deeplc_model = finetune_deeplc_from_df(lcms_ids.peptides)
+        deeplc_cache = get_deeplc_predictions(unique_peptides, model=deeplc_model)
 
         # Estimate MS1 RT window from fine-tuning calibration error.
         # Window = 2 × 95th-percentile |predicted - observed| RT for calibration peptides.

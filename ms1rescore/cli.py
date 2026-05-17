@@ -656,6 +656,67 @@ def build_parser() -> argparse.ArgumentParser:
             "--lcms-peptides is provided. Default for Strategy A: 30."
         ),
     )
+    cand.add_argument(
+        "--decoy-method",
+        choices=("shuffle", "mz_shift", "balanced_shuffle"),
+        default="shuffle",
+        help=(
+            "Decoy generation strategy. 'shuffle' (default): K/R-preserving protein "
+            "shuffle, standard target-decoy competition. 'mz_shift': observation-space "
+            "decoys — each target peptide generates a shifted m/z query "
+            "(delta_min..delta_max Da away) that is matched against MALDI features. "
+            "'balanced_shuffle': iterative K/R-preserving protein shuffle with MALDI-match "
+            "filtering — only shuffled peptides that match a MALDI feature are kept, "
+            "subsampled to target_ratio * N_target. Ensures ~1:1 T:D even when the "
+            "MALDI feature list is sparse."
+        ),
+    )
+    cand.add_argument(
+        "--mz-shift-delta-min",
+        type=float,
+        default=5.0,
+        metavar="FLOAT",
+        help="mz_shift only: minimum absolute m/z shift in Da (default 5.0).",
+    )
+    cand.add_argument(
+        "--mz-shift-delta-max",
+        type=float,
+        default=20.0,
+        metavar="FLOAT",
+        help="mz_shift only: maximum absolute m/z shift in Da (default 20.0).",
+    )
+    cand.add_argument(
+        "--mz-shift-snap-tolerance-ppm",
+        type=float,
+        default=50.0,
+        metavar="FLOAT",
+        help=(
+            "mz_shift only: maximum ppm distance between the shifted query and the "
+            "nearest MALDI feature for the snap to be accepted (default 50.0). "
+            "Increase for sparse feature lists."
+        ),
+    )
+    cand.add_argument(
+        "--max-shuffle-rounds",
+        type=int,
+        default=50,
+        metavar="INT",
+        help=(
+            "balanced_shuffle only: maximum number of shuffle rounds to attempt when "
+            "collecting decoy candidates (default 50). Increase if T:D ratio is low "
+            "due to sparse MALDI features."
+        ),
+    )
+    cand.add_argument(
+        "--decoy-target-ratio",
+        type=float,
+        default=1.0,
+        metavar="FLOAT",
+        help=(
+            "balanced_shuffle only: target T:D candidate ratio (default 1.0). "
+            "The function collects up to int(ratio * N_target) decoy candidates."
+        ),
+    )
 
     # --- Rescoring ---
     rescore_grp = parser.add_argument_group("rescoring")
@@ -825,15 +886,6 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="ProteomeDiscoverer .msf file for DeepLC retention-time finetuning.",
     )
-    extras.add_argument(
-        "--cache-dir",
-        metavar="PATH",
-        help=(
-            "Directory for caching intermediate results "
-            "(MS2PIP predictions, DeepLC predictions, LC-MS/MS data)."
-        ),
-    )
-
     # --- Output ---
     out_grp = parser.add_argument_group("output")
     out_grp.add_argument(
@@ -1160,7 +1212,6 @@ def main() -> None:
         msf_path=args.msf,
         ppm_tolerance=args.ppm_tolerance,
         train_fdr=args.train_fdr,
-        cache_dir=args.cache_dir,
         missed_cleavages=missed_cleavages,
         min_length=min_length,
         max_length=max_length,
@@ -1186,6 +1237,12 @@ def main() -> None:
         digest=args.digest,
         gt_peptides=gt_peptides,
         maldi_intensities=_mzs_intensities,
+        decoy_method=args.decoy_method,
+        mz_shift_delta_min=args.mz_shift_delta_min,
+        mz_shift_delta_max=args.mz_shift_delta_max,
+        mz_shift_snap_tolerance_ppm=args.mz_shift_snap_tolerance_ppm,
+        max_shuffle_rounds=args.max_shuffle_rounds,
+        target_ratio=args.decoy_target_ratio,
     )
 
     # --- Write results ---
@@ -1207,6 +1264,12 @@ def main() -> None:
         logger.info(
             "%d/%d GT peptides are round-2 winners at 1%% FDR.",
             n_gt_winners_fdr, len(gt_set),
+        )
+        winners_fdr_5 = winners[winners['q_value'] < 0.05]
+        n_gt_winners_fdr_5 = winners_fdr_5["peptide"].isin(gt_set).sum()
+        logger.debug(
+            "%d/%d GT peptides are round-2 winners at 5%% FDR.",
+            n_gt_winners_fdr_5, len(gt_set),
         )
     logger.info("Done.")
 

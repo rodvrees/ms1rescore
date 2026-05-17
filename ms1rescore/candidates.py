@@ -242,6 +242,424 @@ def match_to_maldi_features(
     return result
 
 
+def generate_mz_shift_candidates(
+    target_df: pd.DataFrame,
+    feature_mzs: np.ndarray,
+    matching_ppm: float = 20.0,
+    delta_min: float = 5.0,
+    delta_max: float = 20.0,
+    snap_tolerance_ppm: float = 50.0,
+    random_state: int = 42,
+    maldi_intensities: np.ndarray | None = None,
+    maldi_intensities_p90: np.ndarray | None = None,
+    maldi_intensities_sum: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """
+    Generate m/z-shifted observation-space decoys and return a combined
+    target + decoy candidates DataFrame.
+
+    For each unique target peptide a random delta in [delta_min, delta_max] Da
+    is sampled; sign alternates (even index → +, odd index → −).  The shifted
+    query is snapped to the nearest MALDI feature.  If that feature is within
+    snap_tolerance_ppm of the shifted query and does not collide with any target
+    peptide m/z (within matching_ppm), it becomes the decoy feature.  Up to 10
+    resamples are attempted before the peptide's decoy is skipped.
+
+    ppm_error on decoy rows is copied from the peptide's best target match
+    (minimum ppm_error_abs in target_candidates).  This makes ppm_error
+    non-discriminative between a target and its paired decoy, ensuring that
+    score separation comes from isotope envelope, spatial, and intensity features.
+
+    decoy_delta_da stores snapped_feature_mz − peptide_mh_mz (the actual mass
+    offset to the chosen decoy feature, not the sampled delta).
+
+    Returns a DataFrame with the same schema as match_to_maldi_features()
+    plus a decoy_delta_da column (NaN for targets).
+    """
+    rng = np.random.default_rng(random_state)
+    feature_mzs = np.asarray(feature_mzs, dtype=np.float64)
+    n_features = len(feature_mzs)
+    tol_frac = matching_ppm * 1e-6
+
+    # Unique target peptides indexed 0..N-1
+    unique_pep = (
+        target_df[~target_df["is_decoy"].astype(bool)]
+        .drop_duplicates(subset="peptide")
+        .reset_index(drop=True)
+    )
+    n_unique = len(unique_pep)
+    target_mzs_sorted = np.sort(unique_pep["mh_mz"].values.astype(np.float64))
+
+    # Pre-sort feature array once for O(log n) nearest-feature lookup
+    feat_sort_idx = np.argsort(feature_mzs)
+    feat_sorted = feature_mzs[feat_sort_idx]
+
+    # Per-peptide outputs (-1 = no valid decoy feature found)
+    decoy_orig_idx = np.full(n_unique, -1, dtype=np.int64)
+    decoy_feat_mz  = np.full(n_unique, np.nan)
+    decoy_actual_delta = np.full(n_unique, np.nan)
+
+    for i in range(n_unique):
+        orig = float(unique_pep.at[i, "mh_mz"])
+        sign = 1.0 if i % 2 == 0 else -1.0
+        for _attempt in range(10):
+            delta = float(rng.uniform(delta_min, delta_max))
+            shifted = orig + sign * delta
+            if shifted <= 0:
+                sign = 1.0
+                continue
+
+            # Find the nearest feature to the shifted query
+            pos = int(np.searchsorted(feat_sorted, shifted))
+            best_pos, best_dist = -1, np.inf
+            for cand in (pos - 1, pos):
+                if 0 <= cand < n_features:
+                    d = abs(feat_sorted[cand] - shifted)
+                    if d < best_dist:
+                        best_dist, best_pos = d, cand
+            if best_pos < 0:
+                continue
+
+            # Snap tolerance check
+            if best_dist / shifted * 1e6 > snap_tolerance_ppm:
+                sign = -sign
+                continue
+
+            nearest_mz = feat_sorted[best_pos]
+
+            # Collision check: snapped feature must not be within matching_ppm
+            # of any target peptide m/z (covers self-match implicitly)
+            lo = np.searchsorted(target_mzs_sorted, nearest_mz * (1.0 - tol_frac), side="left")
+            hi = np.searchsorted(target_mzs_sorted, nearest_mz * (1.0 + tol_frac), side="right")
+            if lo < hi:
+                sign = -sign
+                continue
+
+            decoy_orig_idx[i] = int(feat_sort_idx[best_pos])
+            decoy_feat_mz[i] = nearest_mz
+            decoy_actual_delta[i] = nearest_mz - orig
+            break
+        else:
+            logger.warning(
+                "mz_shift: no valid decoy found for '%s' (mh_mz=%.4f) after 10 attempts",
+                unique_pep.at[i, "peptide"], orig,
+            )
+
+    valid_mask = decoy_orig_idx >= 0
+    n_valid = int(valid_mask.sum())
+    logger.info("mz_shift: %d/%d target peptides have valid decoy features", n_valid, n_unique)
+
+    # --- Match targets against MALDI features (normal path) ---
+    target_candidates = match_to_maldi_features(
+        feature_mzs, target_df, matching_ppm,
+        maldi_intensities=maldi_intensities,
+        maldi_intensities_p90=maldi_intensities_p90,
+        maldi_intensities_sum=maldi_intensities_sum,
+    )
+    target_candidates["decoy_delta_da"] = np.nan
+    if "source" not in target_candidates.columns:
+        target_candidates["source"] = "target"
+
+    if n_valid == 0:
+        logger.warning("mz_shift: no valid decoy features found — returning target-only candidates")
+        return target_candidates
+
+    # Build ppm_error lookup per peptide: use the target match with the smallest
+    # ppm_error_abs so the decoy inherits the same non-discriminative ppm value.
+    if "ppm_error" in target_candidates.columns and "peptide" in target_candidates.columns:
+        _tc = target_candidates[["peptide", "ppm_error", "ppm_error_abs"]].copy()
+        _best_idx = _tc.groupby("peptide")["ppm_error_abs"].idxmin()
+        pep_ppm_map: pd.Series = (
+            _tc.loc[_best_idx, ["peptide", "ppm_error"]]
+            .set_index("peptide")["ppm_error"]
+        )
+    else:
+        pep_ppm_map = pd.Series(dtype=float)
+
+    valid_pep_rows = unique_pep[valid_mask].reset_index(drop=True)
+    valid_orig_idx = decoy_orig_idx[valid_mask]
+    valid_feat_mz  = decoy_feat_mz[valid_mask]
+    valid_delta    = decoy_actual_delta[valid_mask]
+
+    # --- Build decoy rows ---
+    # LC-MS/MS evidence columns are intentionally preserved from the source target
+    # peptide.  The decoy is the same sequence at a different MALDI feature;
+    # wiping them would give decoys systematically worse priors, breaking TDC symmetry.
+    decoy_df = valid_pep_rows.copy()
+    decoy_df["is_decoy"] = True
+    decoy_df["source"] = "decoy_mz_shift"
+    decoy_df["feature_mz"]  = valid_feat_mz
+    decoy_df["feature_idx"] = valid_orig_idx.astype(int)
+    # ppm_error copied from the target match — not computed from the decoy feature,
+    # because that would be ~δ/mz * 1e6 (thousands of ppm) and leak the label.
+    decoy_df["ppm_error"]     = decoy_df["peptide"].map(pep_ppm_map).fillna(0.0)
+    decoy_df["ppm_error_abs"] = decoy_df["ppm_error"].abs()
+    # actual offset from peptide mass to chosen decoy feature (diagnostic only)
+    decoy_df["decoy_delta_da"] = valid_delta
+
+    fi_vals = valid_orig_idx.astype(int)
+    if maldi_intensities_p90 is not None:
+        decoy_df["feature_intensity_p90"] = maldi_intensities_p90[fi_vals]
+    if maldi_intensities_sum is not None:
+        decoy_df["feature_intensity_sum"] = maldi_intensities_sum[fi_vals]
+    if maldi_intensities is not None:
+        decoy_df["feature_intensity"] = maldi_intensities[fi_vals]
+
+    kendrick = decoy_df["feature_mz"].values * (14.0 / 14.01565)
+    decoy_df["kendrick_mass_defect"] = np.floor(kendrick) - kendrick
+
+    # --- Combine and recompute per-feature statistics ---
+    result = pd.concat([target_candidates, decoy_df], ignore_index=True)
+    result["is_decoy"] = result["is_decoy"].astype(bool)
+    result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")
+    prot_feat_count = result.groupby("protein")["feature_mz"].nunique()
+    result["protein_n_features"] = result["protein"].map(prot_feat_count).fillna(0).astype(int)
+
+    logger.info(
+        "mz_shift: %d features → %d target + %d decoy candidates",
+        result["feature_mz"].nunique(),
+        int((~result["is_decoy"]).sum()),
+        int(result["is_decoy"].sum()),
+    )
+    return result
+
+
+def generate_balanced_shuffle_candidates(
+    fasta_path: str | None,
+    lcms_ids,
+    feature_mzs: np.ndarray,
+    matching_ppm: float = 20.0,
+    max_shuffle_rounds: int = 50,
+    target_ratio: float = 1.0,
+    random_state: int = 42,
+    maldi_intensities: np.ndarray | None = None,
+    maldi_intensities_p90: np.ndarray | None = None,
+    maldi_intensities_sum: np.ndarray | None = None,
+    missed_cleavages: int = 2,
+    min_length: int = 7,
+    max_length: int = 50,
+    enzyme: str = "trypsin",
+) -> pd.DataFrame:
+    """
+    Generate balanced shuffle decoys with MALDI-match filtering.
+
+    Runs up to max_shuffle_rounds rounds of K/R-preserving protein shuffle,
+    keeping only decoy peptides that match a MALDI feature within matching_ppm.
+    Subsample the collected pool to int(target_ratio * N_target) candidates.
+
+    Unlike standard shuffle (one decoy per target regardless of MALDI match),
+    this ensures decoys compete in the same observation space as targets.
+    LC-MS/MS evidence columns are set to NaN for all decoy rows — shuffle
+    decoys have different sequences from their parent targets, so inheriting
+    evidence would break TDC symmetry.
+
+    Returns a DataFrame with the same schema as match_to_maldi_features()
+    plus decoy_delta_da (NaN for all rows) and source columns.
+    """
+    feature_mzs = np.asarray(feature_mzs, dtype=np.float64)
+    enzyme_rule = parser.expasy_rules.get(enzyme, enzyme)
+
+    # --- Step 1: Generate target peptides (no decoys) ---
+    logger.info("balanced_shuffle Step 1: generating target peptides...")
+    if lcms_ids is not None:
+        target_db = digest_identified_proteins(
+            fasta_path=fasta_path,
+            lcms_ids=lcms_ids,
+            enzyme=enzyme,
+            missed_cleavages=missed_cleavages,
+            min_length=min_length,
+            max_length=max_length,
+            generate_decoys=False,
+        )
+    else:
+        if fasta_path is None:
+            raise ValueError("fasta_path required when lcms_ids is None")
+        target_db = digest_fasta(
+            fasta_path,
+            enzyme=enzyme,
+            missed_cleavages=missed_cleavages,
+            min_length=min_length,
+            max_length=max_length,
+            generate_decoys=False,
+        )
+
+    # --- Step 2: Match targets to MALDI features ---
+    target_candidates = match_to_maldi_features(
+        feature_mzs, target_db, matching_ppm,
+        maldi_intensities=maldi_intensities,
+        maldi_intensities_p90=maldi_intensities_p90,
+        maldi_intensities_sum=maldi_intensities_sum,
+    )
+    if "source" not in target_candidates.columns:
+        target_candidates["source"] = "target"
+
+    n_target = len(target_candidates)
+    n_decoys_needed = int(target_ratio * n_target)
+    logger.info(
+        "balanced_shuffle: %d target candidates, need %d decoys (ratio=%.2f)",
+        n_target, n_decoys_needed, target_ratio,
+    )
+
+    if n_target == 0 or n_decoys_needed == 0:
+        logger.warning("balanced_shuffle: 0 targets — returning targets only")
+        target_candidates["decoy_delta_da"] = np.nan
+        return target_candidates
+
+    target_seqs = set(target_db["peptide"].values)
+
+    # --- Step 3: Load protein sequences for shuffle ---
+    is_lc_only = (fasta_path is None) and (lcms_ids is not None)
+
+    if is_lc_only:
+        confirmed_seqs = sorted(set(lcms_ids.peptides["sequence"].values))
+        protein_seqs = {"__pseudo__": "".join(confirmed_seqs)}
+    elif lcms_ids is not None:
+        from ms1rescore.lcms_ids import filter_fasta_to_proteins
+        protein_seqs = filter_fasta_to_proteins(fasta_path, lcms_ids.proteins)
+        if not protein_seqs:
+            logger.warning(
+                "balanced_shuffle: no identified proteins in FASTA — using full FASTA"
+            )
+            protein_seqs = {
+                (desc.split("|")[1] if "|" in desc else desc.split()[0]): seq
+                for desc, seq in fasta.read(fasta_path)
+            }
+    else:
+        protein_seqs = {
+            (desc.split("|")[1] if "|" in desc else desc.split()[0]): seq
+            for desc, seq in fasta.read(fasta_path)
+        }
+
+    # --- Step 4: Iterative shuffle rounds ---
+    decoy_pool_parts: list[pd.DataFrame] = []
+    n_pool = 0
+
+    for r in range(max_shuffle_rounds):
+        if n_pool >= n_decoys_needed:
+            logger.info(
+                "balanced_shuffle: %d/%d decoys collected after %d rounds — stopping early",
+                n_pool, n_decoys_needed, r,
+            )
+            break
+
+        round_rows = []
+        for acc, seq in protein_seqs.items():
+            shuffled = _shuffle_protein(seq, random_state=random_state + r)
+            for pep in parser.cleave(shuffled, enzyme_rule, missed_cleavages=missed_cleavages):
+                if min_length <= len(pep) <= max_length and pep not in target_seqs:
+                    round_rows.append((pep, f"DECOY_{acc}_r{r}", True))
+
+        if not round_rows:
+            continue
+
+        round_df = pd.DataFrame(round_rows, columns=["peptide", "protein", "is_decoy"])
+        round_df = round_df.drop_duplicates(subset="peptide")
+
+        seqs_list = round_df["peptide"].tolist()
+        try:
+            from ms1rescore_rs import compute_peptide_masses
+            masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(seqs_list)
+            round_df["mass"] = masses
+            round_df["mh_mz"] = mh_mzs
+            round_df["n_C"] = n_cs
+            round_df["n_H"] = n_hs
+            round_df["n_N"] = n_ns
+            round_df["n_O"] = n_os
+            round_df["n_S"] = n_ss
+        except ImportError:
+            masses_list = []
+            for seq in seqs_list:
+                try:
+                    comp = mass.Composition(sequence=seq)
+                    pm = mass.calculate_mass(composition=comp)
+                    masses_list.append({
+                        "mass": pm, "mh_mz": pm + PROTON,
+                        "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
+                        "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
+                        "n_S": comp.get("S", 0),
+                    })
+                except Exception:
+                    masses_list.append({
+                        "mass": 0, "mh_mz": 0, "n_C": 0,
+                        "n_H": 0, "n_N": 0, "n_O": 0, "n_S": 0,
+                    })
+            mass_df = pd.DataFrame(masses_list)
+            for col in mass_df.columns:
+                round_df[col] = mass_df[col].values
+
+        round_df = round_df[round_df["mass"] > 0].reset_index(drop=True)
+        if len(round_df) == 0:
+            continue
+
+        round_matched = match_to_maldi_features(
+            feature_mzs, round_df, matching_ppm,
+            maldi_intensities=maldi_intensities,
+            maldi_intensities_p90=maldi_intensities_p90,
+            maldi_intensities_sum=maldi_intensities_sum,
+        )
+        if len(round_matched) == 0:
+            continue
+
+        decoy_pool_parts.append(round_matched)
+        n_pool += len(round_matched)
+        logger.info(
+            "balanced_shuffle round %d: %d new decoy candidates (pool %d/%d)",
+            r, len(round_matched), n_pool, n_decoys_needed,
+        )
+
+    if not decoy_pool_parts:
+        logger.warning(
+            "balanced_shuffle: no decoys matched MALDI features — returning targets only"
+        )
+        target_candidates["decoy_delta_da"] = np.nan
+        return target_candidates
+
+    decoy_pool = pd.concat(decoy_pool_parts, ignore_index=True)
+
+    # --- Step 5: Subsample decoy pool to n_decoys_needed ---
+    if len(decoy_pool) > n_decoys_needed:
+        rng = np.random.default_rng(random_state)
+        keep_idx = np.sort(rng.choice(len(decoy_pool), size=n_decoys_needed, replace=False))
+        decoy_pool = decoy_pool.iloc[keep_idx].reset_index(drop=True)
+        logger.info(
+            "balanced_shuffle: subsampled decoy pool %d → %d", n_pool, n_decoys_needed
+        )
+    elif len(decoy_pool) < n_decoys_needed:
+        logger.warning(
+            "balanced_shuffle: collected only %d/%d decoys after %d rounds — "
+            "consider increasing --max-shuffle-rounds",
+            len(decoy_pool), n_decoys_needed, max_shuffle_rounds,
+        )
+
+    # --- Step 6: Mark decoys and wipe LC-MS/MS evidence ---
+    decoy_pool["is_decoy"] = True
+    decoy_pool["source"] = "decoy_balanced_shuffle"
+
+    _LCMS_EV_PREFIXES = ("lcms_",)
+    _LCMS_EV_NAMES = {"n_psms"}
+    for col in decoy_pool.columns:
+        if any(col.startswith(pfx) for pfx in _LCMS_EV_PREFIXES) or col in _LCMS_EV_NAMES:
+            decoy_pool[col] = np.nan
+
+    target_candidates["decoy_delta_da"] = np.nan
+    decoy_pool["decoy_delta_da"] = np.nan
+
+    # --- Step 7: Combine and recompute per-feature statistics ---
+    result = pd.concat([target_candidates, decoy_pool], ignore_index=True)
+    result["is_decoy"] = result["is_decoy"].astype(bool)
+    result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")
+    prot_feat_count = result.groupby("protein")["feature_mz"].nunique()
+    result["protein_n_features"] = result["protein"].map(prot_feat_count).fillna(0).astype(int)
+
+    logger.info(
+        "balanced_shuffle: %d features → %d target + %d decoy candidates",
+        result["feature_mz"].nunique(),
+        int((~result["is_decoy"]).sum()),
+        int(result["is_decoy"].sum()),
+    )
+    return result
+
+
 def digest_identified_proteins(
     fasta_path: str | None,
     lcms_ids,
@@ -249,6 +667,7 @@ def digest_identified_proteins(
     missed_cleavages: int = 2,
     min_length: int = 7,
     max_length: int = 30,
+    generate_decoys: bool = True,
 ) -> pd.DataFrame:
     """
     Strategy C hybrid candidate generation.
@@ -327,15 +746,16 @@ def digest_identified_proteins(
                     if min_length <= len(pep) <= max_length:
                         rows.append((pep, acc, False))
 
-                decoy_seq = _shuffle_protein(seq)
-                cleaved_d = parser.cleave(
-                    decoy_seq,
-                    parser.expasy_rules.get(enzyme, enzyme),
-                    missed_cleavages=missed_cleavages,
-                )
-                for pep in cleaved_d:
-                    if min_length <= len(pep) <= max_length:
-                        rows.append((pep, f"DECOY_{acc}", True))
+                if generate_decoys:
+                    decoy_seq = _shuffle_protein(seq)
+                    cleaved_d = parser.cleave(
+                        decoy_seq,
+                        parser.expasy_rules.get(enzyme, enzyme),
+                        missed_cleavages=missed_cleavages,
+                    )
+                    for pep in cleaved_d:
+                        if min_length <= len(pep) <= max_length:
+                            rows.append((pep, f"DECOY_{acc}", True))
 
             df = pd.DataFrame(rows, columns=["peptide", "protein", "is_decoy"])
             df = df.drop_duplicates(subset=["peptide", "is_decoy"])
@@ -414,48 +834,49 @@ def digest_identified_proteins(
                 prot = str(prot_row.get("protein", ""))
                 novel_rows.append((seq, prot, False))
 
-            if fasta_path is None:
-                # Concatenated pseudo-protein decoy strategy for LC-only mode.
-                # Per-peptide shuffle produces decoys with identical elemental
-                # composition to their target (same residue multiset, just reordered)
-                # — making isotope envelope features non-discriminative. By
-                # concatenating all target peptides into a pseudo-protein and
-                # shuffling at that level, non-K/R residues are redistributed
-                # across tryptic boundaries, breaking composition conservation.
-                sorted_seqs = sorted(novel_seqs)  # fixed order for reproducibility
-                pseudo_protein = "".join(sorted_seqs)
-                shuffled_pseudo = _shuffle_protein(pseudo_protein, random_state=42)
-                target_set = set(novel_seqs)
-                raw_decoys = list(parser.cleave(
-                    shuffled_pseudo,
-                    parser.expasy_rules.get(enzyme, enzyme),
-                    missed_cleavages=missed_cleavages,
-                ))
-                decoy_peptides = list(dict.fromkeys(
-                    p for p in raw_decoys
-                    if min_length <= len(p) <= max_length and p not in target_set
-                ))
-                n_targets = len(novel_seqs)
-                if len(decoy_peptides) < n_targets:
-                    logger.warning(
-                        "Concatenated pseudo-protein decoy digest produced %d decoys "
-                        "for %d target peptides — TDC ratio will be < 1:1. Consider "
-                        "increasing --missed-cleavages or --max-length.",
-                        len(decoy_peptides), n_targets,
-                    )
-                elif len(decoy_peptides) > n_targets:
-                    decoy_peptides = random.Random(42).sample(decoy_peptides, n_targets)
-                for dec in decoy_peptides:
-                    novel_rows.append((dec, "DECOY_concat", True))
-            else:
-                # Per-peptide K/R-preserving shuffle for novel sequences that are
-                # not reachable from the protein digest (Strategy C hybrid).
-                for seq in novel_seqs:
-                    prot_row = lcms_pep_df[lcms_pep_df["sequence"] == seq].iloc[0]
-                    prot = str(prot_row.get("protein", ""))
-                    dec = _shuffle_protein(seq, random_state=42)
-                    if dec != seq:
-                        novel_rows.append((dec, f"DECOY_{prot}", True))
+            if generate_decoys:
+                if fasta_path is None:
+                    # Concatenated pseudo-protein decoy strategy for LC-only mode.
+                    # Per-peptide shuffle produces decoys with identical elemental
+                    # composition to their target (same residue multiset, just reordered)
+                    # — making isotope envelope features non-discriminative. By
+                    # concatenating all target peptides into a pseudo-protein and
+                    # shuffling at that level, non-K/R residues are redistributed
+                    # across tryptic boundaries, breaking composition conservation.
+                    sorted_seqs = sorted(novel_seqs)  # fixed order for reproducibility
+                    pseudo_protein = "".join(sorted_seqs)
+                    shuffled_pseudo = _shuffle_protein(pseudo_protein, random_state=42)
+                    target_set = set(novel_seqs)
+                    raw_decoys = list(parser.cleave(
+                        shuffled_pseudo,
+                        parser.expasy_rules.get(enzyme, enzyme),
+                        missed_cleavages=missed_cleavages,
+                    ))
+                    decoy_peptides = list(dict.fromkeys(
+                        p for p in raw_decoys
+                        if min_length <= len(p) <= max_length and p not in target_set
+                    ))
+                    n_targets = len(novel_seqs)
+                    if len(decoy_peptides) < n_targets:
+                        logger.warning(
+                            "Concatenated pseudo-protein decoy digest produced %d decoys "
+                            "for %d target peptides — TDC ratio will be < 1:1. Consider "
+                            "increasing --missed-cleavages or --max-length.",
+                            len(decoy_peptides), n_targets,
+                        )
+                    elif len(decoy_peptides) > n_targets:
+                        decoy_peptides = random.Random(42).sample(decoy_peptides, n_targets)
+                    for dec in decoy_peptides:
+                        novel_rows.append((dec, "DECOY_concat", True))
+                else:
+                    # Per-peptide K/R-preserving shuffle for novel sequences that are
+                    # not reachable from the protein digest (Strategy C hybrid).
+                    for seq in novel_seqs:
+                        prot_row = lcms_pep_df[lcms_pep_df["sequence"] == seq].iloc[0]
+                        prot = str(prot_row.get("protein", ""))
+                        dec = _shuffle_protein(seq, random_state=42)
+                        if dec != seq:
+                            novel_rows.append((dec, f"DECOY_{prot}", True))
 
             novel_df = pd.DataFrame(novel_rows, columns=["peptide", "protein", "is_decoy"])
             novel_df = novel_df.drop_duplicates(subset=["peptide", "is_decoy"])

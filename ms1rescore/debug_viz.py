@@ -1,7 +1,7 @@
 """
 Debug visualization for the MALDI-MSI rescoring pipeline.
 
-Eight subsystems:
+Eleven subsystems:
   1. Ion image colocalization  — per-candidate precursor + protein co-feature images
   2. Feature diagnostics       — per-candidate 3×3 panel figure
   3. Isotope envelopes         — per-candidate spectrum-style envelope comparison
@@ -11,6 +11,8 @@ Eight subsystems:
   7. IDs vs FDR curve          — target identifications as a function of FDR threshold
   8. Protein colocalization    — colocalization values split by scoring group
   9. T/D m/z distribution      — target vs decoy m/z coverage and competition status
+ 10. Score PP plot             — empirical CDF of decoy scores vs target scores
+ 11. Score distributions       — target/decoy score histograms at R1, R2, and reweighted
 
 Entry point: save_debug_figures()
 """
@@ -1427,6 +1429,282 @@ def plot_target_decoy_mz_distribution(
 
 
 # ---------------------------------------------------------------------------
+# Subsystem 10: Score PP plot
+# ---------------------------------------------------------------------------
+
+
+def _pp_curve(
+    target_scores: np.ndarray,
+    decoy_scores: np.ndarray,
+    n_points: int = 500,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (F_decoy(t), F_target(t)) evaluated on a grid of n_points thresholds."""
+    t_sorted = np.sort(target_scores)
+    d_sorted = np.sort(decoy_scores)
+    lo = float(min(t_sorted[0], d_sorted[0]))
+    hi = float(max(t_sorted[-1], d_sorted[-1]))
+    if lo >= hi:
+        return np.array([0.0, 1.0]), np.array([0.0, 1.0])
+    thresholds = np.linspace(lo, hi, n_points)
+    x = np.searchsorted(d_sorted, thresholds, side="right") / len(d_sorted)
+    y = np.searchsorted(t_sorted, thresholds, side="right") / len(t_sorted)
+    # Prepend (0,0) so the curve starts at the origin
+    x = np.concatenate([[0.0], x])
+    y = np.concatenate([[0.0], y])
+    return x, y
+
+
+def _draw_pp_panel(
+    ax: "matplotlib.axes.Axes",
+    target_scores: np.ndarray,
+    decoy_scores: np.ndarray,
+    title: str,
+    n_points: int = 500,
+) -> None:
+    """Draw a single PP-plot panel onto ax."""
+    n_t = len(target_scores)
+    n_d = len(decoy_scores)
+    if n_t == 0 or n_d == 0:
+        ax.set_visible(False)
+        return
+
+    x, y = _pp_curve(target_scores, decoy_scores, n_points=n_points)
+
+    # Reference line 1: diagonal y = x (what a fully null distribution would look like)
+    ax.plot([0, 1], [0, 1], color="grey", lw=1.0, ls="--", label="y = x (null)")
+
+    # Reference line 2: y = (1 − π₁) × x — expected slope in the null-dominated region.
+    # π₁ estimated under the TDC assumption: decoys approximate null targets.
+    pi1_hat = max(0.0, 1.0 - n_d / n_t)
+    slope = 1.0 - pi1_hat
+    ax.plot(
+        [0, 1], [0, slope],
+        color="darkorange", lw=1.2, ls=":",
+        label=f"y = (1−π₁)·x  [π₁≈{pi1_hat:.2f}]",
+    )
+
+    ax.plot(x, y, color="steelblue", lw=1.8, label=f"T (n={n_t})  vs  D (n={n_d})")
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("F_decoy(t)", fontsize=9)
+    ax.set_ylabel("F_target(t)", fontsize=9)
+    ax.set_title(title, fontsize=9)
+    ax.legend(fontsize=7, loc="upper left")
+    ax.tick_params(labelsize=8)
+    ax.set_aspect("equal", adjustable="box")
+
+
+def plot_score_pp(
+    features_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    out_dir: str,
+    n_points: int = 500,
+) -> None:
+    """
+    PP plot of score distributions: F_decoy(t) on the x-axis vs F_target(t)
+    on the y-axis, sweeping threshold t across all observed scores.
+
+    Two panels:
+      Left  — Round-2 scores on R1 winners (the TDC input set).
+      Right — Round-1 scores on all candidates.
+
+    Reference lines on each panel:
+      - Dashed grey  y = x: the curve if targets and decoys were identically
+        distributed (pure null, no true positives).
+      - Dotted orange y = (1−π₁)·x: expected null-component slope in the
+        bottom-left region, where π₁ = max(0, 1 − n_decoy / n_target) is
+        the fraction of estimated true positives among targets.
+
+    A healthy TDC run: the curve starts at (0, 0), tracks the orange dotted
+    line in the low-score region (where both distributions are dominated by
+    incorrect matches), then peels away toward (1, 1) as the target CDF
+    accumulates true positives in the high-score tail.
+
+    Output: ``{out_dir}/score_pp_plot.png``
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat = features_df.reset_index(drop=True)
+    res  = result_df.reset_index(drop=True)
+
+    is_decoy = (
+        feat.get("is_decoy", pd.Series(False, index=feat.index))
+        .fillna(False).astype(bool).values
+    )
+    is_winner = (
+        res.get("is_tdc_winner", pd.Series(False, index=res.index))
+        .fillna(False).astype(bool).values
+    )
+
+    # Detect score columns dynamically
+    r2_cols = [c for c in res.columns if c.endswith("_score_r2")]
+    r1_cols = [c for c in res.columns if c.endswith("_score_r1")]
+    if not r2_cols and not r1_cols:
+        logger.debug("score_pp: no score columns found, skipping")
+        return
+
+    r2_col = r2_cols[0] if r2_cols else None
+    r1_col = r1_cols[0] if r1_cols else None
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+    # Left panel: R2 scores on R1 winners
+    ax = axes[0]
+    if r2_col is not None:
+        winner_mask = is_winner
+        r2_scores = pd.to_numeric(res[r2_col], errors="coerce").values
+        finite_w = winner_mask & np.isfinite(r2_scores)
+        t_r2 = r2_scores[~is_decoy & finite_w]
+        d_r2 = r2_scores[ is_decoy & finite_w]
+        _draw_pp_panel(ax, t_r2, d_r2, f"R1 winners — {r2_col}", n_points=n_points)
+    else:
+        ax.set_visible(False)
+
+    # Right panel: R1 scores on all candidates
+    ax = axes[1]
+    if r1_col is not None:
+        r1_scores = pd.to_numeric(res[r1_col], errors="coerce").values
+        finite_r1 = np.isfinite(r1_scores)
+        t_r1 = r1_scores[~is_decoy & finite_r1]
+        d_r1 = r1_scores[ is_decoy & finite_r1]
+        _draw_pp_panel(ax, t_r1, d_r1, f"All candidates — {r1_col}", n_points=n_points)
+    else:
+        ax.set_visible(False)
+
+    fig.suptitle("Score PP plot: target vs decoy empirical CDFs", fontsize=11)
+    plt.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, "score_pp_plot.png"),
+        dpi=120, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Score distributions
+# ---------------------------------------------------------------------------
+
+def plot_score_distributions(
+    features_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    out_dir: str,
+    n_bins: int = 60,
+) -> None:
+    """
+    Overlapping target/decoy score histograms for R1, R2, and reweighted scores.
+
+    Three panels (left to right):
+      R1  — all candidates (including non-winners).
+      R2  — R1 winners only (non-winners have NaN R2 scores).
+      RW  — reweighted score on R1 winners (same subset as R2).
+
+    Each panel uses normalised counts (density=True) so target and decoy
+    distributions are comparable when their sizes differ. A vertical dashed
+    line marks the score threshold corresponding to q_value ≤ 0.01 on R2 (if
+    computable). Panels with no finite scores are hidden.
+
+    Output: ``{out_dir}/score_distributions.png``
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat = features_df.reset_index(drop=True)
+    res  = result_df.reset_index(drop=True)
+
+    is_decoy = (
+        feat.get("is_decoy", pd.Series(False, index=feat.index))
+        .fillna(False).astype(bool).values
+    )
+    is_winner = (
+        res.get("is_tdc_winner", pd.Series(False, index=res.index))
+        .fillna(False).astype(bool).values
+    )
+
+    r1_cols = [c for c in res.columns if c.endswith("_score_r1")]
+    r2_cols = [c for c in res.columns if c.endswith("_score_r2")]
+    r1_col = r1_cols[0] if r1_cols else None
+    r2_col = r2_cols[0] if r2_cols else None
+    rw_col = "reweighted_score" if "reweighted_score" in res.columns else None
+
+    panels = []
+    if r1_col:
+        s = pd.to_numeric(res[r1_col], errors="coerce").values
+        panels.append((s, np.ones(len(s), dtype=bool), r1_col, "All candidates"))
+    if r2_col:
+        s = pd.to_numeric(res[r2_col], errors="coerce").values
+        panels.append((s, is_winner, r2_col, "R1 winners"))
+    if rw_col:
+        s = pd.to_numeric(res[rw_col], errors="coerce").values
+        panels.append((s, is_winner, "reweighted_score", "R1 winners"))
+
+    if not panels:
+        logger.debug("score_distributions: no score columns found, skipping")
+        return
+
+    # Q=0.01 threshold from R2 winners
+    q_threshold_score = None
+    if r2_col and "q_value" in res.columns:
+        r2_scores = pd.to_numeric(res[r2_col], errors="coerce").values
+        q_vals = pd.to_numeric(res["q_value"], errors="coerce").values
+        mask = is_winner & ~is_decoy & np.isfinite(r2_scores) & np.isfinite(q_vals)
+        if mask.any():
+            passing = r2_scores[mask & (q_vals <= 0.01)]
+            if len(passing):
+                q_threshold_score = passing.min()
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4), squeeze=False)
+    axes = axes[0]
+
+    colours = {"T": "#2196F3", "D": "#F44336"}
+
+    for ax, (scores, subset_mask, col_label, subset_label) in zip(axes, panels):
+        t_scores = scores[~is_decoy & subset_mask]
+        d_scores = scores[ is_decoy & subset_mask]
+        t_finite = t_scores[np.isfinite(t_scores)]
+        d_finite = d_scores[np.isfinite(d_scores)]
+
+        if not len(t_finite) and not len(d_finite):
+            ax.set_visible(False)
+            continue
+
+        all_finite = np.concatenate([t_finite, d_finite])
+        lo, hi = np.nanpercentile(all_finite, [0.5, 99.5])
+        if lo >= hi:
+            lo, hi = all_finite.min(), all_finite.max()
+        bins = np.linspace(lo, hi, n_bins + 1)
+
+        if len(t_finite):
+            ax.hist(
+                t_finite, bins=bins, density=True,
+                color=colours["T"], alpha=0.55, label=f"Target (n={len(t_finite):,})",
+            )
+        if len(d_finite):
+            ax.hist(
+                d_finite, bins=bins, density=True,
+                color=colours["D"], alpha=0.55, label=f"Decoy (n={len(d_finite):,})",
+            )
+
+        if q_threshold_score is not None and col_label == r2_col:
+            ax.axvline(
+                q_threshold_score, color="black", linestyle="--", linewidth=1.0,
+                label=f"q≤0.01 ({q_threshold_score:.3f})",
+            )
+
+        ax.set_xlabel("Score")
+        ax.set_ylabel("Density")
+        ax.set_title(f"{col_label}\n({subset_label})", fontsize=9)
+        ax.legend(fontsize=8)
+
+    fig.suptitle("Score distributions — target vs decoy", fontsize=11)
+    plt.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, "score_distributions.png"),
+        dpi=120, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Ground-truth helpers
 # ---------------------------------------------------------------------------
 
@@ -1688,6 +1966,24 @@ def save_debug_figures(
         logger.info("T/D m/z distribution saved to %s/target_decoy_mz_distribution.png", debug_dir)
     except Exception as exc:
         logger.warning("T/D m/z distribution plot failed: %s", exc)
+
+    try:
+        plot_score_pp(
+            features_df, result_df,
+            out_dir=debug_dir,
+        )
+        logger.info("Score PP plot saved to %s/score_pp_plot.png", debug_dir)
+    except Exception as exc:
+        logger.warning("Score PP plot failed: %s", exc)
+
+    try:
+        plot_score_distributions(
+            features_df, result_df,
+            out_dir=debug_dir,
+        )
+        logger.info("Score distributions saved to %s/score_distributions.png", debug_dir)
+    except Exception as exc:
+        logger.warning("Score distributions failed: %s", exc)
 
     if importances_r1 is not None or importances_r2 is not None:
         imp_names = importance_names or feature_names or []

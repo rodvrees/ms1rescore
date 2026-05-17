@@ -49,6 +49,8 @@ MALDI_INTRINSIC_FEATURES = [
     # --- mass accuracy (A-group) ---
     "ppm_error_abs", "ppm_rank", "ppm_best_ratio",
     "ppm_error_calibrated_z",        # A3  — optional, requires pixel_coords
+    # --- ambiguity ---
+    "n_candidates", "log_n_candidates",
     # --- peptide properties (basic) ---
     "peptide_length", "n_missed_cleavages", "has_modifications",
     # --- peptide properties (extended, C-group) ---
