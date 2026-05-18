@@ -83,6 +83,16 @@ def digest_fasta(
     df = pd.DataFrame(rows, columns=["peptide", "protein", "is_decoy"])
     df = df.drop_duplicates(subset=["peptide", "is_decoy"])
 
+    # Remove decoys whose sequence is identical to a target (arises when all
+    # non-K/R residues in a peptide are identical or there is only one — the
+    # K/R-preserving shuffle is then a no-op for that peptide).
+    target_seqs = set(df.loc[~df["is_decoy"], "peptide"])
+    n_before = df["is_decoy"].sum()
+    df = df[~(df["is_decoy"] & df["peptide"].isin(target_seqs))].reset_index(drop=True)
+    n_removed = n_before - df["is_decoy"].sum()
+    if n_removed > 0:
+        logger.debug("  Removed %d decoy sequences identical to a target peptide", n_removed)
+
     # Phase 2: Compute masses + elemental composition (Rust if available, else pyteomics)
     sequences = df["peptide"].tolist()
     try:
@@ -227,6 +237,11 @@ def match_to_maldi_features(
     # Computed over ALL candidates (targets + decoys) — symmetric
     protein_feature_count = result.groupby("protein")["feature_mz"].nunique()
     result["protein_n_features"] = result["protein"].map(protein_feature_count).fillna(0).astype(int)
+
+    # Full tryptic digest count per protein (from peptide_db, before m/z filtering).
+    # Used by compute_protein_consistency_features to compute protein_coverage correctly.
+    protein_tryptic_counts = peptide_db.groupby("protein")["peptide"].nunique()
+    result["protein_tryptic_count"] = result["protein"].map(protein_tryptic_counts).fillna(0).astype(int)
 
     # Candidates per feature
     result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")

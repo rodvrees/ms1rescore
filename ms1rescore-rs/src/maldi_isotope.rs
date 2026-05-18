@@ -62,19 +62,16 @@ pub fn compute_isotope_means_flat(
                     pi += 1;
                 }
 
-                // Scan the window to find the most intense peak.
-                // `scan` is a local copy; pi stays at the window start for the
-                // next (larger) target to continue from.
-                let mut best = 0.0f32;
+                // Sum all peaks in the window (matches the RAM path which uses
+                // np.bincount weighted sum via _extract_centroid_fast).
+                let mut window_sum = 0.0f64;
                 let mut scan = pi;
                 while scan < mz_arr.len() && mz_arr[scan] <= hi_mz {
-                    if int_arr[scan] > best {
-                        best = int_arr[scan];
-                    }
+                    window_sum += int_arr[scan] as f64;
                     scan += 1;
                 }
 
-                pixel_sums[orig_idx[ti]] = best as f64;
+                pixel_sums[orig_idx[ti]] = window_sum;
             }
 
             pixel_sums

@@ -558,13 +558,16 @@ def _compute_isotope_means_python(
 ) -> np.ndarray:
     """Pure-Python fallback for compute_maldi_isotope_means (no Rust required).
 
-    Uses vectorised numpy per pixel: nearest-peak lookup with searchsorted.
+    Uses window-sum aggregation to match the RAM path (_extract_centroid_fast
+    uses np.bincount weighted sum) and the fixed Rust path.
     O(n_pixels * n_targets) with small constant — acceptable for Rust-absent envs.
     """
     n_targets = len(target_mzs)
     n_pixels = len(pixel_offsets) - 1
     sums = np.zeros(n_targets, dtype=np.float64)
     tols = target_mzs * ppm_tolerance * 1e-6
+    lo_bounds = target_mzs - tols
+    hi_bounds = target_mzs + tols
 
     for px in range(n_pixels):
         lo = pixel_offsets[px]
@@ -574,18 +577,13 @@ def _compute_isotope_means_python(
         mzs = flat_mzs[lo:hi]
         ints = flat_ints[lo:hi].astype(np.float64)
 
-        # Vectorised nearest-peak lookup for all targets simultaneously.
-        idx_r = np.searchsorted(mzs, target_mzs)
-        idx_r = np.clip(idx_r, 0, len(mzs) - 1)
-        idx_l = np.clip(idx_r - 1, 0, len(mzs) - 1)
-
-        dist_r = np.abs(mzs[idx_r] - target_mzs)
-        dist_l = np.abs(mzs[idx_l] - target_mzs)
-
-        best_idx = np.where(dist_l < dist_r, idx_l, idx_r)
-        best_dist = np.minimum(dist_l, dist_r)
-
-        sums += np.where(best_dist <= tols, ints[best_idx], 0.0)
+        # Window-sum: for each target find all peaks within [mz-tol, mz+tol]
+        # and sum their intensities.
+        lo_idxs = np.searchsorted(mzs, lo_bounds, side="left")
+        hi_idxs = np.searchsorted(mzs, hi_bounds, side="right")
+        for ti in range(n_targets):
+            if lo_idxs[ti] < hi_idxs[ti]:
+                sums[ti] += ints[lo_idxs[ti]:hi_idxs[ti]].sum()
 
     return sums / max(n_pixels, 1)
 

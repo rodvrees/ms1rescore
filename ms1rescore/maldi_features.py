@@ -10,7 +10,10 @@ import logging
 import numpy as np
 import pandas as pd
 
-from ms1rescore.utils import NEUTRON, theoretical_isotope_distribution
+from ms1rescore.utils import (
+    AVERAGINE_C, AVERAGINE_H, AVERAGINE_N, AVERAGINE_O,
+    NEUTRON, theoretical_isotope_distribution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,8 +150,11 @@ def compute_protein_consistency_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     df["log_protein_n_features"] = np.log1p(df["protein_n_features"])
 
-    protein_total_peptides = df.groupby("protein")["peptide"].nunique()
-    total_peps = df["protein"].map(protein_total_peptides).clip(lower=1)
+    if "protein_tryptic_count" in df.columns:
+        total_peps = df["protein_tryptic_count"].clip(lower=1)
+    else:
+        protein_total_peptides = df.groupby("protein")["peptide"].nunique()
+        total_peps = df["protein"].map(protein_total_peptides).clip(lower=1)
     df["protein_coverage"] = df["protein_n_features"] / total_peps
 
     df["protein_rank"] = df.groupby("feature_mz")["protein_n_features"].rank(
@@ -468,10 +474,10 @@ def compute_theoretical_isotope_features(
 
     # --- averagine theoretical (brainpy, cached; S=0 consistent with prior behaviour) ---
     pep_mass = df["mass"].values.astype(float)
-    nc_avg = np.round(pep_mass * 0.0444).astype(int)
-    nh_avg = np.round(pep_mass * 0.0698).astype(int)
-    nn_avg = np.round(pep_mass * 0.0123).astype(int)
-    no_avg = np.round(pep_mass * 0.0133).astype(int)
+    nc_avg = np.round(pep_mass * AVERAGINE_C).astype(int)
+    nh_avg = np.round(pep_mass * AVERAGINE_H).astype(int)
+    nn_avg = np.round(pep_mass * AVERAGINE_N).astype(int)
+    no_avg = np.round(pep_mass * AVERAGINE_O).astype(int)
     avg_comps = list(zip(
         nc_avg.tolist(), nh_avg.tolist(), nn_avg.tolist(), no_avg.tolist(),
         [0] * n,
@@ -500,8 +506,8 @@ def compute_theoretical_isotope_features(
     theo_cosine = np.zeros(n)
     theo_chi2 = np.zeros(n)
     theo_kl = np.zeros(n)
-    theo_m1_diff = np.zeros(n)
-    theo_m2_diff = np.zeros(n)
+    theo_m1_diff = np.full(n, np.nan)
+    theo_m2_diff = np.full(n, np.nan)
 
     if maldi_envelopes:
         feature_mzs = df["feature_mz"].values
@@ -560,10 +566,10 @@ def compute_mass_defect_features(df: pd.DataFrame) -> pd.DataFrame:
     peptide_md = mass - np.floor(mass)
 
     # Averagine monoisotopic mass (same atom counts as compute_theoretical_isotope_features)
-    nc_avg = np.round(mass * 0.0444)
-    nh_avg = np.round(mass * 0.0698)
-    nn_avg = np.round(mass * 0.0123)
-    no_avg = np.round(mass * 0.0133)
+    nc_avg = np.round(mass * AVERAGINE_C)
+    nh_avg = np.round(mass * AVERAGINE_H)
+    nn_avg = np.round(mass * AVERAGINE_N)
+    no_avg = np.round(mass * AVERAGINE_O)
     avg_mono_mass = (
         nc_avg * 12.0
         + nh_avg * 1.00782503207
@@ -860,7 +866,9 @@ def compute_im2deep_features(
 
     # Z-score and rank within each MALDI feature
     df["im2deep_ccs_zscore"] = df.groupby("feature_mz")["_im2deep_delta"].transform(
-        lambda x: (x - x.mean()) / (x.std() + 1e-10)
+        lambda x: pd.Series(0.0, index=x.index)
+        if len(x) < 2 or x.std() < 1e-12
+        else (x - x.mean()) / x.std()
     )
     df["im2deep_ccs_rank"] = df.groupby("feature_mz")["_im2deep_abspct"].rank(method="min")
 

@@ -55,14 +55,21 @@ def composition_from_sequence(peptide: str) -> dict[str, int]:
     }
 
 
+AVERAGINE_C = 0.04443
+AVERAGINE_H = 0.06981
+AVERAGINE_N = 0.01221
+AVERAGINE_O = 0.01329
+AVERAGINE_S = 0.00037
+
+
 def averagine_composition(mass: float) -> dict[str, int]:
     """Compute averagine elemental composition for a given mass."""
     return {
-        "C": int(round(mass * 0.04443)),
-        "H": int(round(mass * 0.06981)),
-        "N": int(round(mass * 0.01221)),
-        "O": int(round(mass * 0.01329)),
-        "S": int(round(mass * 0.00037)),
+        "C": int(round(mass * AVERAGINE_C)),
+        "H": int(round(mass * AVERAGINE_H)),
+        "N": int(round(mass * AVERAGINE_N)),
+        "O": int(round(mass * AVERAGINE_O)),
+        "S": int(round(mass * AVERAGINE_S)),
     }
 
 
@@ -91,8 +98,3 @@ def mz_to_mass(mz: float, charge: int) -> float:
 def mass_to_mz(mass: float, charge: int) -> float:
     """Convert neutral mass to m/z."""
     return (mass + charge * PROTON) / charge
-
-
-def ppm_error(observed_mz: float, theoretical_mz: float) -> float:
-    """Compute ppm error."""
-    return abs(observed_mz - theoretical_mz) / theoretical_mz * 1e6

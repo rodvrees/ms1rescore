@@ -12,4 +12,3 @@
     2. Check some stuff that looks off:
         - RT residual
         - log_mean_intensity and spatial_entropy
-- Isotopologue colocalization (E1): 0/983 features with M+1 image

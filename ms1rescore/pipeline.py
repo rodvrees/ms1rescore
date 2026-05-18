@@ -317,7 +317,7 @@ def _rescore_lda(
 
     Returns ``(scores, importances, feature_names_used)`` where ``scores`` is
     a 1-D array (higher = more likely correct), ``importances`` is
-    ``|coef_[0]|`` from the final LDA pipeline (or None), and
+    ``coef_[0]`` (signed) from the final LDA pipeline (or None), and
     ``feature_names_used`` is the aligned feature name list.
     """
     from sklearn.discriminant_analysis import LinearDiscriminantAnalysis

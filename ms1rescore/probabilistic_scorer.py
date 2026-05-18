@@ -216,7 +216,7 @@ def add_ranking_features(
     New columns added to a copy of candidates_df:
         generative_score       : raw log-likelihood
         generative_score_rank  : rank within the feature (1 = best)
-        generative_score_gap   : score(rank-1) - score(rank-2); 0 for non-winners
+        generative_score_gap   : score(rank-1) - score(rank-2); NaN for single-candidate features, 0 for non-winners
         generative_score_z     : z-score within the feature's candidate set
 
     Returns a copy of candidates_df with these columns appended.
@@ -237,7 +237,7 @@ def add_ranking_features(
         mu = grp.mean()
         sigma = grp.std()
         if np.isnan(sigma) or sigma < 1e-12:
-            return pd.Series(0.0, index=grp.index)
+            return pd.Series(np.nan, index=grp.index)
         return (grp - mu) / sigma
 
     df["generative_score_z"] = df.groupby(feature_col)["generative_score"].transform(
@@ -247,7 +247,7 @@ def add_ranking_features(
     def _gap(grp: pd.Series) -> pd.Series:
         scores = grp.values
         if len(scores) < 2:
-            return pd.Series(0.0, index=grp.index)
+            return pd.Series(np.nan, index=grp.index)
         top2 = np.partition(scores, -2)[-2:]  # two largest
         best, second = top2[1], top2[0]
         gap = best - second

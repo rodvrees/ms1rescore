@@ -977,7 +977,9 @@ def compute_all_lcms_evidence(
                             result["isotope_envelope_pearson"] = float(
                                 np.dot(a_c, b_c) / denom
                             )
-                        result["isotope_envelope_mse"] = float(np.mean((a - b) ** 2))
+                        a_sum = a.sum()
+                        a_n = a / a_sum if a_sum > 0 else a
+                        result["isotope_envelope_mse"] = float(np.mean((a_n - b) ** 2))
                         if a[0] > 0 and b[0] > 0:
                             result["isotope_m1_ratio_diff"] = float(
                                 abs(a[1] / a[0] - b[1] / b[0])
