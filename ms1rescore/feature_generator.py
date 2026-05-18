@@ -119,9 +119,24 @@ _LCMS_MZML_FEATURES = [
     "lcms_ms1_isotope_cosine",
     "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
     # MALDI vs LC-MS/MS isotope envelope similarity (requires maldi_envelopes)
-    "isotope_envelope_cosine", "isotope_envelope_pearson",
-    "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
-    "isotope_n_matched", "isotope_absolute_diff"
+    "isotope_envelope_pearson",
+    "isotope_envelope_mse",
+    "isotope_n_matched", "isotope_absolute_diff",
+    # DeepLC-anchored RT-consistency and apex features
+    "lcms_ms1_apex_rt_delta",
+    "lcms_ms1_frac_apex_signal",
+    "lcms_ms1_n_scans_with_signal",
+    "lcms_ms2_rt_delta",
+]
+
+# Isotope envelope comparison features that directly evaluate MALDI signal
+# quality: cosine and ratio differences compare the MALDI M+1/M+2 pattern to
+# the LC-MS/MS M+1/M+2 pattern, validating the MALDI detection itself.
+# These go in the ranker (MALDI_INTRINSIC_FEATURES), not the prior.
+_LCMS_RANKER_FROM_EVIDENCE = [
+    "isotope_envelope_cosine",
+    "isotope_m1_ratio_diff",
+    "isotope_m2_ratio_diff",
 ]
 
 _LCMS_ID_FEATURES = [
@@ -133,6 +148,9 @@ _LCMS_ID_FEATURES = [
 _LCMS_CCS_FEATURES = ["lcms_ccs_delta", "lcms_ccs_abs_pct"]
 
 LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_CCS_FEATURES
+
+# Extend the ranker feature list with envelope comparison features from evidence.
+MALDI_INTRINSIC_FEATURES += _LCMS_RANKER_FROM_EVIDENCE
 
 # Spatial prior features: ion-image-level quality signals applied as a
 # multiplicative prior after scoring (analogous to LCMS_PRIOR_FEATURES).
@@ -293,16 +311,25 @@ def compute_all_features(
     # when maldi_envelopes was passed to compute_all_lcms_evidence.
     if lcms_evidence is not None:
         ev_df = pd.DataFrame.from_dict(lcms_evidence, orient="index", dtype=float)
-        ev_df = ev_df.reindex(columns=_LCMS_MZML_FEATURES)
+        # Join prior and ranker evidence columns in one operation.
+        all_ev_cols = _LCMS_MZML_FEATURES + _LCMS_RANKER_FROM_EVIDENCE
+        ev_df = ev_df.reindex(columns=all_ev_cols)
         df = df.join(ev_df, how="left")
+        # Fill NaN for prior features with 0.0; ranker features keep NaN for LDA imputer.
         df[_LCMS_MZML_FEATURES] = df[_LCMS_MZML_FEATURES].fillna(0.0)
-        # For similarity/ratio features, replace 0-fill with column median so that
-        # candidates without signal are not penalised relative to the median.
+        # Drop any ranker evidence column that is entirely NaN (e.g. maldi_envelopes not
+        # provided): an all-NaN column breaks SimpleImputer → StandardScaler → LDA.
+        for feat in _LCMS_RANKER_FROM_EVIDENCE:
+            if feat in df.columns and df[feat].isna().all():
+                df = df.drop(columns=[feat])
+        # For similarity/ratio features and NaN-sentinel RT-delta features, replace
+        # 0-fill with column median so candidates without signal are not penalised.
         _median_fill_feats = [
             "lcms_ms1_isotope_cosine",
             "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
-            "isotope_envelope_cosine", "isotope_envelope_pearson",
-            "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
+            "isotope_envelope_pearson",
+            "lcms_ms1_apex_rt_delta",
+            "lcms_ms2_rt_delta",
         ]
         for feat in _median_fill_feats:
             if feat not in df.columns:
@@ -313,6 +340,8 @@ def compute_all_features(
     else:
         for feat in _LCMS_MZML_FEATURES:
             df[feat] = 0.0
+        # _LCMS_RANKER_FROM_EVIDENCE columns are not added when no mzML is provided;
+        # pipeline.py's intrinsic_present filter excludes absent columns automatically.
 
     # --- MALDI vs LC-MS/MS CCS features (optional) ---
     df = compute_lcms_ccs_features(df, observed_ccs_per_feature=observed_ccs_per_feature)

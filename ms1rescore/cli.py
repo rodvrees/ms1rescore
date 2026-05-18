@@ -722,14 +722,15 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp = parser.add_argument_group("rescoring")
     rescore_grp.add_argument(
         "--model",
-        choices=("svm", "catboost", "lda"),
+        choices=("svm", "catboost", "lda", "qda"),
         default="lda",
         help=(
             "Rescoring backend. 'lda': sklearn LDA with median imputation and "
-            "standardization; no extra dependencies (default). 'svm': mokapot "
-            "PercolatorModel trained on MALDI-intrinsic features. 'catboost': "
-            "semi-supervised CatBoostRanker with pseudo-label iteration (requires "
-            "pip install ms1rescore[catboost])."
+            "standardization; no extra dependencies (default). 'qda': sklearn QDA "
+            "(QuadraticDiscriminantAnalysis, reg_param=0.1); same structure as LDA. "
+            "'svm': mokapot PercolatorModel trained on MALDI-intrinsic features. "
+            "'catboost': semi-supervised CatBoostRanker with pseudo-label iteration "
+            "(requires pip install ms1rescore[catboost])."
         ),
     )
     rescore_grp.add_argument(

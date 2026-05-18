@@ -14,6 +14,17 @@ def _make_bimodal(n_target: int = 300, n_decoy: int = 150, seed: int = 42):
     return scores, is_decoy
 
 
+def _make_skewed(n_target: int = 300, n_decoy: int = 150, seed: int = 7):
+    """Heavy-tailed / skewed score distributions (representative of QDA output)."""
+    rng = np.random.default_rng(seed)
+    # Log-normal targets (right-skewed); exponential decoys
+    target_scores = rng.lognormal(mean=1.0, sigma=0.8, size=n_target)
+    decoy_scores = rng.exponential(scale=0.5, size=n_decoy)
+    scores = np.concatenate([target_scores, decoy_scores])
+    is_decoy = np.array([False] * n_target + [True] * n_decoy)
+    return scores, is_decoy
+
+
 class TestEstimatePep:
     def test_pep_in_unit_interval(self):
         scores, is_decoy = _make_bimodal()
@@ -67,6 +78,47 @@ class TestEstimatePep:
         scores, is_decoy = _make_bimodal(n_target=100, n_decoy=50)
         pep = estimate_pep(scores, is_decoy)
         assert len(pep) == len(scores)
+
+
+class TestEstimatePepKDE:
+    """Tests for method='kde' path used by the QDA backend."""
+
+    def test_kde_pep_in_unit_interval(self):
+        scores, is_decoy = _make_skewed()
+        pep = estimate_pep(scores, is_decoy, method="kde")
+        assert np.all((pep >= 0.0) & (pep <= 1.0))
+
+    def test_kde_output_length_matches_input(self):
+        scores, is_decoy = _make_skewed()
+        pep = estimate_pep(scores, is_decoy, method="kde")
+        assert len(pep) == len(scores)
+
+    def test_kde_high_scoring_targets_have_low_pep(self):
+        scores, is_decoy = _make_skewed()
+        pep = estimate_pep(scores, is_decoy, method="kde")
+        target_scores = scores[~is_decoy]
+        high_threshold = np.percentile(target_scores, 90)
+        high_target_mask = (~is_decoy) & (scores >= high_threshold)
+        assert np.all(pep[high_target_mask] < 0.3), (
+            f"High-scoring targets should have low PEP; "
+            f"got max PEP = {pep[high_target_mask].max():.3f}"
+        )
+
+    def test_kde_returns_nan_with_too_few_decoys(self):
+        scores = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        is_decoy = np.array([False, False, False, False, True])
+        pep = estimate_pep(scores, is_decoy, method="kde")
+        assert np.all(np.isnan(pep))
+
+    def test_kde_gaussian_agree_on_gaussian_data(self):
+        """KDE and Gaussian methods should produce similar PEP on well-separated Gaussian data."""
+        scores, is_decoy = _make_bimodal(n_target=500, n_decoy=250)
+        pep_g = estimate_pep(scores, is_decoy, method="gaussian")
+        pep_k = estimate_pep(scores, is_decoy, method="kde")
+        # Ranking correlation: Spearman rank order should be very high
+        from scipy.stats import spearmanr
+        rho, _ = spearmanr(pep_g, pep_k)
+        assert rho > 0.97, f"KDE and Gaussian PEP ranks diverge: Spearman rho = {rho:.4f}"
 
 
 class TestPepQvalues:

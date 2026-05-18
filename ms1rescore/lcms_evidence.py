@@ -829,6 +829,16 @@ def compute_all_lcms_evidence(
         peptide = peptides[i]
         ms2_scan_indices = feature_ms2_scans[mz]
 
+        # Pre-fetch predicted RT so MS2 scans can be restricted to the DeepLC RT window.
+        predicted_rt = deeplc_cache.get(peptide) if deeplc_cache is not None else None
+
+        # Apply DeepLC RT filter to MS2 scans when calibration is available.
+        if rt_window_min > 0 and predicted_rt is not None:
+            ms2_scan_indices = [
+                idx for idx in ms2_scan_indices
+                if abs(float(lcms_data.ms2_precursor_rt[idx]) - predicted_rt) <= rt_window_min
+            ]
+
         result: dict[str, float] = {
             "lcms_ms2_n_matches": float(len(ms2_scan_indices)),
             "lcms_ms2_spectral_angle": 0.0,
@@ -843,6 +853,10 @@ def compute_all_lcms_evidence(
             "isotope_m1_ratio_diff": np.nan,
             "isotope_m2_ratio_diff": np.nan,
             "isotope_n_matched": 0.0,
+            "lcms_ms1_apex_rt_delta": np.nan,
+            "lcms_ms1_frac_apex_signal": 0.0,
+            "lcms_ms1_n_scans_with_signal": 0.0,
+            "lcms_ms2_rt_delta": np.nan,
         }
 
         # --- MS2 spectral angle ---
@@ -850,6 +864,7 @@ def compute_all_lcms_evidence(
         # 0.0 = prediction available but spectral angle genuinely low (<3 matched fragments).
         best_angle = 0.0
         best_charge = 1  # fallback; updated to the charge of the best-SA scan
+        best_sa_rt = np.nan
         has_prediction = False
         for scan_idx in ms2_scan_indices:
             scan_charge = int(lcms_data.ms2_precursor_charge[scan_idx])
@@ -866,14 +881,16 @@ def compute_all_lcms_evidence(
             if angle > best_angle:
                 best_angle = angle
                 best_charge = scan_charge
+                best_sa_rt = float(lcms_data.ms2_precursor_rt[scan_idx])
         result["lcms_ms2_spectral_angle"] = best_angle if has_prediction else np.nan
+        if np.isfinite(best_sa_rt) and predicted_rt is not None:
+            result["lcms_ms2_rt_delta"] = abs(best_sa_rt - predicted_rt)
 
         # --- DeepLC-anchored MS1 features ---
         if deeplc_cache is None or not has_ms1:
             evidence[candidates_df.index[i]] = result
             continue
 
-        predicted_rt = deeplc_cache.get(peptide)
         if predicted_rt is None:
             evidence[candidates_df.index[i]] = result
             continue
@@ -935,6 +952,39 @@ def compute_all_lcms_evidence(
 
         neutral_mass = mz - PROTON
         lc_mz = (neutral_mass + best_charge * PROTON) / best_charge
+
+        # F1-F3: apex window features (only when rt_window_min > 0, i.e. DeepLC calibrated).
+        # scan_indices already contains all MS1 scans within ±rt_window_min of predicted_rt.
+        if rt_window_min > 0 and len(scan_indices) > 0:
+            tol_apex = lc_mz * ppm_tolerance / 1e6
+            win_signals = np.array([
+                float(
+                    lcms_data.ms1_int_arrays[wi][
+                        np.searchsorted(lcms_data.ms1_mz_arrays[wi], lc_mz - tol_apex, side="left"):
+                        np.searchsorted(lcms_data.ms1_mz_arrays[wi], lc_mz + tol_apex, side="right")
+                    ].sum()
+                )
+                for wi in scan_indices
+            ])
+            result["lcms_ms1_n_scans_with_signal"] = float((win_signals > 0).sum())
+            max_sig = float(win_signals.max())
+            if max_sig > 0:
+                apex_local_idx = int(np.argmax(win_signals))
+                apex_scan_idx = scan_indices[apex_local_idx]
+                result["lcms_ms1_apex_rt_delta"] = abs(
+                    float(lcms_data.ms1_rts[apex_scan_idx]) - predicted_rt
+                )
+                # Fraction of apex signal present at the DeepLC-anchored (nearest) scan
+                anchor_scan_idx = scan_indices[
+                    int(np.argmin(np.abs(lcms_data.ms1_rts[scan_indices] - predicted_rt)))
+                ]
+                anchor_mz_arr = lcms_data.ms1_mz_arrays[anchor_scan_idx]
+                anchor_int_arr = lcms_data.ms1_int_arrays[anchor_scan_idx]
+                lo = np.searchsorted(anchor_mz_arr, lc_mz - tol_apex, side="left")
+                hi = np.searchsorted(anchor_mz_arr, lc_mz + tol_apex, side="right")
+                anchor_sig = float(anchor_int_arr[lo:hi].sum()) if lo < hi else 0.0
+                result["lcms_ms1_frac_apex_signal"] = anchor_sig / max_sig
+
         raw_env = np.zeros(3)
         for scan_idx in scan_indices:
             raw_env += _extract_ms1_envelope(lc_mz, scan_idx, lcms_data, charge=best_charge, n_peaks=3, normalize=False)

@@ -397,6 +397,123 @@ def _rescore_lda(
     return scores, importances, present
 
 
+def _rescore_qda(
+    features_df: pd.DataFrame,
+    intrinsic_feature_names: list[str],
+    init_ppm_threshold: float,
+    seed_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Semi-supervised QDA on MALDI-intrinsic features.
+
+    Identical structure to _rescore_lda but uses QuadraticDiscriminantAnalysis
+    (reg_param=0.1) instead of LinearDiscriminantAnalysis.  Importances are
+    estimated as |mu_pos - mu_neg| / pooled_std in the standardized feature
+    space (a t-statistic proxy based on the final pseudo-label assignments).
+
+    Returns ``(scores, importances, feature_names_used)``.
+    """
+    from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    df = features_df.reset_index(drop=True)
+    present = [f for f in intrinsic_feature_names if f in df.columns]
+    X_raw = df[present].values.astype(np.float64)
+    X = np.where(np.isfinite(X_raw), X_raw, np.nan)
+
+    is_decoy = df["is_decoy"].values.astype(bool)
+    is_target = ~is_decoy
+
+    if seed_mask is None:
+        ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+        n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
+        seed_mask = (
+            is_target
+            & (
+                (ppm_col < init_ppm_threshold)
+                | (n_cand_col == 1)
+            )
+        ).values
+        if not seed_mask.any():
+            logger.warning("  QDA: no seed positives — falling back to top-ppm init")
+            seed_mask = (is_target & (ppm_col < ppm_col[is_target].quantile(0.10))).values
+
+    n_seed = seed_mask.sum()
+    logger.info(f"  QDA: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
+
+    scores = np.zeros(len(df))
+    prev_pos_size = -1
+    pipe = None
+
+    for iteration in range(5):
+        pos_idx = np.where(seed_mask)[0]
+        dec_idx = np.where(is_decoy)[0]
+        train_idx = np.concatenate([pos_idx, dec_idx])
+        y_train = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(dec_idx))])
+
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("qda", QuadraticDiscriminantAnalysis(reg_param=0.1)),
+        ])
+        pipe.fit(X[train_idx], y_train)
+        scores = pipe.decision_function(X).ravel()
+
+        q_values = _tdc_qvalues(scores, is_decoy)
+        new_seed = is_target & (q_values <= 0.05)
+        n_new = new_seed.sum()
+
+        logger.info(
+            f"  QDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size})"
+        )
+
+        if n_new == 0:
+            logger.warning("  QDA: no pseudo-positives at q≤0.05 — stopping early")
+            break
+
+        change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
+        if prev_pos_size >= 0 and change < 0.01:
+            logger.info("  QDA: converged")
+            break
+
+        prev_pos_size = n_new
+        seed_mask = new_seed.values if hasattr(new_seed, "values") else new_seed
+
+    pep_proba = np.full(len(df), np.nan)
+    importances = None
+    if pipe is not None:
+        try:
+            # P(decoy | features): y=0 is decoy, so classes_[0] == 0 → column 0
+            # predict_proba returns columns ordered by pipe["qda"].classes_
+            classes = list(pipe["qda"].classes_)
+            decoy_col = classes.index(0)
+            pep_proba = np.clip(pipe.predict_proba(X)[:, decoy_col], 0.0, 1.0)
+        except Exception:
+            pass
+        try:
+            # t-statistic proxy in standardized space: |mu_pos - mu_neg| / pooled_std
+            X_t = pipe[:-1].transform(X)
+            pos_mask = seed_mask.astype(bool)
+            neg_mask = is_decoy
+            mu_pos = np.nanmean(X_t[pos_mask], axis=0)
+            mu_neg = np.nanmean(X_t[neg_mask], axis=0)
+            std_pos = np.nanstd(X_t[pos_mask], axis=0)
+            std_neg = np.nanstd(X_t[neg_mask], axis=0)
+            n_pos = pos_mask.sum()
+            n_neg = neg_mask.sum()
+            pooled = np.sqrt(
+                ((n_pos - 1) * std_pos**2 + (n_neg - 1) * std_neg**2)
+                / max(n_pos + n_neg - 2, 1)
+            )
+            pooled = np.where(pooled > 0, pooled, 1.0)
+            importances = (mu_pos - mu_neg) / pooled
+        except Exception:
+            pass
+    return scores, pep_proba, importances, present
+
+
 # def _feature_level_tdc(
 #     features_df: pd.DataFrame,
 #     scores: np.ndarray,
@@ -468,26 +585,36 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     return q_values
 
 
-def estimate_pep(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
+def estimate_pep(
+    scores: np.ndarray,
+    is_decoy: np.ndarray,
+    method: str = "gaussian",
+) -> np.ndarray:
     """
-    Estimate posterior error probability (PEP) via a two-component Gaussian
-    mixture fitted to the R2 winner score distribution.
+    Estimate posterior error probability (PEP) via a two-component mixture.
 
     Model
     -----
-    f0 : Gaussian fitted to decoy scores (null distribution).
-    f1 : Gaussian fitted to target scores above the target median (signal
-         distribution).  Using only the right tail avoids contamination from
-         incorrect target matches that overlap with the null.
-    pi0 : n_decoy / n_total  (fraction of winners that are decoys).
+    f0 : null distribution fitted to decoy scores.
+    f1 : signal distribution fitted to target scores above the target median.
+         Using only the right tail avoids contamination from incorrect target
+         matches that overlap with the null.
+    pi0 : n_decoy / n_total.
 
     PEP(s) = pi0 * f0(s) / (pi0 * f0(s) + (1 - pi0) * f1(s)), clipped to [0, 1].
+
+    Parameters
+    ----------
+    method : "gaussian" (default) or "kde".
+        "gaussian" fits parametric Gaussians to f0 and f1 — appropriate when
+        score distributions are approximately normal (LDA, SVM).
+        "kde" uses scipy.stats.gaussian_kde — appropriate when score
+        distributions are skewed or heavy-tailed (QDA).  Falls back to
+        "gaussian" if the KDE covariance is singular.
 
     Returns NaN for all entries when fewer than 2 decoys or fewer than 2 targets
     are present (mixture is unidentifiable).
     """
-    from scipy.stats import norm
-
     scores = np.asarray(scores, dtype=float)
     is_decoy = np.asarray(is_decoy, dtype=bool)
 
@@ -501,18 +628,29 @@ def estimate_pep(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     decoy_scores = scores[is_decoy]
     target_scores = scores[~is_decoy]
 
-    mu0 = float(np.mean(decoy_scores))
-    sigma0 = max(float(np.std(decoy_scores)), 1e-6)
-
     median_t = float(np.median(target_scores))
     high_t = target_scores[target_scores > median_t]
     if len(high_t) < 2:
         high_t = target_scores
-    mu1 = float(np.mean(high_t))
-    sigma1 = max(float(np.std(high_t)), 1e-6)
 
-    f0 = norm.pdf(scores, mu0, sigma0)
-    f1 = norm.pdf(scores, mu1, sigma1)
+    if method == "kde":
+        from scipy.stats import gaussian_kde
+        try:
+            kde0 = gaussian_kde(decoy_scores)
+            kde1 = gaussian_kde(high_t)
+            f0 = kde0(scores)
+            f1 = kde1(scores)
+        except np.linalg.LinAlgError:
+            method = "gaussian"
+
+    if method == "gaussian":
+        from scipy.stats import norm
+        mu0 = float(np.mean(decoy_scores))
+        sigma0 = max(float(np.std(decoy_scores)), 1e-6)
+        mu1 = float(np.mean(high_t))
+        sigma1 = max(float(np.std(high_t)), 1e-6)
+        f0 = norm.pdf(scores, mu0, sigma0)
+        f1 = norm.pdf(scores, mu1, sigma1)
 
     numer = pi0 * f0
     denom = numer + (1.0 - pi0) * f1
@@ -686,11 +824,11 @@ def rescore(
     max_length
         Maximum peptide length.
     model
-        Rescoring backend: "svm" (mokapot PercolatorModel, default),
-        "catboost" (semi-supervised CatBoostRanker), or "lda"
-        (LinearDiscriminantAnalysis, recommended). All backends use only
-        MALDI_INTRINSIC_FEATURES for training. LC-MS/MS evidence is
-        applied as an additive log-prior after scoring.
+        Rescoring backend: "svm" (mokapot PercolatorModel), "catboost"
+        (semi-supervised CatBoostRanker), "lda" (LinearDiscriminantAnalysis,
+        default), or "qda" (QuadraticDiscriminantAnalysis, reg_param=0.1).
+        All backends use only MALDI_INTRINSIC_FEATURES for training. LC-MS/MS
+        evidence is applied as an additive log-prior after scoring.
     compute_generative
         When True and model is "svm" or "catboost", run the generative scorer
         first and add its ranking features (generative_score,
@@ -1508,5 +1646,140 @@ def rescore(
 
         return psm_list, result_df, feature_names
 
+    elif model == "qda":
+        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
+
+        # --- Round 1: score all candidates ---
+        scores1, _, _imp_r1_qda, _imp_names_qda = _rescore_qda(
+            features_df,
+            intrinsic_present,
+            init_ppm_threshold=init_ppm_threshold,
+        )
+        if verbose:
+            with open(f"{output_dir}/17_debug_qda_scores_r1.pkl", "wb") as f:
+                pickle.dump(scores1, f)
+            qda_importances_df = pd.DataFrame({
+                "feature": _imp_names_qda,
+                "importance": _imp_r1_qda if _imp_r1_qda is not None else np.zeros(len(_imp_names_qda)),
+            }).sort_values("importance", key=np.abs, ascending=False)
+            qda_importances_df.to_csv(
+                f"{output_dir}/17_debug_qda_importances_r1.tsv", sep="\t", index=False
+            )
+
+        # --- Per-feature winner selection ---
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        logger.info(
+            f"  Round-1 winner selection: {len(winners_df)} candidates retained "
+            f"({int(winners_df['is_decoy'].sum())} decoys)"
+        )
+        winner_pos, winners_df = _filter_winners_by_r1_q(
+            winner_pos, winners_df, scores1[winner_pos], winner_min_r1_q
+        )
+
+        # --- Round 2: retrain on winner subset ---
+        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+        target_scores_w = scores1[winner_pos][~is_decoy_w]
+        score_threshold = np.percentile(target_scores_w, 80)
+        r2_seed_mask = (~is_decoy_w) & (scores1[winner_pos] >= score_threshold)
+        logger.info(
+            f"  QDA R2: seeding from top-20% R1 target scores "
+            f"(score ≥ {score_threshold:.3f}) → {r2_seed_mask.sum()} positives"
+        )
+
+        scores2, pep_proba2, qda_imp_r2, qda_imp_names_r2 = _rescore_qda(
+            winners_df,
+            intrinsic_present,
+            init_ppm_threshold=init_ppm_threshold,
+            seed_mask=r2_seed_mask,
+        )
+        if verbose:
+            with open(f"{output_dir}/17_debug_qda_scores_r2.pkl", "wb") as f:
+                pickle.dump(scores2, f)
+            qda_importances_df = pd.DataFrame({
+                "feature": qda_imp_names_r2 or _imp_names_qda,
+                "importance": qda_imp_r2 if qda_imp_r2 is not None else np.zeros(len(qda_imp_names_r2 or _imp_names_qda)),
+            }).sort_values("importance", key=np.abs, ascending=False)
+            qda_importances_df.to_csv(
+                f"{output_dir}/17_debug_qda_importances_r2.tsv", sep="\t", index=False
+            )
+
+        # --- Standard TDC FDR on winners ---
+        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+        q2 = _tdc_qvalues(scores2, is_decoy_w)
+        # Use QDA's own posterior probabilities: predict_proba(X)[:, decoy_class]
+        # is exactly P(false | features) — no separate mixture model needed.
+        pep_w = pep_proba2
+        pep_q_w = _pep_qvalues(pep_w)
+        lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
+        spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
+        _LOG_EPS = 1e-12
+        reweighted2 = (
+            scores2
+            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+        )
+        rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+
+        # --- Map back to full candidate table ---
+        is_winner_full = np.zeros(len(features_df), dtype=bool)
+        is_winner_full[winner_pos] = True
+        scores2_full = np.full(len(features_df), np.nan)
+        scores2_full[winner_pos] = scores2
+        q_full = np.full(len(features_df), np.nan)
+        q_full[winner_pos] = q2
+        pep_full = np.full(len(features_df), np.nan)
+        pep_full[winner_pos] = pep_w
+        pep_q_full = np.full(len(features_df), np.nan)
+        pep_q_full[winner_pos] = pep_q_w
+        rw_full = np.full(len(features_df), np.nan)
+        rw_full[winner_pos] = reweighted2
+        rw_q_full = np.full(len(features_df), np.nan)
+        rw_q_full[winner_pos] = rw_q2
+
+        is_decoy = features_df["is_decoy"].values.astype(bool)
+        result_df = pd.DataFrame(
+            {
+                "peptide": features_df["peptide"].values,
+                "protein": features_df["protein"].values if "protein" in features_df.columns else "",
+                "feature_mz": features_df["feature_mz"].values if "feature_mz" in features_df.columns else np.nan,
+                "feature_idx": features_df.get(
+                    "feature_idx", pd.Series(range(len(features_df)))
+                ).values,
+                "is_decoy": is_decoy,
+                "qda_score_r1": scores1,
+                "qda_score_r2": scores2_full,
+                "q_value": q_full,
+                "pep": pep_full,
+                "pep_q_value": pep_q_full,
+                "is_tdc_winner": is_winner_full,
+                "reweighted_score": rw_full,
+                "reweighted_q_value": rw_q_full,
+            }
+        )
+
+        for fdr_threshold in [0.01, 0.05, 0.10]:
+            n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
+            n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
+            logger.info(
+                f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
+                f"{n_rw} target features (reweighted)"
+            )
+
+        if debug_dir is not None:
+            from ms1rescore.debug_viz import save_debug_figures
+            save_debug_figures(
+                features_df, result_df,
+                ion_images=ion_images, ion_image_mzs=ion_image_mzs,
+                maldi_envelopes=maldi_envelopes,
+                feature_names=intrinsic_present, model_name="qda",
+                pep_method="kde",
+                importances_r1=_imp_r1_qda, importances_r2=qda_imp_r2,
+                importance_names=qda_imp_names_r2 or _imp_names_qda,
+                debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
+                gt_peptides=gt_peptides,
+            )
+
+        return psm_list, result_df, feature_names
+
     else:
-        raise ValueError(f"Unknown model '{model}'. Choose 'svm', 'catboost', or 'lda'.")
+        raise ValueError(f"Unknown model '{model}'. Choose 'svm', 'catboost', 'lda', or 'qda'.")

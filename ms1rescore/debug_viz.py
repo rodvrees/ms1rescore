@@ -1698,7 +1698,13 @@ def plot_score_distributions(
             continue
 
         all_finite = np.concatenate([t_finite, d_finite])
-        lo, hi = np.nanpercentile(all_finite, [0.5, 99.5])
+
+        # IQR-based x-axis limits: robust to heavy-tailed and skewed distributions.
+        # Whisker = Q1 - 3*IQR … Q3 + 3*IQR, then clipped to data range.
+        q1, q3 = np.percentile(all_finite, [25, 75])
+        iqr = q3 - q1
+        lo = max(all_finite.min(), q1 - 3.0 * iqr)
+        hi = min(all_finite.max(), q3 + 3.0 * iqr)
         if lo >= hi:
             lo, hi = all_finite.min(), all_finite.max()
         bins = np.linspace(lo, hi, n_bins + 1)
@@ -1706,13 +1712,26 @@ def plot_score_distributions(
         if len(t_finite):
             ax.hist(
                 t_finite, bins=bins, density=True,
-                color=colours["T"], alpha=0.55, label=f"Target (n={len(t_finite):,})",
+                color=colours["T"], alpha=0.45, label=f"Target (n={len(t_finite):,})",
             )
         if len(d_finite):
             ax.hist(
                 d_finite, bins=bins, density=True,
-                color=colours["D"], alpha=0.55, label=f"Decoy (n={len(d_finite):,})",
+                color=colours["D"], alpha=0.45, label=f"Decoy (n={len(d_finite):,})",
             )
+
+        # KDE overlay for clearer shape visualization.
+        try:
+            from scipy.stats import gaussian_kde
+            x_kde = np.linspace(lo, hi, 300)
+            if len(t_finite) >= 5:
+                ax.plot(x_kde, gaussian_kde(t_finite)(x_kde),
+                        color=colours["T"], lw=1.5)
+            if len(d_finite) >= 5:
+                ax.plot(x_kde, gaussian_kde(d_finite)(x_kde),
+                        color=colours["D"], lw=1.5)
+        except Exception:
+            pass
 
         if q_threshold_score is not None and col_label == r2_col:
             ax.axvline(
@@ -1722,6 +1741,7 @@ def plot_score_distributions(
 
         ax.set_xlabel("Score")
         ax.set_ylabel("Density")
+        ax.set_xlim(lo, hi)
         ax.set_title(f"{col_label}\n({subset_label})", fontsize=9)
         ax.legend(fontsize=8)
 
@@ -1820,16 +1840,23 @@ def plot_pep_mixture(
     out_dir: str,
     model_name: str = "model",
     n_bins: int = 50,
+    pep_method: str = "gaussian",
 ) -> None:
     """
-    Overlay histogram of target and decoy R2 scores with fitted f0/f1 Gaussians
+    Overlay histogram of target and decoy R2 scores with fitted density curves
     and a secondary y-axis PEP curve.
+
+    The ``pep_method`` parameter must match the method passed to ``estimate_pep``
+    so that the overlay curves reflect the actual PEP computation:
+    - ``"gaussian"`` (default): parametric Gaussian f0/f1 (LDA, SVM, CatBoost).
+    - ``"kde"``: kernel density estimates (QDA).
+
+    X-axis uses IQR-based limits (Q1 − 3×IQR … Q3 + 3×IQR) to handle
+    heavy-tailed score distributions robustly.
 
     Reads ``pep`` and the ``*_score_r2`` column from ``result_df`` (winners only).
     Output: ``{out_dir}/pep_mixture.png``
     """
-    from scipy.stats import norm
-
     os.makedirs(out_dir, exist_ok=True)
 
     is_winner = result_df.get("is_tdc_winner", pd.Series(False, index=result_df.index)).fillna(False).astype(bool)
@@ -1864,43 +1891,82 @@ def plot_pep_mixture(
     t_scores = scores_f[~is_decoy_f]
     d_scores = scores_f[is_decoy_f]
 
-    # Reconstruct mixture parameters (mirrors estimate_pep logic)
-    mu0 = float(np.mean(d_scores)) if len(d_scores) >= 2 else float(np.mean(scores_f))
-    sigma0 = max(float(np.std(d_scores)), 1e-6) if len(d_scores) >= 2 else 1.0
+    # IQR-based x limits: robust to heavy tails from QDA or CatBoost scores.
+    q1, q3 = np.percentile(scores_f, [25, 75])
+    iqr = q3 - q1
+    lo = max(float(scores_f.min()), q1 - 3.0 * iqr)
+    hi = min(float(scores_f.max()), q3 + 3.0 * iqr)
+    if lo >= hi:
+        lo, hi = float(scores_f.min()) - 0.5, float(scores_f.max()) + 0.5
+    score_range = np.linspace(lo, hi, 300)
+
+    # Shared setup for both methods (mirrors estimate_pep)
     median_t = float(np.median(t_scores)) if len(t_scores) >= 2 else float(np.mean(scores_f))
     high_t = t_scores[t_scores > median_t] if len(t_scores) >= 2 else t_scores
     if len(high_t) < 2:
         high_t = t_scores
-    mu1 = float(np.mean(high_t)) if len(high_t) >= 1 else mu0 + 1.0
-    sigma1 = max(float(np.std(high_t)), 1e-6) if len(high_t) >= 2 else 1.0
-
-    score_range = np.linspace(scores_f.min() - 0.5, scores_f.max() + 0.5, 300)
-    f0_curve = norm.pdf(score_range, mu0, sigma0)
-    f1_curve = norm.pdf(score_range, mu1, sigma1)
-
     pi0 = is_decoy_f.sum() / len(is_decoy_f)
-    numer = pi0 * norm.pdf(score_range, mu0, sigma0)
-    denom = numer + (1.0 - pi0) * norm.pdf(score_range, mu1, sigma1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        pep_curve = np.where(denom > 0, numer / denom, 1.0)
 
     fig, ax1 = plt.subplots(figsize=(8, 5))
-
-    bins = np.linspace(scores_f.min(), scores_f.max(), n_bins + 1)
+    bins = np.linspace(lo, hi, n_bins + 1)
     ax1.hist(t_scores, bins=bins, alpha=0.4, color="steelblue", label="Targets", density=True)
     ax1.hist(d_scores, bins=bins, alpha=0.4, color="tomato", label="Decoys", density=True)
 
-    # Scale Gaussians to density of their respective groups for visual alignment
-    ax1.plot(score_range, f1_curve, color="steelblue", lw=1.5, ls="--", label="f1 (signal)")
-    ax1.plot(score_range, f0_curve, color="tomato", lw=1.5, ls="--", label="f0 (null)")
+    if pep_method == "kde":
+        # QDA: PEP comes directly from predict_proba — no mixture model fitting needed.
+        # Overlay KDE curves of the score distributions to show separation, and fit an
+        # isotonic regression through the (score, PEP) scatter for the trend line.
+        from scipy.stats import gaussian_kde
+        try:
+            if len(t_scores) >= 5:
+                ax1.plot(score_range, gaussian_kde(t_scores)(score_range),
+                         color="steelblue", lw=1.5, ls="--", label="target KDE")
+            if len(d_scores) >= 5:
+                ax1.plot(score_range, gaussian_kde(d_scores)(score_range),
+                         color="tomato", lw=1.5, ls="--", label="decoy KDE")
+        except Exception:
+            pass
+
+        ax2 = ax1.twinx()
+        sort_idx = np.argsort(scores_f)
+        ax2.scatter(scores_f[sort_idx], pep_f[sort_idx],
+                    s=6, color="grey", alpha=0.35, zorder=3, label="PEP (predict_proba)")
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            ir = IsotonicRegression(increasing=False, out_of_bounds="clip")
+            pep_iso = ir.fit_transform(scores_f[sort_idx], pep_f[sort_idx])
+            ax2.plot(scores_f[sort_idx], pep_iso, color="black", lw=2, label="PEP (isotonic)")
+        except Exception:
+            pass
+        title_suffix = "QDA predict_proba"
+    else:
+        # Gaussian mixture: reconstruct f0/f1 and PEP curve analytically.
+        from scipy.stats import norm
+        mu0 = float(np.mean(d_scores)) if len(d_scores) >= 2 else float(np.mean(scores_f))
+        sigma0 = max(float(np.std(d_scores)), 1e-6) if len(d_scores) >= 2 else 1.0
+        mu1 = float(np.mean(high_t)) if len(high_t) >= 1 else mu0 + 1.0
+        sigma1 = max(float(np.std(high_t)), 1e-6) if len(high_t) >= 2 else 1.0
+        f0_curve = norm.pdf(score_range, mu0, sigma0)
+        f1_curve = norm.pdf(score_range, mu1, sigma1)
+        numer = pi0 * f0_curve
+        denom = numer + (1.0 - pi0) * f1_curve
+        with np.errstate(invalid="ignore", divide="ignore"):
+            pep_curve = np.where(denom > 0, numer / denom, 1.0)
+
+        ax1.plot(score_range, f1_curve, color="steelblue", lw=1.5, ls="--", label="f1 (signal)")
+        ax1.plot(score_range, f0_curve, color="tomato", lw=1.5, ls="--", label="f0 (null)")
+
+        ax2 = ax1.twinx()
+        ax2.plot(score_range, pep_curve, color="black", lw=2, label="PEP")
+        sort_idx = np.argsort(scores_f)
+        ax2.scatter(scores_f[sort_idx], pep_f[sort_idx],
+                    s=6, color="grey", alpha=0.4, zorder=3)
+        title_suffix = "Gaussian mixture"
+
     ax1.set_xlabel(f"R2 score ({r2_col})")
     ax1.set_ylabel("Density")
+    ax1.set_xlim(lo, hi)
 
-    ax2 = ax1.twinx()
-    ax2.plot(score_range, pep_curve, color="black", lw=2, label="PEP")
-    # Overlay actual PEP values as a scatter to show model fit
-    sort_idx = np.argsort(scores_f)
-    ax2.scatter(scores_f[sort_idx], pep_f[sort_idx], s=6, color="grey", alpha=0.4, zorder=3)
     ax2.set_ylabel("PEP")
     ax2.set_ylim(-0.05, 1.15)
     ax2.axhline(0.05, color="black", lw=0.8, ls=":", alpha=0.6)
@@ -1910,7 +1976,9 @@ def plot_pep_mixture(
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
 
-    ax1.set_title(f"PEP mixture model — {model_name} R2 winners (n={len(scores_f)})")
+    ax1.set_title(
+        f"PEP — {model_name} R2 winners (n={len(scores_f)}) [{title_suffix}]"
+    )
     plt.tight_layout()
     fig.savefig(os.path.join(out_dir, "pep_mixture.png"), dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -1929,6 +1997,7 @@ def save_debug_figures(
     maldi_envelopes: dict | None = None,
     feature_names: list[str] | None = None,
     model_name: str = "model",
+    pep_method: str = "gaussian",
     importances_r1: np.ndarray | None = None,
     importances_r2: np.ndarray | None = None,
     importance_names: list[str] | None = None,
@@ -2126,6 +2195,7 @@ def save_debug_figures(
             result_df,
             out_dir=debug_dir,
             model_name=model_name,
+            pep_method=pep_method,
         )
         logger.info("PEP mixture plot saved to %s/pep_mixture.png", debug_dir)
     except Exception as exc:

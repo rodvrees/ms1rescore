@@ -38,10 +38,12 @@ ms1rescore/
 │       ├── test_deisotoping.py
 │       ├── test_evidence_score.py
 │       ├── test_isotope_distribution.py
+│       ├── test_lcms_apex_features.py
 │       ├── test_lcms_ids.py
 │       ├── test_lda_backend.py
 │       ├── test_maldi_extraction.py
-│       └── test_mz_shift_decoys.py
+│       ├── test_mz_shift_decoys.py
+│       └── test_pep.py
 └── ms1rescore-rs/              # Rust extension (PyO3 + rayon)
     ├── Cargo.toml
     └── src/
@@ -343,14 +345,22 @@ Holds all MS1 and MS2 scan data loaded from mzML or Bruker `.d` files. Lazily co
 1. Pre-compute per MALDI feature (1,398 iterations):
    - Matching MS2 scan indices (by neutral mass)
 2. Per-candidate loop (707K iterations): all peptide-specific computations:
-   - Spectral angle vs MS2PIP prediction (peptide+charge specific). `lcms_ms2_spectral_angle` = NaN when no MS2PIP prediction is available (no matched MS2 scan or prediction not computed); 0.0 when a prediction exists but fewer than 3 fragments match.
-   - DeepLC predicted RT → nearest MS1 scan (cached per unique peptide sequence)
-   - `lcms_ms1_intensity`: log1p of summed signal in ±ppm window at precursor m/z
+   - **MS2 RT filter**: when `rt_window_min > 0`, `predicted_rt` is fetched before the MS2 loop and the neutral-mass-matched scan list is further restricted to scans whose `ms2_precursor_rt` is within ±`rt_window_min` of `predicted_rt`. `lcms_ms2_n_matches` reflects this filtered count. When `rt_window_min == 0`, only neutral-mass matching applies (original behaviour).
+   - Spectral angle vs MS2PIP prediction (peptide+charge specific). `lcms_ms2_spectral_angle` = NaN when no MS2PIP prediction is available; 0.0 when a prediction exists but fewer than 3 fragments match.
+   - `lcms_ms2_rt_delta` (F4): |RT of the highest-SA MS2 scan − predicted_rt|. NaN when no MS2 match passes both filters.
+   - DeepLC predicted RT → MS1 scan window (cached per unique peptide sequence). When `rt_window_min > 0`: all MS1 scans within ±`rt_window_min`; when `rt_window_min == 0`: single nearest scan.
+   - `lcms_ms1_intensity`: log1p of summed signal in ±ppm window at precursor m/z across selected scans
    - `lcms_ms1_snr`: log10(signal / median_background) when both signal > 0 and background > 0; log10(signal) when signal > 0 but no non-zero background found; 0.0 when signal = 0
-   - Isotope envelope [M0, M+1, M+2] from `_extract_ms1_envelope` at the **LC-MS/MS charge** (charge of the highest-SA MS2 scan, fallback charge 1 when no MS2 prediction available). The envelope m/z is `(neutral_mass + z * PROTON) / z` with peak spacing `NEUTRON / z`.
+   - Isotope envelope [M0, M+1, M+2] from `_extract_ms1_envelope` at the **LC-MS/MS charge** (charge of the highest-SA MS2 scan, fallback charge 1). The envelope m/z is `(neutral_mass + z * PROTON) / z` with peak spacing `NEUTRON / z`.
    - `lcms_ms1_isotope_cosine`: cosine similarity of observed vs theoretical envelope
    - `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`: |obs_ratio − theo_ratio| for M+1/M0 and M+2/M0
+   - **Apex window features** (F1–F3, only when `rt_window_min > 0`): computed at `lc_mz` (LC-MS/MS charge m/z) over the same scan window:
+     - `lcms_ms1_apex_rt_delta`: |RT of the max-signal scan − predicted_rt|. NaN when no signal found.
+     - `lcms_ms1_frac_apex_signal`: signal at the DeepLC-nearest scan / signal at the apex scan. 0.0 when no signal. Equals 1.0 when predicted_rt falls exactly at the elution apex.
+     - `lcms_ms1_n_scans_with_signal`: count of scans in the window with non-zero signal at `lc_mz ± ppm_tolerance`.
    - If `maldi_envelopes` provided: MALDI vs LC-MS/MS envelope comparison → `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff`, `isotope_n_matched`
+
+**`rt_window_min` is set to `2.0 × p95_mae`** of DeepLC calibration residuals in `pipeline.py`, where `p95_mae` is the 95th-percentile absolute error over the fine-tuning calibration set. When no calibration is performed, `rt_window_min = 0.0` and all window-based features (F1–F4 plus the MS2 RT filter) fall back to their sentinel values automatically.
 
 **Signature:**
 ```python
@@ -360,6 +370,7 @@ compute_all_lcms_evidence(
     maldi_envelopes=None,  # feature_mz → normalized envelope array
     ppm_tolerance=20.0,
     fragment_tol_da=0.02,
+    rt_window_min=0.0,     # ±window for MS2 RT filter and apex features
 ) -> dict[int, dict[str, float]]
 ```
 
@@ -454,6 +465,9 @@ from ms1rescore.feature_generator import (
 - Ion mobility (optional, requires im2deep + observed CCS): `im2deep_delta_ccs`, `im2deep_abs_delta_ccs_pct`, `im2deep_ccs_zscore`, `im2deep_ccs_rank`
 - Isotopologue co-localization (optional, requires ion_images): `isotope_image_colocalization_m1`, `isotope_image_colocalization_m2`, `isotope_image_colocalization_mean`
 - Adduct co-localization (optional, requires ion_images): `adduct_colocalization_na`, `adduct_colocalization_k`, `adduct_colocalization_chca`
+- MALDI vs LC-MS/MS isotope envelope comparison (`_LCMS_RANKER_FROM_EVIDENCE`, requires `maldi_envelopes`): `isotope_envelope_cosine`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff`
+
+The last group (`_LCMS_RANKER_FROM_EVIDENCE`) is appended to `MALDI_INTRINSIC_FEATURES` after `LCMS_PRIOR_FEATURES` is defined. These features compare the MALDI M+1/M+2 pattern directly to the LC-MS/MS M+1/M+2 pattern, measuring MALDI signal quality rather than LC-MS/MS identification quality. They are excluded from `MALDI_INTRINSIC_FEATURES` (dropped from the DataFrame) when `maldi_envelopes` is not provided, so the LDA is not given a degenerate all-NaN column.
 
 **`SPATIAL_PRIOR_FEATURES`** — excluded from the ranker; applied as additive log-prior alongside `LCMS_PRIOR_FEATURES` (via `compute_spatial_prior()` in `pipeline.py`):
 - `spatial_autocorrelation`, `fraction_detected`, `intensity_cv`, `log_mean_intensity`, `spatial_entropy`, `spatial_morans_i`, `spatial_gearys_c`
@@ -469,10 +483,13 @@ from ms1rescore.feature_generator import (
 **`LCMS_PRIOR_FEATURES`** — excluded from the ranker, applied as an additive log-prior after scoring. All features are derived symmetrically from raw mzML (no search engine scores):
 
 *mzML-derived* (`_LCMS_MZML_FEATURES`):
-- MS2: `lcms_ms2_spectral_angle`, `lcms_ms2_n_matches`
+- MS2: `lcms_ms2_spectral_angle`, `lcms_ms2_n_matches` (both filtered by DeepLC RT window when `rt_window_min > 0`)
 - DeepLC-anchored MS1 signal: `lcms_ms1_intensity`, `lcms_ms1_snr`
 - DeepLC-anchored MS1 isotope: `lcms_ms1_isotope_cosine`, `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`
-- MALDI vs LC-MS/MS envelope similarity (requires `maldi_envelopes`): `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff`, `isotope_n_matched`
+- MALDI vs LC-MS/MS envelope similarity (requires `maldi_envelopes`): `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_n_matched`, `isotope_absolute_diff`
+- DeepLC-anchored RT-consistency (requires `rt_window_min > 0`): `lcms_ms1_apex_rt_delta`, `lcms_ms1_frac_apex_signal`, `lcms_ms1_n_scans_with_signal`, `lcms_ms2_rt_delta`
+
+Note: `isotope_envelope_cosine`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff` are **not** in `_LCMS_MZML_FEATURES`; they are in `_LCMS_RANKER_FROM_EVIDENCE` and go into `MALDI_INTRINSIC_FEATURES` instead.
 
 *CCS-derived* (`_LCMS_CCS_FEATURES`, optional): `lcms_ccs_delta`, `lcms_ccs_abs_pct`
 
