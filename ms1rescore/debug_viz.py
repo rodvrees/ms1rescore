@@ -77,6 +77,24 @@ def _sample_subset(
     )
     td_labels = np.where(is_decoy_arr, "D", "T")
 
+    # If no candidates pass 1% FDR, seed the ID stratum from the 5 winners
+    # with the lowest PEP so at least one high-confidence example appears in
+    # every per-candidate debug figure.
+    pep_col = pd.to_numeric(
+        res.get("pep", pd.Series(float("nan"), index=res.index)),
+        errors="coerce",
+    )
+    if not passes.any() and "pep" in res.columns:
+        winner_indices = np.where(is_winner.values)[0]
+        if len(winner_indices) > 0:
+            winner_pep = pep_col.values[winner_indices]
+            finite_mask = np.isfinite(winner_pep)
+            if finite_mask.any():
+                ranked = np.argsort(winner_pep[finite_mask])
+                top5 = winner_indices[np.where(finite_mask)[0][ranked[:5]]]
+                groups[top5] = "ID"
+                passes = pd.Series(groups == "ID", index=res.index)
+
     # Stratify across 6 strata: {ID, R1, L} × {T, D}
     strata = [(grp, td) for grp in ("ID", "R1", "L") for td in ("T", "D")]
     per_stratum = max(1, n // len(strata))
@@ -1505,9 +1523,10 @@ def plot_score_pp(
     PP plot of score distributions: F_decoy(t) on the x-axis vs F_target(t)
     on the y-axis, sweeping threshold t across all observed scores.
 
-    Two panels:
-      Left  — Round-2 scores on R1 winners (the TDC input set).
-      Right — Round-1 scores on all candidates.
+    Three panels:
+      Left   — Round-1 scores on all candidates.
+      Centre — Round-2 scores on R1 winners (the TDC input set).
+      Right  — Reweighted R2 scores on R1 winners (after LC-MS/MS + spatial prior).
 
     Reference lines on each panel:
       - Dashed grey  y = x: the curve if targets and decoys were identically
@@ -1540,6 +1559,7 @@ def plot_score_pp(
     # Detect score columns dynamically
     r2_cols = [c for c in res.columns if c.endswith("_score_r2")]
     r1_cols = [c for c in res.columns if c.endswith("_score_r1")]
+    has_reweighted = "reweighted_score" in res.columns
     if not r2_cols and not r1_cols:
         logger.debug("score_pp: no score columns found, skipping")
         return
@@ -1547,28 +1567,38 @@ def plot_score_pp(
     r2_col = r2_cols[0] if r2_cols else None
     r1_col = r1_cols[0] if r1_cols else None
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    # Left panel: R2 scores on R1 winners
+    # Left panel: R1 scores on all candidates
     ax = axes[0]
-    if r2_col is not None:
-        winner_mask = is_winner
-        r2_scores = pd.to_numeric(res[r2_col], errors="coerce").values
-        finite_w = winner_mask & np.isfinite(r2_scores)
-        t_r2 = r2_scores[~is_decoy & finite_w]
-        d_r2 = r2_scores[ is_decoy & finite_w]
-        _draw_pp_panel(ax, t_r2, d_r2, f"R1 winners — {r2_col}", n_points=n_points)
-    else:
-        ax.set_visible(False)
-
-    # Right panel: R1 scores on all candidates
-    ax = axes[1]
     if r1_col is not None:
         r1_scores = pd.to_numeric(res[r1_col], errors="coerce").values
         finite_r1 = np.isfinite(r1_scores)
         t_r1 = r1_scores[~is_decoy & finite_r1]
         d_r1 = r1_scores[ is_decoy & finite_r1]
         _draw_pp_panel(ax, t_r1, d_r1, f"All candidates — {r1_col}", n_points=n_points)
+    else:
+        ax.set_visible(False)
+
+    # Centre panel: R2 scores on R1 winners
+    ax = axes[1]
+    if r2_col is not None:
+        r2_scores = pd.to_numeric(res[r2_col], errors="coerce").values
+        finite_w = is_winner & np.isfinite(r2_scores)
+        t_r2 = r2_scores[~is_decoy & finite_w]
+        d_r2 = r2_scores[ is_decoy & finite_w]
+        _draw_pp_panel(ax, t_r2, d_r2, f"R1 winners — {r2_col}", n_points=n_points)
+    else:
+        ax.set_visible(False)
+
+    # Right panel: reweighted R2 scores on R1 winners
+    ax = axes[2]
+    if has_reweighted:
+        rw_scores = pd.to_numeric(res["reweighted_score"], errors="coerce").values
+        finite_rw = is_winner & np.isfinite(rw_scores)
+        t_rw = rw_scores[~is_decoy & finite_rw]
+        d_rw = rw_scores[ is_decoy & finite_rw]
+        _draw_pp_panel(ax, t_rw, d_rw, "R1 winners — reweighted_score", n_points=n_points)
     else:
         ax.set_visible(False)
 
@@ -1782,6 +1812,111 @@ def _save_gt_not_found_figures(peptides: list[str], subdirs: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PEP mixture model visualization
+# ---------------------------------------------------------------------------
+
+def plot_pep_mixture(
+    result_df: pd.DataFrame,
+    out_dir: str,
+    model_name: str = "model",
+    n_bins: int = 50,
+) -> None:
+    """
+    Overlay histogram of target and decoy R2 scores with fitted f0/f1 Gaussians
+    and a secondary y-axis PEP curve.
+
+    Reads ``pep`` and the ``*_score_r2`` column from ``result_df`` (winners only).
+    Output: ``{out_dir}/pep_mixture.png``
+    """
+    from scipy.stats import norm
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    is_winner = result_df.get("is_tdc_winner", pd.Series(False, index=result_df.index)).fillna(False).astype(bool)
+    winners = result_df[is_winner].copy()
+    if len(winners) == 0:
+        logger.debug("plot_pep_mixture: no winners, skipping")
+        return
+
+    r2_cols = [c for c in winners.columns if c.endswith("_score_r2")]
+    if not r2_cols:
+        logger.debug("plot_pep_mixture: no R2 score column found, skipping")
+        return
+    r2_col = r2_cols[0]
+
+    if "pep" not in winners.columns:
+        logger.debug("plot_pep_mixture: pep column missing, skipping")
+        return
+
+    is_decoy_w = winners["is_decoy"].fillna(False).astype(bool).values
+    scores = pd.to_numeric(winners[r2_col], errors="coerce").values
+    pep_vals = pd.to_numeric(winners["pep"], errors="coerce").values
+
+    finite = np.isfinite(scores) & np.isfinite(pep_vals)
+    if finite.sum() < 4:
+        logger.debug("plot_pep_mixture: too few finite winners, skipping")
+        return
+
+    scores_f = scores[finite]
+    pep_f = pep_vals[finite]
+    is_decoy_f = is_decoy_w[finite]
+
+    t_scores = scores_f[~is_decoy_f]
+    d_scores = scores_f[is_decoy_f]
+
+    # Reconstruct mixture parameters (mirrors estimate_pep logic)
+    mu0 = float(np.mean(d_scores)) if len(d_scores) >= 2 else float(np.mean(scores_f))
+    sigma0 = max(float(np.std(d_scores)), 1e-6) if len(d_scores) >= 2 else 1.0
+    median_t = float(np.median(t_scores)) if len(t_scores) >= 2 else float(np.mean(scores_f))
+    high_t = t_scores[t_scores > median_t] if len(t_scores) >= 2 else t_scores
+    if len(high_t) < 2:
+        high_t = t_scores
+    mu1 = float(np.mean(high_t)) if len(high_t) >= 1 else mu0 + 1.0
+    sigma1 = max(float(np.std(high_t)), 1e-6) if len(high_t) >= 2 else 1.0
+
+    score_range = np.linspace(scores_f.min() - 0.5, scores_f.max() + 0.5, 300)
+    f0_curve = norm.pdf(score_range, mu0, sigma0)
+    f1_curve = norm.pdf(score_range, mu1, sigma1)
+
+    pi0 = is_decoy_f.sum() / len(is_decoy_f)
+    numer = pi0 * norm.pdf(score_range, mu0, sigma0)
+    denom = numer + (1.0 - pi0) * norm.pdf(score_range, mu1, sigma1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pep_curve = np.where(denom > 0, numer / denom, 1.0)
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+
+    bins = np.linspace(scores_f.min(), scores_f.max(), n_bins + 1)
+    ax1.hist(t_scores, bins=bins, alpha=0.4, color="steelblue", label="Targets", density=True)
+    ax1.hist(d_scores, bins=bins, alpha=0.4, color="tomato", label="Decoys", density=True)
+
+    # Scale Gaussians to density of their respective groups for visual alignment
+    ax1.plot(score_range, f1_curve, color="steelblue", lw=1.5, ls="--", label="f1 (signal)")
+    ax1.plot(score_range, f0_curve, color="tomato", lw=1.5, ls="--", label="f0 (null)")
+    ax1.set_xlabel(f"R2 score ({r2_col})")
+    ax1.set_ylabel("Density")
+
+    ax2 = ax1.twinx()
+    ax2.plot(score_range, pep_curve, color="black", lw=2, label="PEP")
+    # Overlay actual PEP values as a scatter to show model fit
+    sort_idx = np.argsort(scores_f)
+    ax2.scatter(scores_f[sort_idx], pep_f[sort_idx], s=6, color="grey", alpha=0.4, zorder=3)
+    ax2.set_ylabel("PEP")
+    ax2.set_ylim(-0.05, 1.15)
+    ax2.axhline(0.05, color="black", lw=0.8, ls=":", alpha=0.6)
+    ax2.axhline(0.20, color="black", lw=0.8, ls=":", alpha=0.4)
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
+
+    ax1.set_title(f"PEP mixture model — {model_name} R2 winners (n={len(scores_f)})")
+    plt.tight_layout()
+    fig.savefig(os.path.join(out_dir, "pep_mixture.png"), dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1852,7 +1987,17 @@ def save_debug_figures(
                 res_aligned.get("reweighted_q_value", pd.Series(float("nan"), index=res_aligned.index)),
                 errors="coerce",
             )
-            _id_idx = np.where((_is_winner & (_rw_q <= 0.01)).values)[0].tolist()
+            _id_mask = _is_winner & (_rw_q <= 0.01)
+            if not _id_mask.any() and "pep" in res_aligned.columns:
+                _pep = pd.to_numeric(res_aligned["pep"], errors="coerce")
+                _winner_idx = np.where(_is_winner.values)[0]
+                _finite = np.isfinite(_pep.values[_winner_idx])
+                if _finite.any():
+                    _ranked = np.argsort(_pep.values[_winner_idx[_finite]])
+                    _top5 = _winner_idx[np.where(_finite)[0][_ranked[:5]]]
+                    _id_mask = pd.Series(False, index=res_aligned.index)
+                    _id_mask.iloc[_top5] = True
+            _id_idx = np.where(_id_mask.values)[0].tolist()
             _score_r1_cols = [c for c in result_df.columns if c.endswith("_score_r1")]
             _display_cols = _score_r1_cols + [
                 c for c in ["q_value", "is_tdc_winner", "reweighted_score", "reweighted_q_value"]
@@ -1975,6 +2120,16 @@ def save_debug_figures(
         logger.info("Score PP plot saved to %s/score_pp_plot.png", debug_dir)
     except Exception as exc:
         logger.warning("Score PP plot failed: %s", exc)
+
+    try:
+        plot_pep_mixture(
+            result_df,
+            out_dir=debug_dir,
+            model_name=model_name,
+        )
+        logger.info("PEP mixture plot saved to %s/pep_mixture.png", debug_dir)
+    except Exception as exc:
+        logger.warning("PEP mixture plot failed: %s", exc)
 
     try:
         plot_score_distributions(

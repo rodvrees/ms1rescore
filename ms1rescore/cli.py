@@ -742,7 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp.add_argument(
         "--winner-min-r1-q",
         type=float,
-        default=0.80,
+        default=1.00,
         metavar="FLOAT",
         help=(
             "R1 TDC q-value threshold for winner selection. Only per-feature "

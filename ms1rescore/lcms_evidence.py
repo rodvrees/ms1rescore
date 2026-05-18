@@ -569,7 +569,7 @@ def finetune_deeplc_from_df(
         ]
     )
 
-    model = finetune(psm_list)
+    model = finetune(psm_list, train_kwargs={"epochs": 30})
     return model
 
 

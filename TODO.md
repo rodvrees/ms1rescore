@@ -1,7 +1,6 @@
 - Move MSF parser to psm_utils
 - LC-MS/MS prior features should just be MS2Rescore features
 - cleanup: classes of scoring algos? with a base class?
-- log_mean_intensity and spatial_entropy are empty?
 - New release of psm_utils
 - Implement JSON config structure like in MS2Rescore
 - Priority:

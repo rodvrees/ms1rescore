@@ -129,10 +129,13 @@ def _compute_pi_batch(unique_seqs: np.ndarray,
 
 
 def compute_mass_accuracy_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute ppm_error_abs, ppm_rank, ppm_best_ratio within feature groups."""
+    """Compute ppm_error_abs, ppm_rank, ppm_best_ratio, ppm_error_pct, ppm_error_squared."""
     df["ppm_rank"] = df.groupby("feature_mz")["ppm_error_abs"].rank(method="min")
     best_ppm = df.groupby("feature_mz")["ppm_error_abs"].transform("min")
     df["ppm_best_ratio"] = df["ppm_error_abs"] / best_ppm.clip(lower=1e-6)
+    df['log_ppm_best_ratio'] = np.log1p(df['ppm_best_ratio'])
+    df["ppm_error_pct"] = df["ppm_error_abs"] / df["feature_mz"].clip(lower=1.0) * 100
+    df["ppm_error_squared"] = df["ppm_error_abs"] ** 2
     return df
 
 

@@ -468,6 +468,83 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     return q_values
 
 
+def estimate_pep(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
+    """
+    Estimate posterior error probability (PEP) via a two-component Gaussian
+    mixture fitted to the R2 winner score distribution.
+
+    Model
+    -----
+    f0 : Gaussian fitted to decoy scores (null distribution).
+    f1 : Gaussian fitted to target scores above the target median (signal
+         distribution).  Using only the right tail avoids contamination from
+         incorrect target matches that overlap with the null.
+    pi0 : n_decoy / n_total  (fraction of winners that are decoys).
+
+    PEP(s) = pi0 * f0(s) / (pi0 * f0(s) + (1 - pi0) * f1(s)), clipped to [0, 1].
+
+    Returns NaN for all entries when fewer than 2 decoys or fewer than 2 targets
+    are present (mixture is unidentifiable).
+    """
+    from scipy.stats import norm
+
+    scores = np.asarray(scores, dtype=float)
+    is_decoy = np.asarray(is_decoy, dtype=bool)
+
+    n_decoy = int(is_decoy.sum())
+    n_target = int((~is_decoy).sum())
+    if n_decoy < 2 or n_target < 2:
+        return np.full(len(scores), np.nan)
+
+    pi0 = n_decoy / len(scores)
+
+    decoy_scores = scores[is_decoy]
+    target_scores = scores[~is_decoy]
+
+    mu0 = float(np.mean(decoy_scores))
+    sigma0 = max(float(np.std(decoy_scores)), 1e-6)
+
+    median_t = float(np.median(target_scores))
+    high_t = target_scores[target_scores > median_t]
+    if len(high_t) < 2:
+        high_t = target_scores
+    mu1 = float(np.mean(high_t))
+    sigma1 = max(float(np.std(high_t)), 1e-6)
+
+    f0 = norm.pdf(scores, mu0, sigma0)
+    f1 = norm.pdf(scores, mu1, sigma1)
+
+    numer = pi0 * f0
+    denom = numer + (1.0 - pi0) * f1
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pep = np.where(denom > 0.0, numer / denom, 1.0)
+
+    return np.clip(pep, 0.0, 1.0)
+
+
+def _pep_qvalues(pep: np.ndarray) -> np.ndarray:
+    """
+    Convert PEP values to q-values using the cumulative-mean estimator.
+
+    PSMs are sorted by ascending PEP; q(k) = mean(PEP_1 ... PEP_k).  This is
+    the BH-style q-value interpretation of PEP.  NaN entries (non-winners) are
+    propagated as NaN.
+    """
+    pep = np.asarray(pep, dtype=float)
+    q = np.full(len(pep), np.nan)
+    finite = np.isfinite(pep)
+    if not finite.any():
+        return q
+    idx = np.where(finite)[0]
+    order = np.argsort(pep[idx])
+    sorted_pep = pep[idx][order]
+    cumavg = np.cumsum(sorted_pep) / (np.arange(len(sorted_pep)) + 1.0)
+    result = np.empty(len(idx))
+    result[order] = cumavg
+    q[idx] = result
+    return q
+
+
 def _select_feature_winners(
     features_df: pd.DataFrame,
     scores: np.ndarray,
@@ -1091,6 +1168,8 @@ def rescore(
         # --- Standard TDC FDR on winners ---
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         q2 = _tdc_qvalues(scores2, is_decoy_w)
+        pep_w = estimate_pep(scores2, is_decoy_w)
+        pep_q_w = _pep_qvalues(pep_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
         spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
         # Additive log-prior: rank-correct for arbitrary-sign scores.
@@ -1113,6 +1192,10 @@ def rescore(
         scores2_full[winner_pos] = scores2
         q_full = np.full(len(features_df), np.nan)
         q_full[winner_pos] = q2
+        pep_full = np.full(len(features_df), np.nan)
+        pep_full[winner_pos] = pep_w
+        pep_q_full = np.full(len(features_df), np.nan)
+        pep_q_full[winner_pos] = pep_q_w
         rw_full = np.full(len(features_df), np.nan)
         rw_full[winner_pos] = reweighted2
         rw_q_full = np.full(len(features_df), np.nan)
@@ -1131,6 +1214,8 @@ def rescore(
                 "svm_score_r1": scores1,
                 "svm_score_r2": scores2_full,
                 "q_value": q_full,
+                "pep": pep_full,
+                "pep_q_value": pep_q_full,
                 "is_tdc_winner": is_winner_full,
                 "reweighted_score": rw_full,
                 "reweighted_q_value": rw_q_full,
@@ -1200,6 +1285,8 @@ def rescore(
         # --- Standard TDC FDR on winners ---
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         q2 = _tdc_qvalues(scores2, is_decoy_w)
+        pep_w = estimate_pep(scores2, is_decoy_w)
+        pep_q_w = _pep_qvalues(pep_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
         spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
         # Additive log-prior: rank-correct for arbitrary-sign scores.
@@ -1222,6 +1309,10 @@ def rescore(
         scores2_full[winner_pos] = scores2
         q_full = np.full(len(features_df), np.nan)
         q_full[winner_pos] = q2
+        pep_full = np.full(len(features_df), np.nan)
+        pep_full[winner_pos] = pep_w
+        pep_q_full = np.full(len(features_df), np.nan)
+        pep_q_full[winner_pos] = pep_q_w
         rw_full = np.full(len(features_df), np.nan)
         rw_full[winner_pos] = reweighted2
         rw_q_full = np.full(len(features_df), np.nan)
@@ -1240,6 +1331,8 @@ def rescore(
                 "catboost_score_r1": scores1,
                 "catboost_score_r2": scores2_full,
                 "q_value": q_full,
+                "pep": pep_full,
+                "pep_q_value": pep_q_full,
                 "is_tdc_winner": is_winner_full,
                 "reweighted_score": rw_full,
                 "reweighted_q_value": rw_q_full,
@@ -1338,6 +1431,8 @@ def rescore(
         # --- Standard TDC FDR on winners ---
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         q2 = _tdc_qvalues(scores2, is_decoy_w)
+        pep_w = estimate_pep(scores2, is_decoy_w)
+        pep_q_w = _pep_qvalues(pep_w)
         lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
         spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
         # Additive log-prior: rank-correct for arbitrary-sign scores.
@@ -1360,6 +1455,10 @@ def rescore(
         scores2_full[winner_pos] = scores2
         q_full = np.full(len(features_df), np.nan)
         q_full[winner_pos] = q2
+        pep_full = np.full(len(features_df), np.nan)
+        pep_full[winner_pos] = pep_w
+        pep_q_full = np.full(len(features_df), np.nan)
+        pep_q_full[winner_pos] = pep_q_w
         rw_full = np.full(len(features_df), np.nan)
         rw_full[winner_pos] = reweighted2
         rw_q_full = np.full(len(features_df), np.nan)
@@ -1378,6 +1477,8 @@ def rescore(
                 "lda_score_r1": scores1,
                 "lda_score_r2": scores2_full,
                 "q_value": q_full,
+                "pep": pep_full,
+                "pep_q_value": pep_q_full,
                 "is_tdc_winner": is_winner_full,
                 "reweighted_score": rw_full,
                 "reweighted_q_value": rw_q_full,

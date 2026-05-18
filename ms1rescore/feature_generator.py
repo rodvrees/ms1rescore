@@ -47,8 +47,9 @@ logger = logging.getLogger(__name__)
 # get_feature_names() when the required data was not provided.
 MALDI_INTRINSIC_FEATURES = [
     # --- mass accuracy (A-group) ---
-    "ppm_error_abs", "ppm_rank", "ppm_best_ratio",
-    "ppm_error_calibrated_z",        # A3  — optional, requires pixel_coords
+    "ppm_error_abs", "ppm_rank", "ppm_best_ratio", "log_ppm_best_ratio",
+    "ppm_error_calibrated_z",  # A3 — optional, requires pixel_coords
+    "ppm_error_pct", "ppm_error_squared",
     # --- ambiguity ---
     "n_candidates", "log_n_candidates",
     # --- peptide properties (basic) ---
@@ -120,7 +121,7 @@ _LCMS_MZML_FEATURES = [
     # MALDI vs LC-MS/MS isotope envelope similarity (requires maldi_envelopes)
     "isotope_envelope_cosine", "isotope_envelope_pearson",
     "isotope_envelope_mse", "isotope_m1_ratio_diff", "isotope_m2_ratio_diff",
-    "isotope_n_matched",
+    "isotope_n_matched", "isotope_absolute_diff"
 ]
 
 _LCMS_ID_FEATURES = [
