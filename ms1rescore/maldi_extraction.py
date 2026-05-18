@@ -736,14 +736,25 @@ def _compute_chunk(
         0.0,
     )
 
+    # --- Spatial Shannon entropy of the per-feature intensity distribution ---
+    safe_sum = np.maximum(intensity_sum, 1e-12)[:, None]
+    p = flat32.astype(np.float64) / safe_sum
+    with np.errstate(divide="ignore", invalid="ignore"):
+        spatial_entropy = -np.where(p > 0, p * np.log(p), 0.0).sum(axis=1)
+    spatial_entropy = np.where(intensity_sum > 0, spatial_entropy, 0.0)
+
+    log_mean_intensity = np.log1p(mean_int)
+
     return pd.DataFrame({
         "feature_mz": chunk_mzs.astype(np.float64),
         "n_pixels_detected": n_det.astype(int),
         "fraction_detected": frac,
         "mean_intensity": mean_int,
+        "log_mean_intensity": log_mean_intensity,
         "intensity_p90": p90,
         "intensity_sum": intensity_sum,
         "spatial_autocorrelation": morans_i,
+        "spatial_entropy": spatial_entropy,
         "intensity_cv": cv,
     })
 

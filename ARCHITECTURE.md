@@ -223,7 +223,7 @@ mzML-derived        lcms_ms2_spectral_angle, lcms_ms2_n_matches,
                     lcms_xic_snr, lcms_xic_best_charge,
                     lcms_rt_residual, lcms_ms1_isotope_cosine
 ID-derived          lcms_q_value, lcms_pep, lcms_score, n_psms,
-  (Strategy C)      lcms_intensity, source_lcms_confirmed (2× weight)
+  (Strategy C)      lcms_intensity
 ```
 
 ---
@@ -270,9 +270,7 @@ for each prior feature f in LCMS_PRIOR_FEATURES present in data:
     fill NaN with worst value (1.0 for q_value/pep, 0.0 for others)
     invert if lower-is-better (q_value, pep): value = 1 - value
     min-max normalise across all candidates → [0, 1]
-    apply weight (source_lcms_confirmed gets 2×, others 1×)
-
-prior_weight = weighted mean of normalised features (per candidate)
+prior_weight = mean of normalised features (per candidate)
 reweighted_score = base_score × prior_weight
 reweighted_q_value = TDC(reweighted_score)
 ```

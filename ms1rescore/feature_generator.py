@@ -125,7 +125,7 @@ _LCMS_MZML_FEATURES = [
 
 _LCMS_ID_FEATURES = [
     "lcms_q_value", "lcms_pep", "lcms_score",
-    "n_psms", "lcms_intensity", "source_lcms_confirmed",
+    "n_psms", "lcms_intensity",
 ]
 
 # MALDI-vs-LC-MS/MS CCS comparison (optional: requires ion mobility in LC-MS/MS data).

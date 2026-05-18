@@ -846,12 +846,17 @@ def compute_all_lcms_evidence(
         }
 
         # --- MS2 spectral angle ---
+        # NaN = no MS2PIP prediction available (no information).
+        # 0.0 = prediction available but spectral angle genuinely low (<3 matched fragments).
         best_angle = 0.0
+        best_charge = 1  # fallback; updated to the charge of the best-SA scan
+        has_prediction = False
         for scan_idx in ms2_scan_indices:
             scan_charge = int(lcms_data.ms2_precursor_charge[scan_idx])
             pred = ms2pip_cache.get((peptide, scan_charge))
             if pred is None:
                 continue
+            has_prediction = True
             angle = _match_and_score_spectrum(
                 pred[0], pred[1],
                 lcms_data.ms2_mz_arrays[scan_idx],
@@ -860,7 +865,8 @@ def compute_all_lcms_evidence(
             )
             if angle > best_angle:
                 best_angle = angle
-        result["lcms_ms2_spectral_angle"] = best_angle
+                best_charge = scan_charge
+        result["lcms_ms2_spectral_angle"] = best_angle if has_prediction else np.nan
 
         # --- DeepLC-anchored MS1 features ---
         if deeplc_cache is None or not has_ms1:
@@ -903,23 +909,35 @@ def compute_all_lcms_evidence(
 
         result["lcms_ms1_intensity"] = float(np.log1p(signal))
 
-        # SNR: median of non-zero background peaks across all selected scans
-        if signal > 0 and bg_chunks:
-            bg_vals = np.concatenate(bg_chunks)
-            bg_nonzero = bg_vals[bg_vals > 0]
-            if len(bg_nonzero) > 0:
-                background = float(np.median(bg_nonzero))
-                if background > 0:
-                    result["lcms_ms1_snr"] = float(np.log10(signal / background))
+        # SNR: log10(signal / background). When the local ±500 ppm window has no
+        # non-zero peaks, the background is effectively zero — this is a clean
+        # region and the signal stands out clearly, so use log10(signal) as a
+        # sentinel rather than collapsing it to 0 alongside the no-signal case.
+        if signal > 0:
+            background = 0.0
+            if bg_chunks:
+                bg_vals = np.concatenate(bg_chunks)
+                bg_nonzero = bg_vals[bg_vals > 0]
+                if len(bg_nonzero) > 0:
+                    background = float(np.median(bg_nonzero))
+            if background > 0:
+                result["lcms_ms1_snr"] = float(np.log10(signal / background))
+            else:
+                result["lcms_ms1_snr"] = float(np.log10(signal))
 
-        # Isotope envelope: accumulate raw counts across selected scans, then normalize
+        # Isotope envelope: accumulate raw counts across selected scans, then normalize.
+        # Extract at the LC-MS/MS precursor m/z and charge rather than the MALDI [M+H]+
+        # m/z, because LC-MS/MS peptides are detected at charge 2+ and the envelope
+        # spacing is NEUTRON/charge at that m/z.
         if not has_comp:
             evidence[candidates_df.index[i]] = result
             continue
 
+        neutral_mass = mz - PROTON
+        lc_mz = (neutral_mass + best_charge * PROTON) / best_charge
         raw_env = np.zeros(3)
         for scan_idx in scan_indices:
-            raw_env += _extract_ms1_envelope(mz, scan_idx, lcms_data, charge=1, n_peaks=3, normalize=False)
+            raw_env += _extract_ms1_envelope(lc_mz, scan_idx, lcms_data, charge=best_charge, n_peaks=3, normalize=False)
         env_total = raw_env.sum()
         env = raw_env / env_total if env_total > 0 else raw_env
         if env.sum() > 0:

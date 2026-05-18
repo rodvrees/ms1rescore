@@ -47,25 +47,33 @@ def compute_lcms_prior(
     Compute a per-candidate multiplicative weight in (0, 1] based on
     available LC-MS/MS evidence.
 
-    Each feature is min-max normalized to [0, 1]. Features where all values
-    are identical (no information) are skipped. Returns the mean of normalized
-    features, or 1.0 if no informative features are present.
+    Each feature is min-max normalized to [0, 1] using the non-NaN range.
+    NaN values (e.g. lcms_ms2_spectral_angle when no MS2 prediction is
+    available) are excluded from that candidate's mean so they don't
+    suppress the prior for candidates that lack MS2 evidence.
+    Features where all non-NaN values are identical are skipped.
+    Returns the nanmean of normalized features, or 1.0 where all features
+    are NaN or no informative features are present.
     """
     normed: list[np.ndarray] = []
 
     for feat in present_lcms_features:
         if feat not in candidates_df.columns:
             continue
-        col = candidates_df[feat].fillna(0.0).values.astype(float)
-        col_min, col_max = col.min(), col.max()
-        if col_max - col_min < 1e-12:
+        col = candidates_df[feat].values.astype(float)
+        col_min = np.nanmin(col)
+        col_max = np.nanmax(col)
+        if not np.isfinite(col_min) or not np.isfinite(col_max) or col_max - col_min < 1e-12:
             continue
         normed.append((col - col_min) / (col_max - col_min))
 
     if not normed:
         return np.ones(len(candidates_df))
 
-    return np.stack(normed, axis=0).mean(axis=0)
+    stacked = np.stack(normed, axis=0)
+    result = np.nanmean(stacked, axis=0)
+    # candidates where every feature is NaN get a neutral weight
+    return np.where(np.isnan(result), 1.0, result)
 
 
 def compute_spatial_prior(
@@ -383,7 +391,7 @@ def _rescore_lda(
     importances = None
     if pipe is not None:
         try:
-            importances = np.abs(pipe["lda"].coef_[0])
+            importances = pipe["lda"].coef_[0]
         except Exception:
             pass
     return scores, importances, present
@@ -483,6 +491,37 @@ def _select_feature_winners(
     return winner_pos, winners_df
 
 
+def _filter_winners_by_r1_q(
+    winner_pos: np.ndarray,
+    winners_df: pd.DataFrame,
+    winner_r1_scores: np.ndarray,
+    r1_q_threshold: float = 0.80,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """
+    Drop winner rows whose R1 TDC q-value exceeds r1_q_threshold.
+
+    Dropped features remain in result_df as non-winners (is_tdc_winner=False,
+    q_value=NaN). Returns the unfiltered set with a warning if the threshold
+    would remove all winners or leave fewer than 20 targets.
+    """
+    is_decoy_w = winners_df["is_decoy"].values.astype(bool)
+    q1 = _tdc_qvalues(winner_r1_scores, is_decoy_w)
+    keep = q1 <= r1_q_threshold
+    n_kept_targets = int((keep & ~is_decoy_w).sum())
+    if n_kept_targets < 20:
+        logger.warning(
+            f"  R1 quality filter (q ≤ {r1_q_threshold:.2f}) would leave only "
+            f"{n_kept_targets} target winners — skipping filter to avoid R2 collapse"
+        )
+        return winner_pos, winners_df
+    logger.info(
+        f"  R1 quality filter (q ≤ {r1_q_threshold:.2f}): "
+        f"{keep.sum()}/{len(keep)} winners kept "
+        f"({int((keep & is_decoy_w).sum())} decoys among kept)"
+    )
+    return winner_pos[keep], winners_df[keep].reset_index(drop=True)
+
+
 def rescore(
     fasta_path: str,
     maldi_mzs: np.ndarray,
@@ -495,6 +534,7 @@ def rescore(
     msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
     train_fdr: float = 0.01,
+    winner_min_r1_q: float = 0.80,
     missed_cleavages: int = 2,
     min_length: int = 7,
     max_length: int = 30,
@@ -558,6 +598,10 @@ def rescore(
         Mass tolerance for MALDI-to-database matching in ppm.
     train_fdr
         FDR threshold for mokapot training (SVM backend only).
+    winner_min_r1_q
+        R1 TDC q-value threshold for winner selection. Only winners with
+        q ≤ winner_min_r1_q are passed to R2 training; features below this
+        receive is_tdc_winner=False and q_value=NaN in the output. Default 0.20.
     missed_cleavages
         Number of missed cleavages for in-silico digest.
     min_length
@@ -566,10 +610,10 @@ def rescore(
         Maximum peptide length.
     model
         Rescoring backend: "svm" (mokapot PercolatorModel, default),
-        "catboost" (semi-supervised CatBoostRanker), or "generative"
-        (probabilistic generative scorer, no training). SVM and CatBoost use
-        only MALDI_INTRINSIC_FEATURES for training. LC-MS/MS evidence is
-        applied as a multiplicative prior after scoring.
+        "catboost" (semi-supervised CatBoostRanker), or "lda"
+        (LinearDiscriminantAnalysis, recommended). All backends use only
+        MALDI_INTRINSIC_FEATURES for training. LC-MS/MS evidence is
+        applied as an additive log-prior after scoring.
     compute_generative
         When True and model is "svm" or "catboost", run the generative scorer
         first and add its ranking features (generative_score,
@@ -915,7 +959,7 @@ def rescore(
 
     # --- Step 6b: Generative scoring (optional pre-step) ---
     has_generative = False
-    if (model in ("svm", "catboost") and compute_generative) or model == "generative":
+    if model in ("svm", "catboost") and compute_generative:
         from ms1rescore.probabilistic_scorer import run_generative_scoring
 
         logger.info("Step 6b: Running generative scorer...")
@@ -974,103 +1018,6 @@ def rescore(
         logger.info(f"  Dropping {len(_constant)} constant features from ranker: {_constant}")
         intrinsic_present = [f for f in intrinsic_present if f not in _constant]
 
-    # --- Generative-only backend: two-pass ---
-    if model == "generative":
-        from ms1rescore.probabilistic_scorer import (
-            compute_generative_scores,
-            estimate_noise_params,
-        )
-
-        logger.info("Step 8: Generative backend — two-pass scoring...")
-        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
-
-        # Round-1 scores already computed by run_generative_scoring (step 7b)
-        scores1 = features_df["generative_score"].values
-
-        # Per-feature winner selection
-        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
-        logger.info(
-            f"  Round-1 winner selection: {len(winners_df)} candidates retained "
-            f"({int(winners_df['is_decoy'].sum())} decoys)"
-        )
-
-        # Round-2: re-estimate noise on winner subset, recompute log-likelihoods
-        noise_params_r2 = estimate_noise_params(winners_df)
-        scores2_series, _ = compute_generative_scores(winners_df, noise_params_r2)
-        scores2 = scores2_series.values
-
-        # Standard TDC FDR on winners
-        is_decoy_w = winners_df["is_decoy"].values.astype(bool)
-        q2 = _tdc_qvalues(scores2, is_decoy_w)
-        lcms_prior_w = compute_lcms_prior(winners_df, lcms_present)
-        spatial_prior_w = compute_spatial_prior(winners_df, spatial_present)
-        # Additive log-prior: rank-correct for arbitrary-sign scores.
-        # Multiplying a negative score by a prior in [0,1] would invert
-        # the ranking (a bad candidate with low prior becomes less negative,
-        # i.e. higher-ranked).  Adding log(prior) penalises low-prior
-        # candidates uniformly regardless of score sign.
-        _LOG_EPS = 1e-12
-        reweighted2 = (
-            scores2
-            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
-            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
-        )
-        rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
-
-        # Map back to full candidate table
-        is_winner_full = np.zeros(len(features_df), dtype=bool)
-        is_winner_full[winner_pos] = True
-        scores2_full = np.full(len(features_df), np.nan)
-        scores2_full[winner_pos] = scores2
-        q_full = np.full(len(features_df), np.nan)
-        q_full[winner_pos] = q2
-        rw_full = np.full(len(features_df), np.nan)
-        rw_full[winner_pos] = reweighted2
-        rw_q_full = np.full(len(features_df), np.nan)
-        rw_q_full[winner_pos] = rw_q2
-
-        is_decoy = features_df["is_decoy"].values.astype(bool)
-        result_df = pd.DataFrame(
-            {
-                "peptide": features_df["peptide"].values,
-                "protein": features_df["protein"].values if "protein" in features_df.columns else "",
-                "feature_idx": features_df.get(
-                    "feature_idx", pd.Series(range(len(features_df)))
-                ).values,
-                "is_decoy": is_decoy,
-                "generative_score_r1": scores1,
-                "generative_score_r2": scores2_full,
-                "Delta_m": features_df.get("Delta_m", pd.Series(np.nan, index=features_df.index)).values,
-                "q_value": q_full,
-                "is_tdc_winner": is_winner_full,
-                "reweighted_score": rw_full,
-                "reweighted_q_value": rw_q_full,
-            }
-        )
-
-        for fdr_threshold in [0.01, 0.05, 0.10]:
-            n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
-            n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
-            logger.info(
-                f"  At {fdr_threshold*100:.0f}% FDR: {n} winners (base), "
-                f"{n_rw} winners (reweighted)"
-            )
-
-        psm_list = candidates_to_psm_list(features_df)
-
-        if debug_dir is not None:
-            from ms1rescore.debug_viz import save_debug_figures
-            save_debug_figures(
-                features_df, result_df,
-                ion_images=ion_images, ion_image_mzs=ion_image_mzs,
-                maldi_envelopes=maldi_envelopes,
-                feature_names=intrinsic_present, model_name="generative",
-                debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
-                gt_peptides=gt_peptides,
-            )
-
-        return psm_list, result_df, feature_names
-
     # --- Step 7: Build PSMList ---
     logger.info("Step 8: Building PSMList...")
     psm_list = candidates_to_psm_list(features_df)
@@ -1120,6 +1067,9 @@ def rescore(
         logger.info(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
+        )
+        winner_pos, winners_df = _filter_winners_by_r1_q(
+            winner_pos, winners_df, scores1[winner_pos], winner_min_r1_q
         )
 
         # --- Round 2: retrain on winner subset ---
@@ -1230,6 +1180,9 @@ def rescore(
         logger.info(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
+        )
+        winner_pos, winners_df = _filter_winners_by_r1_q(
+            winner_pos, winners_df, scores1[winner_pos], winner_min_r1_q
         )
 
         # --- Round 2: retrain on winner subset ---
@@ -1343,6 +1296,9 @@ def rescore(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
         )
+        winner_pos, winners_df = _filter_winners_by_r1_q(
+            winner_pos, winners_df, scores1[winner_pos], winner_min_r1_q
+        )
 
         # --- Round 2: retrain on winner subset ---
         # Seed R2 from the top-20% of target winners by R1 score.  After winner
@@ -1452,4 +1408,4 @@ def rescore(
         return psm_list, result_df, feature_names
 
     else:
-        raise ValueError(f"Unknown model '{model}'. Choose 'svm', 'catboost', 'lda', or 'generative'.")
+        raise ValueError(f"Unknown model '{model}'. Choose 'svm', 'catboost', or 'lda'.")

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`ms1rescore` is a symmetric target-decoy rescoring package for MALDI-MSI MS1 data. It takes MALDI feature m/z values, a protein FASTA, and optional LC-MS/MS mzML files, then produces FDR-controlled peptide identifications via mokapot (SVM-based semi-supervised rescoring).
+`ms1rescore` is a symmetric target-decoy rescoring package for MALDI-MSI MS1 data. It takes MALDI feature m/z values, a protein FASTA, and optional LC-MS/MS mzML files, then produces FDR-controlled peptide identifications via LDA-based semi-supervised rescoring (default) or SVM/CatBoost alternatives.
 
 **Why it was built this way:** The prior approach (ms2rescore "Approach B") used ProteomeDiscoverer (PD) output for candidates and features. This introduced label leakage — `lcms_xcorr` (a PD search engine score) had AUC 0.993 and was a near-perfect surrogate for the PD target/decoy label, making rescoring trivial but invalid. This package replaces that with:
 - Candidates from in-silico tryptic digest of forward + reversed FASTA (no PD)
@@ -28,7 +28,7 @@ ms1rescore/
 │   ├── maldi_features.py       # MALDI-side rescoring features
 │   ├── feature_generator.py    # Orchestration + PSMList construction
 │   ├── pipeline.py             # End-to-end pipeline function; rescoring backends; priors
-│   ├── probabilistic_scorer.py # Generative (probabilistic) rescoring backend
+│   ├── probabilistic_scorer.py # Generative pre-scorer (used by SVM/CatBoost as step-7b feature source)
 │   ├── cli.py                  # argparse CLI entry point (`ms1rescore` command)
 │   ├── debug_viz.py            # Debug figure generation (saved when --verbose)
 │   └── tests/                  # Unit tests (pytest; testpaths configured in pyproject.toml)
@@ -326,13 +326,13 @@ Holds all MS1 and MS2 scan data loaded from mzML or Bruker `.d` files. Lazily co
 
 | Function | Description |
 |---|---|
-| `load_lcms_data(mzml_paths, cache_path)` | Load mzML via pyteomics or Bruker `.d` via alphatims; routes based on extension |
-| `load_lcms_data_from_d(d_path, cache_path)` | Load timsTOF `.d` folder with alphatims; MS1 per-frame, MS2 vectorised via `index_precursors()` |
+| `load_lcms_data(mzml_paths)` | Load mzML via pyteomics or Bruker `.d` via alphatims; routes based on extension |
+| `load_lcms_data_from_d(d_path)` | Load timsTOF `.d` folder with alphatims; MS1 per-frame, MS2 vectorised via `index_precursors()` |
 | `_find_matching_ms2_scans(neutral_mass, lcms_data, ppm)` | Binary search over MS2 neutral masses |
-| `get_ms2pip_predictions(pairs, model, cache_path)` | Batch MS2PIP predictions for `(peptide, charge)` pairs. Import: `from ms2pip.core import predict_batch` |
-| `finetune_deeplc(msf_path, cache_path)` | Fine-tune DeepLC on PD TargetPsms (q≤0.01) |
-| `finetune_deeplc_from_df(rt_df, cache_path)` | Fine-tune DeepLC from a DataFrame with `sequence`/`rt_mean` columns (minutes); used for FragPipe input |
-| `get_deeplc_predictions(peptides, model, cache_path)` | Batch DeepLC RT predictions |
+| `get_ms2pip_predictions(pairs, model)` | Batch MS2PIP predictions for `(peptide, charge)` pairs. Import: `from ms2pip.core import predict_batch` |
+| `finetune_deeplc(msf_path)` | Fine-tune DeepLC on PD TargetPsms (q≤0.01) |
+| `finetune_deeplc_from_df(rt_df)` | Fine-tune DeepLC from a DataFrame with `sequence`/`rt_mean` columns (minutes); used for FragPipe input |
+| `get_deeplc_predictions(peptides, model)` | Batch DeepLC RT predictions |
 | `extract_all_xics(unique_mzs, lcms_data, ppm)` | XIC extraction utility (available but not used in the main pipeline) |
 | `compute_all_lcms_evidence(candidates_df, ...)` | Main entry point: returns dict mapping candidate index → feature dict |
 
@@ -343,11 +343,11 @@ Holds all MS1 and MS2 scan data loaded from mzML or Bruker `.d` files. Lazily co
 1. Pre-compute per MALDI feature (1,398 iterations):
    - Matching MS2 scan indices (by neutral mass)
 2. Per-candidate loop (707K iterations): all peptide-specific computations:
-   - Spectral angle vs MS2PIP prediction (peptide+charge specific)
+   - Spectral angle vs MS2PIP prediction (peptide+charge specific). `lcms_ms2_spectral_angle` = NaN when no MS2PIP prediction is available (no matched MS2 scan or prediction not computed); 0.0 when a prediction exists but fewer than 3 fragments match.
    - DeepLC predicted RT → nearest MS1 scan (cached per unique peptide sequence)
    - `lcms_ms1_intensity`: log1p of summed signal in ±ppm window at precursor m/z
-   - `lcms_ms1_snr`: log10(signal / median background) where background = median of non-zero peaks in ±500 ppm window excluding signal window
-   - Isotope envelope [M0, M+1, M+2] from `_extract_ms1_envelope` at charge 1
+   - `lcms_ms1_snr`: log10(signal / median_background) when both signal > 0 and background > 0; log10(signal) when signal > 0 but no non-zero background found; 0.0 when signal = 0
+   - Isotope envelope [M0, M+1, M+2] from `_extract_ms1_envelope` at the **LC-MS/MS charge** (charge of the highest-SA MS2 scan, fallback charge 1 when no MS2 prediction available). The envelope m/z is `(neutral_mass + z * PROTON) / z` with peak spacing `NEUTRON / z`.
    - `lcms_ms1_isotope_cosine`: cosine similarity of observed vs theoretical envelope
    - `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`: |obs_ratio − theo_ratio| for M+1/M0 and M+2/M0
    - If `maldi_envelopes` provided: MALDI vs LC-MS/MS envelope comparison → `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_m1_ratio_diff`, `isotope_m2_ratio_diff`, `isotope_n_matched`
@@ -476,9 +476,9 @@ from ms1rescore.feature_generator import (
 
 *CCS-derived* (`_LCMS_CCS_FEATURES`, optional): `lcms_ccs_delta`, `lcms_ccs_abs_pct`
 
-Note: `_LCMS_ID_FEATURES` (`lcms_q_value`, `lcms_pep`, `lcms_score`, `n_psms`, `lcms_intensity`, `source_lcms_confirmed`) are still populated in the candidates DataFrame by Strategy C (Strategy C only) but are **not** included in `LCMS_PRIOR_FEATURES`. Using ID-derived features in the prior would give LC-MS/MS confirmed targets different treatment than decoys, breaking TDC symmetry.
+Note: `_LCMS_ID_FEATURES` (`lcms_q_value`, `lcms_pep`, `lcms_score`, `n_psms`, `lcms_intensity`) are populated in the candidates DataFrame by Strategy C but are **not** included in `LCMS_PRIOR_FEATURES`. Using ID-derived features in the prior would give LC-MS/MS confirmed targets different treatment than decoys, breaking TDC symmetry.
 
-**Design rationale:** LC-MS/MS features are explicitly excluded from the ranker training set. Instead, LC-MS/MS evidence is applied as an additive log-prior *after* MALDI-intrinsic scoring (see `compute_lcms_prior()` and `compute_spatial_prior()` in `pipeline.py`). `compute_lcms_prior` min-max normalizes each mzML feature and returns the column mean as a per-candidate weight in (0, 1]. The log of this weight (and the spatial prior) is added to the round-2 score before FDR computation.
+**Design rationale:** LC-MS/MS features are explicitly excluded from the ranker training set. Instead, LC-MS/MS evidence is applied as an additive log-prior *after* MALDI-intrinsic scoring (see `compute_lcms_prior()` and `compute_spatial_prior()` in `pipeline.py`). `compute_lcms_prior` min-max normalizes each mzML feature (using `np.nanmin`/`np.nanmax` to ignore NaN), fills NaN sentinel values (e.g. `lcms_ms2_spectral_angle` when no MS2PIP prediction) with the column minimum after normalization so they do not penalize candidates, and returns the `np.nanmean` across features as a per-candidate weight in (0, 1]. Features that are all-NaN after normalization are skipped. The log of this weight (and the spatial prior) is added to the round-2 score before FDR computation.
 
 `get_feature_names()` returns `MALDI_INTRINSIC_FEATURES + LCMS_PRIOR_FEATURES` for backwards compatibility (optional groups included only when data was computed).
 
@@ -518,7 +518,7 @@ The `source` column on the candidates DataFrame encodes the origin of each row:
 
 This ensures decoy peptides draw non-K/R residues from across the shuffled pool of all target peptides, breaking the isobaric property of per-peptide shuffle.
 
-LC-MS/MS evidence is joined onto target rows from `lcms_ids.peptides`; decoy rows always get `NaN`. The binary `source_lcms_confirmed` feature is computed in `compute_all_features()` and is 1.0 for any `"lcms_confirmed"` candidate.
+LC-MS/MS evidence is joined onto target rows from `lcms_ids.peptides`; decoy rows always get `NaN`.
 
 **Fallback:** if `digest_identified_proteins()` returns 0 rows (e.g. no FASTA proteins found), `rescore()` falls back to Strategy A with a warning.
 
@@ -564,8 +564,9 @@ P12345  →  P12345
 **Decoy mode parameter:** `decoy_method` (str, default `"shuffle"`) controls Step 1c:
 - `"shuffle"` — standard K/R-preserving protein shuffle (via `digest_fasta` / `digest_identified_proteins`). Decoys are sequence-space decoys with distinct elemental compositions (different `theo_isotope_cosine`).
 - `"mz_shift"` — observation-space decoys via `generate_mz_shift_candidates()`. Shuffle decoys from Step 1b are filtered out; `generate_mz_shift_candidates` is called on the target-only candidate set. Decoy rows carry the real peptide's theoretical isotope pattern but are anchored to an off-target MALDI feature ±delta Da away. Use with `mz_shift_delta_min` (default 5.0 Da) and `mz_shift_delta_max` (default 20.0 Da).
+- `"balanced_shuffle"` — iterative K/R-preserving protein shuffle with MALDI-match filtering via `generate_balanced_shuffle_candidates()`. Runs up to `max_shuffle_rounds` (default 50) rounds of protein-level shuffle, keeping only decoy peptides that match a MALDI feature within `matching_ppm`. Subsamples the collected pool to `target_ratio * N_target` (default 1.0). Unlike standard shuffle (one decoy per target regardless of MALDI match), this ensures decoys compete in the same observation space as targets and achieves ~1:1 T:D even when the MALDI feature list is sparse. LC-MS/MS evidence columns are NaN for all decoy rows (shuffle decoys have different sequences; inheriting evidence would break TDC symmetry). `source = "decoy_balanced_shuffle"` in the candidates DataFrame.
 
-CLI flags: `--decoy-method {shuffle,mz_shift}`, `--mz-shift-delta-min FLOAT`, `--mz-shift-delta-max FLOAT`.
+CLI flags: `--decoy-method {shuffle,mz_shift,balanced_shuffle}`, `--mz-shift-delta-min FLOAT`, `--mz-shift-delta-max FLOAT`, `--max-shuffle-rounds INT`, `--decoy-target-ratio FLOAT`.
 
 1. Generate candidates (Strategy A or C) + match to MALDI features
 2. Load LC-MS/MS data
@@ -581,7 +582,7 @@ CLI flags: `--decoy-method {shuffle,mz_shift}`, `--mz-shift-delta-min FLOAT`, `-
 All backends follow the same two-pass structure:
 
 1. **Round 1** — score all candidates globally. The model does not use per-feature grouping; every candidate is treated on equal footing.
-2. **Per-feature winner selection** (`_select_feature_winners`) — for each MALDI m/z feature, retain only the highest round-1 score candidate. Produces `winners_df` (~N rows for N features).
+2. **Per-feature winner selection** (`_select_feature_winners`) — for each MALDI m/z feature, retain only the highest round-1 score candidate. Produces `winners_df` (~N rows for N features). After selection, `_filter_winners_by_r1_q` computes TDC q-values over the winner set and drops winners with R1 q > `winner_min_r1_q` (default 0.80, CLI `--winner-min-r1-q`). Dropped features get `is_tdc_winner=False`, `q_value=NaN`. Falls back to the unfiltered winner set with a warning when fewer than 20 target winners would survive the cut.
 3. **Round 2** — retrain/rescore on the winner subset only. Because each feature contributes exactly one candidate, this is a cleaner training set than the full candidate pool.
 4. **FDR** — standard TDC (`_tdc_qvalues`) over all winners sorted by round-2 score. Q-values propagated to non-winners as NaN.
 
@@ -591,7 +592,7 @@ All backends follow the same two-pass structure:
 
 `rescore()` accepts a `model` parameter:
 
-**`model="lda"` (recommended):** Semi-supervised `LinearDiscriminantAnalysis` (sklearn) on `MALDI_INTRINSIC_FEATURES`. No extra dependencies beyond sklearn (always installed). Preferred over SVM because it converges faster and produces cleaner feature importances.
+**`model="lda"` (default):** Semi-supervised `LinearDiscriminantAnalysis` (sklearn) on `MALDI_INTRINSIC_FEATURES`. No extra dependencies beyond sklearn (always installed). Preferred over SVM because it converges faster and produces cleaner feature importances.
 
 Preprocessing: ±inf replaced with NaN, then `SimpleImputer(strategy="median")` + `StandardScaler` inside a sklearn `Pipeline`.
 
@@ -607,7 +608,7 @@ Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `p
 
 ---
 
-**`model="svm"` (code default, not recommended):** mokapot `PercolatorModel` trained on `MALDI_INTRINSIC_FEATURES`.
+**`model="svm"`:** mokapot `PercolatorModel` trained on `MALDI_INTRINSIC_FEATURES`.
 - Round 1: train on all candidates, get `svm_score_r1`.
 - Round 2: rebuild PSMList from `winners_df`, retrain mokapot, get `svm_score_r2`.
 - FDR: `_tdc_qvalues(svm_score_r2, is_decoy_winners)` → `q_value`.
@@ -621,19 +622,11 @@ Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `p
 - Round 1 trains on all candidates → `catboost_score_r1`; round 2 retrains on `winners_df` → `catboost_score_r2`.
 - Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `peptide`, `protein`, `feature_mz`, `feature_idx`, `is_decoy`, `catboost_score_r1`, `catboost_score_r2`, `q_value`, `is_tdc_winner`, `reweighted_score`, `reweighted_q_value`.
 
-**`model="generative"`:** Probabilistic generative scorer. No training. Implemented in `probabilistic_scorer.py`.
-- Estimates noise parameters label-free from the best-ppm non-decoy candidate per MALDI feature (proxy for true positives).
-- Computes a log-sum generative score from independent half-normal / normal likelihoods for: ppm error, isotope cosine deviation from 1.0, CCS deviation (if im2deep present), spatial autocorrelation (if spatial features present).
-- Adds per-feature ranking features in step 7b: `generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`, plus diagnostic columns `Tm`, `Dm`, `Delta_m`, `generative_q_value`, `generative_pep`, `is_tdc_winner` (from the internal `estimate_fdr` call — **not used for final FDR**).
-- Round-1 scores = `generative_score` from step 7b. Round-2 re-estimates noise parameters on `winners_df` (cleaner proxy set) and recomputes log-likelihoods via `estimate_noise_params` + `compute_generative_scores`.
-- FDR: `_tdc_qvalues(generative_score_r2, is_decoy_winners)` — standard TDC, not margin-based.
-- Returns `(psm_list, result_df, feature_names)` with columns: `peptide`, `protein`, `feature_idx`, `is_decoy`, `generative_score_r1`, `generative_score_r2`, `Delta_m`, `q_value`, `is_tdc_winner`, `reweighted_score`, `reweighted_q_value`.
-
-**Generative pre-scoring for SVM/CatBoost** (`compute_generative=True`, default): when model is `"svm"` or `"catboost"`, the generative scorer runs first (step 7b) and its four ranking features (`generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`) are added to `MALDI_INTRINSIC_FEATURES` before training. These features are carried into `winners_df` unchanged for the round-2 model — no recomputation needed.
+**Generative pre-scoring for SVM/CatBoost** (`compute_generative=True`, default when `model` is `"svm"` or `"catboost"`): `probabilistic_scorer.py` runs first (step 7b) and adds four ranking features (`generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`) to `MALDI_INTRINSIC_FEATURES` before training. Not used for `model="lda"`. These features are carried into `winners_df` unchanged — no recomputation in R2.
 
 **Post-scoring reweighting** (applied after all backends to winners only):
 
-`compute_lcms_prior()` min-max normalizes each `LCMS_PRIOR_FEATURES` column, averages the normalized values (excluding all-zero features), and returns a per-candidate weight in (0, 1].
+`compute_lcms_prior()` min-max normalizes each `LCMS_PRIOR_FEATURES` column using `nanmin`/`nanmax`. NaN values (e.g. `lcms_ms2_spectral_angle` when no prediction exists) are treated as the column minimum after normalization so they contribute 0 without inflating the mean. The `nanmean` across available features returns a per-candidate weight in (0, 1]; candidates where all features are NaN receive weight 1.0 (no penalty).
 
 `compute_spatial_prior()` min-max normalizes spatial quality features (`spatial_autocorrelation`, `spatial_gearys_c` negated, etc.) for the winner subset and returns a per-candidate weight in (0, 1]. Returns 1.0 if no informative spatial features are present.
 
@@ -657,7 +650,7 @@ Built with PyO3 + rayon. Exposed functions:
 | `match_mz(feature_mzs, peptide_mzs, ppm)` | digest.rs | Binary search m/z matching; returns (feat_idx, pep_idx, ppm_errors) |
 | `extract_xics_batch(ms1_rts, ms1_mz_arrays, ms1_int_arrays, target_mzs, ppm)` | xic.rs | Parallel XIC extraction for multiple target m/z values across all MS1 scans |
 | `extract_ms1_envelopes_batch(ms1_mz_arrays, ms1_int_arrays, scan_indices, target_mzs, charge, n_peaks, ppm)` | isotope.rs | MS1 isotope envelope extraction at specified scans |
-| `spectral_angles_batch(pred_mzs, pred_ints, obs_mzs, obs_ints, fragment_tol_da)` | spectral.rs | Batch spectral angle; requires ≥3 matched fragments, else returns 0.0 |
+| `spectral_angles_batch(pred_mzs, pred_ints, obs_mzs, obs_ints, fragment_tol_da)` | spectral.rs | Batch spectral angle; returns 0.0 when fewer than 3 fragments match (genuine poor match). NaN (no-prediction sentinel) is set at the Python level in `compute_all_lcms_evidence` when no MS2PIP prediction exists for a candidate. |
 | `compute_ionization_features(sequences)` | features.rs | Returns (n_R, n_K, n_H, n_F, n_W, n_Y, gravy, pi) — 8 arrays; parallel rayon |
 | `compute_property_features(sequences)` | features.rs | Returns (n_D, n_E, n_C, n_P, n_M, n_W, n_Y, seq_len, nterm_code, pi) — 10 arrays; parallel rayon |
 | `count_missed_cleavages_batch(sequences)` | features.rs | K/R not followed by P, excluding last residue; parallel rayon |
@@ -722,14 +715,6 @@ pip install -e "ms1rescore/[timstof]"
 
 The mean spectral angle is low because most of the 707K candidates are random mass coincidences. The max is ~0.402 for correct peptides. This is expected: centroided Thermo MS2 spectra have 12-34 peaks, and most MALDI features do not have a matching LC-MS/MS MS2 scan at all. The feature is still informative as a discriminator.
 
-### Cache invalidation on numpy version change
-
-`ms2pip_predictions.pkl` and `lcms_data.pkl` caches may fail to unpickle if numpy version changes between the session that wrote them and the session that reads them. Delete and rebuild:
-```bash
-rm notebooks/cache/ms2pip_predictions.pkl
-rm notebooks/cache/lcms_data.pkl
-```
-
 ### `maldi_intensities_p90` must be passed explicitly
 
 `match_to_maldi_features()` accepts `maldi_intensities`, `maldi_intensities_p90`, and `maldi_intensities_sum`. If none are passed, all log-intensity features are 0. In `pipeline.py`, these are read from `spatial_features` columns (`intensity_p90`, `intensity_sum`, `mean_intensity`) when available. In standalone use (e.g. the viz script), pass at least `maldi_intensities` from ion images or spatial features.
@@ -742,3 +727,30 @@ With the human FASTA (~20K proteins) and 1,398 MALDI features at 20 ppm:
 - ~1,067/1,398 features with MS2 matches
 - MS2PIP is run for ~683K unique (peptide, charge) pairs (only at features with observed MS2 scans)
 - DeepLC predictions run for all ~542K unique peptide sequences; each candidate is anchored to its peptide's nearest MS1 scan
+
+---
+
+## Reference pipeline command (amyloidosis dataset)
+
+Current default command used for development and benchmarking:
+
+```bash
+ms1rescore \
+  -f /home/robbe/MALDI_MSI_score/data/uniprot_human_reviewed.fasta \
+  -l /home/robbe/MALDI_MSI_score/data/amyloidosis/Lme112_S1-A2_1_9673.d \
+  --maldi-raw /home/robbe/MALDI_MSI_score/data/amyloidosis/Amy_TMA_MS1.d \
+  --feature-mzs /home/robbe/MALDI_MSI_score/data/amyloidosis/ff_with_new_algo._amyloidosies_Lme48.csv \
+  --lcms-peptides /home/robbe/MALDI_MSI_score/data/amyloidosis/fragpipe_output_amyloidosis/Amyl_tissue_psm.tsv \
+  --lcms-id-format psm_utils \
+  --model lda \
+  --decoy-method balanced_shuffle \
+  --output-dir /home/robbe/MALDI_MSI_score/results/balanced_shuffle/ \
+  -v --im2deep-calibration linear \
+  --debug-gt /home/robbe/MALDI_MSI_score/data/amyloidosis/GT_peptides.txt
+```
+
+Key parameter choices:
+- `--model lda`: LDA default; no extra dependencies, fast pseudo-label iteration.
+- `--decoy-method balanced_shuffle`: ensures ~1:1 T:D by retaining only shuffled peptides that match a MALDI feature. Prevents decoy starvation on sparse feature lists.
+- `--im2deep-calibration linear`: IM2Deep CCS calibration mode.
+- `--debug-gt`: ground truth peptide list for diagnostic FDR plots (not used in scoring).

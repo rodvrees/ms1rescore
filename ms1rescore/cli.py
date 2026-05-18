@@ -722,15 +722,14 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp = parser.add_argument_group("rescoring")
     rescore_grp.add_argument(
         "--model",
-        choices=("svm", "catboost", "lda", "generative"),
-        default="svm",
+        choices=("svm", "catboost", "lda"),
+        default="lda",
         help=(
-            "Rescoring backend. 'svm': mokapot PercolatorModel trained on "
-            "MALDI-intrinsic features (default). 'catboost': semi-supervised "
-            "CatBoostRanker with pseudo-label iteration (requires "
-            "pip install ms1rescore[catboost]). 'lda': sklearn LDA with "
-            "median imputation and standardization; no extra dependencies. "
-            "'generative': probabilistic generative scorer, no training required."
+            "Rescoring backend. 'lda': sklearn LDA with median imputation and "
+            "standardization; no extra dependencies (default). 'svm': mokapot "
+            "PercolatorModel trained on MALDI-intrinsic features. 'catboost': "
+            "semi-supervised CatBoostRanker with pseudo-label iteration (requires "
+            "pip install ms1rescore[catboost])."
         ),
     )
     rescore_grp.add_argument(
@@ -739,6 +738,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.01,
         metavar="FLOAT",
         help="FDR threshold for SVM model training.",
+    )
+    rescore_grp.add_argument(
+        "--winner-min-r1-q",
+        type=float,
+        default=0.80,
+        metavar="FLOAT",
+        help=(
+            "R1 TDC q-value threshold for winner selection. Only per-feature "
+            "winners with q ≤ this value are passed to R2 training. Features "
+            "below this threshold receive is_tdc_winner=False and q_value=NaN. "
+            "Default 0.80."
+        ),
     )
     rescore_grp.add_argument(
         "--init-ppm-threshold",
@@ -1212,6 +1223,7 @@ def main() -> None:
         msf_path=args.msf,
         ppm_tolerance=args.ppm_tolerance,
         train_fdr=args.train_fdr,
+        winner_min_r1_q=args.winner_min_r1_q,
         missed_cleavages=missed_cleavages,
         min_length=min_length,
         max_length=max_length,

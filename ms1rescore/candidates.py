@@ -231,9 +231,10 @@ def match_to_maldi_features(
     # Candidates per feature
     result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")
 
-    # A10 — Kendrick mass defect (CH₂ reference unit: 14 / 14.01565)
+    # A10 — Kendrick mass defect (CH₂ reference unit: 14 / 14.01565).
+    # KMD = KM − round(KM) ∈ [-0.5, 0.5).
     kendrick_mass = result["feature_mz"] * (14.0 / 14.01565)
-    result["kendrick_mass_defect"] = np.floor(kendrick_mass) - kendrick_mass
+    result["kendrick_mass_defect"] = kendrick_mass - np.round(kendrick_mass)
 
     logger.info(
         f"Matched {result['feature_mz'].nunique()}/{len(maldi_mzs)} features → "
@@ -406,7 +407,7 @@ def generate_mz_shift_candidates(
         decoy_df["feature_intensity"] = maldi_intensities[fi_vals]
 
     kendrick = decoy_df["feature_mz"].values * (14.0 / 14.01565)
-    decoy_df["kendrick_mass_defect"] = np.floor(kendrick) - kendrick
+    decoy_df["kendrick_mass_defect"] = kendrick - np.round(kendrick)
 
     # --- Combine and recompute per-feature statistics ---
     result = pd.concat([target_candidates, decoy_df], ignore_index=True)

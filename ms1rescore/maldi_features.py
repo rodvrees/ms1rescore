@@ -244,12 +244,17 @@ def compute_maldi_ionization_features(df: pd.DataFrame) -> pd.DataFrame:
         gravy_u = np.add.reduceat(kd_arr[concat_bytes], split_pts) / np.maximum(seq_lens, 1)
 
     n_basic_u = n_R.astype(np.float64) + n_K + n_H
+    acidic_cnt = _residue_counts_batch(uniques, "DE")
+    n_D_u = acidic_cnt["D"].astype(np.float64)
+    n_E_u = acidic_cnt["E"].astype(np.float64)
+
     df["n_arginine"]       = n_R[codes].astype(np.float32)
     df["n_phenylalanine"]  = n_F[codes].astype(np.float32)
     df["n_basic_residues"] = n_basic_u[codes].astype(np.float32)
     df["n_aromatic"]       = (n_F + n_W + n_Y)[codes].astype(np.float32)
     df["gravy_score"]      = gravy_u[codes]
-    df["charge_proxy"]     = (n_basic_u + 1)[codes].astype(np.float32)
+    # Net basic minus acidic count: signed charge proxy at near-neutral pH.
+    df["charge_proxy"]     = (n_basic_u - (n_D_u + n_E_u))[codes].astype(np.float32)
 
     logger.info("Computed MALDI ionization features (basic residue counts, GRAVY, charge proxy)")
     return df
