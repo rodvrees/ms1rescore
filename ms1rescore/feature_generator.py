@@ -52,17 +52,12 @@ MALDI_INTRINSIC_FEATURES = [
     "ppm_error_pct", "ppm_error_squared",
     # --- ambiguity ---
     "n_candidates", "log_n_candidates",
-    # --- peptide properties (basic) ---
-    "peptide_length", "n_missed_cleavages", "has_modifications",
-    # --- peptide properties (extended, C-group) ---
-    "nterm_basic",                   # C2
-    "peptide_pi",                    # C8
-    "has_oxidized_met", "has_cys", "n_proline", "nterm_pyroglu_risk",  # C9
-    "acidic_residue_density",        # C12
-    "n_tryptophan", "n_tyrosine",    # C15
+    # --- peptide properties ---
+    "peptide_length", "n_missed_cleavages",
+    "has_oxidized_met", "has_cys", "n_proline",
+    "acidic_residue_density",
     # --- MALDI signal ---
     "log_maldi_intensity_p90", "log_maldi_intensity_sum",
-    "log_maldi_intensity",     # backwards-compatible alias for log_maldi_intensity_p90
     # --- mass defect features (A-group) ---
     "kendrick_mass_defect",          # A10 — computed in match_to_maldi_features
     "mass_defect_residual",          # A11
@@ -73,11 +68,8 @@ MALDI_INTRINSIC_FEATURES = [
     "theo_has_sulfur", "averagine_deviation", "averagine_deviation_sulfur",
     "theo_m1_ratio_diff", "theo_m2_ratio_diff",
     "monoisotopic_confidence",       # A8
-    # --- generative model outputs (optional — requires run_generative_scoring) ---
-    "generative_score", "generative_score_rank",
-    "generative_score_gap", "generative_score_z",
     # --- ionization priors ---
-    "n_arginine", "n_basic_residues", "n_phenylalanine", "n_aromatic",
+    "n_arginine", "n_basic_residues", "n_aromatic",
     "gravy_score", "charge_proxy",
     # --- ion mobility (B-group) — optional, requires im2deep + observed CCS ---
     "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
@@ -190,10 +182,6 @@ _ADDUCT_COLOC_FEATS = frozenset([
     "adduct_colocalization_na", "adduct_colocalization_k", "adduct_colocalization_chca",
 ])
 _MORANS_FEATS = frozenset(["spatial_morans_i", "spatial_gearys_c"])
-_GENERATIVE_FEATS = frozenset([
-    "generative_score", "generative_score_rank",
-    "generative_score_gap", "generative_score_z",
-])
 
 
 def get_feature_names(
@@ -202,7 +190,6 @@ def get_feature_names(
     has_envelopes: bool = False,  # kept for backwards compatibility; no longer used
     has_pixel_coords: bool = False,
     has_ccs: bool = False,
-    has_generative: bool = False,
 ) -> list[str]:
     """Return the full list of feature names based on available data.
 
@@ -217,7 +204,6 @@ def get_feature_names(
         and (f not in _ADDUCT_COLOC_FEATS or has_ion_images)
         and (f not in _PIXEL_FEATS or has_pixel_coords)
         and (f not in _CCS_FEATS or has_ccs)
-        and (f not in _GENERATIVE_FEATS or has_generative)
     ]
     return intrinsic + LCMS_PRIOR_FEATURES
 

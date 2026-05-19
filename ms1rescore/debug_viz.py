@@ -402,7 +402,6 @@ def plot_feature_diagnostics(
             ("n_arginine", "Arg count"),
             ("n_basic_residues", "Basic residues"),
             ("gravy_score", "GRAVY"),
-            ("peptide_pi", "pI"),
             ("peptide_length", "Length"),
             ("n_missed_cleavages", "Missed cleavages"),
         ]
@@ -846,11 +845,19 @@ def plot_feature_distributions(
         gt_set = set(gt_peptides)
         gt_mask = target_mask & feat["peptide"].isin(gt_set).values
 
-    if feature_names is None:
-        feature_names = [
-            c for c in feat.columns
-            if c not in _DIST_SKIP and pd.api.types.is_numeric_dtype(feat[c])
-        ]
+    # Always plot every numeric column in features_df that is not in _DIST_SKIP.
+    # Explicitly listed features (the ranker inputs) come first; the remaining
+    # numeric columns — LC-MS/MS prior features, spatial prior features, and
+    # optional intrinsic features dropped before training — follow.
+    _explicit = list(feature_names) if feature_names is not None else []
+    _explicit_set = set(_explicit)
+    _extra = [
+        c for c in feat.columns
+        if c not in _DIST_SKIP
+        and c not in _explicit_set
+        and pd.api.types.is_numeric_dtype(feat[c])
+    ]
+    feature_names = _explicit + _extra
 
     def _draw(ax: plt.Axes, t_vals: np.ndarray, d_vals: np.ndarray,
                bins: np.ndarray, subtitle: str) -> None:

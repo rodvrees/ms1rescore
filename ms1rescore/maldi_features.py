@@ -29,13 +29,6 @@ _KD_SCALE = {
     "S": -0.8, "T": -0.7, "W": -0.9, "Y": -1.3, "V": 4.2,
 }
 
-# Lehninger pKa values for pI computation (C8)
-_PKA = {
-    "D": 3.9, "E": 4.1, "H": 6.0, "C": 8.3,
-    "Y": 10.1, "K": 10.5, "R": 12.5,
-    "nterm": 8.0, "cterm": 3.1,
-}
-
 # CHCA matrix cluster ions [M+H]+ m/z values (A12)
 CHCA_CLUSTER_MZS = np.array([
     190.0499,  # [M+H]+
@@ -54,78 +47,6 @@ _ADDUCT_DELTAS = {
     "k":    37.9559,   # [M+K]+   — K replaces H
     "chca": 171.0320,  # [M+CHCA+H-H2O]+ CHCA matrix adduct
 }
-
-
-def _compute_pi(sequence: str) -> float:
-    """Compute peptide pI by bisection on Lehninger pKa values (C8)."""
-    n_D = sequence.count("D"); n_E = sequence.count("E"); n_H = sequence.count("H")
-    n_C = sequence.count("C"); n_Y = sequence.count("Y")
-    n_K = sequence.count("K"); n_R = sequence.count("R")
-
-    def net_charge(ph: float) -> float:
-        q  =  1.0 / (1.0 + 10.0 ** (ph - _PKA["nterm"]))
-        q -= 1.0 / (1.0 + 10.0 ** (_PKA["cterm"] - ph))
-        q -= n_D / (1.0 + 10.0 ** (_PKA["D"] - ph))
-        q -= n_E / (1.0 + 10.0 ** (_PKA["E"] - ph))
-        q -= n_C / (1.0 + 10.0 ** (_PKA["C"] - ph))
-        q -= n_Y / (1.0 + 10.0 ** (_PKA["Y"] - ph))
-        q += n_H / (1.0 + 10.0 ** (ph - _PKA["H"]))
-        q += n_K / (1.0 + 10.0 ** (ph - _PKA["K"]))
-        q += n_R / (1.0 + 10.0 ** (ph - _PKA["R"]))
-        return q
-
-    lo, hi = 0.0, 14.0
-    for _ in range(50):
-        mid = (lo + hi) / 2.0
-        if net_charge(mid) > 0:
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2.0
-
-
-def _compute_pi_batch(unique_seqs: np.ndarray,
-                      n_D: np.ndarray, n_E: np.ndarray, n_H: np.ndarray,
-                      n_C: np.ndarray, n_Y: np.ndarray,
-                      n_K: np.ndarray, n_R: np.ndarray) -> np.ndarray:
-    """
-    Vectorized pI for all unique sequences simultaneously.
-
-    Reformulates the bisection in terms of x = 10^ph so that only ONE
-    np.power call is needed per iteration (vs 9 in the naive implementation).
-    Scalar pKa terms are precomputed once outside the loop.
-
-    50 × 1 np.power calls instead of 50 × 9 = ~9× reduction in the
-    most expensive operation.
-    """
-    # Precompute 10^pKa scalars (computed once, not inside the loop).
-    pk_nt = 10.0 ** _PKA["nterm"]
-    pk_ct = 10.0 ** _PKA["cterm"]
-    pk_D  = 10.0 ** _PKA["D"];  pk_E = 10.0 ** _PKA["E"]
-    pk_C  = 10.0 ** _PKA["C"];  pk_Y = 10.0 ** _PKA["Y"]
-    pk_H  = 10.0 ** _PKA["H"];  pk_K = 10.0 ** _PKA["K"]
-    pk_R  = 10.0 ** _PKA["R"]
-
-    lo = np.zeros(len(unique_seqs), dtype=np.float64)
-    hi = np.full(len(unique_seqs), 14.0, dtype=np.float64)
-
-    for _ in range(50):
-        mid = (lo + hi) * 0.5
-        x = np.power(10.0, mid)          # 1 power call per iteration
-        # Rewrite 1/(1+10^(a-b)) = 10^b / (10^b + 10^a) = pk / (pk + x)
-        q  =  pk_nt / (pk_nt + x)        # N-term basic
-        q -= x / (x + pk_ct)             # C-term acidic
-        q -= n_D * x / (x + pk_D)
-        q -= n_E * x / (x + pk_E)
-        q -= n_C * x / (x + pk_C)
-        q -= n_Y * x / (x + pk_Y)
-        q += n_H * pk_H / (pk_H + x)
-        q += n_K * pk_K / (pk_K + x)
-        q += n_R * pk_R / (pk_R + x)
-        lo = np.where(q > 0, mid, lo)
-        hi = np.where(q <= 0, mid, hi)
-
-    return (lo + hi) * 0.5
 
 
 def compute_mass_accuracy_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -170,7 +91,7 @@ def compute_protein_consistency_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_peptide_properties(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute peptide_length, n_missed_cleavages, has_modifications."""
+    """Compute peptide_length and n_missed_cleavages."""
     df["peptide_length"] = df["peptide"].str.len()
     try:
         from ms1rescore_rs import count_missed_cleavages_batch
@@ -178,7 +99,6 @@ def compute_peptide_properties(df: pd.DataFrame) -> pd.DataFrame:
     except ImportError:
         # K/R not followed by P, excluding the C-terminal cleavage site.
         df["n_missed_cleavages"] = df["peptide"].str[:-1].str.count(r"[KR](?!P)")
-    df["has_modifications"] = 0  # plain sequences from digest have no mods
     return df
 
 
@@ -196,9 +116,6 @@ def compute_maldi_signal_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["log_maldi_intensity_sum"] = 0.0
 
-    # Backwards-compatible alias — maps to p90 if not already present
-    if "log_maldi_intensity" not in df.columns:
-        df["log_maldi_intensity"] = df["log_maldi_intensity_p90"]
     return df
 
 
@@ -258,7 +175,6 @@ def compute_maldi_ionization_features(df: pd.DataFrame) -> pd.DataFrame:
     n_E_u = acidic_cnt["E"].astype(np.float64)
 
     df["n_arginine"]       = n_R[codes].astype(np.float32)
-    df["n_phenylalanine"]  = n_F[codes].astype(np.float32)
     df["n_basic_residues"] = n_basic_u[codes].astype(np.float32)
     df["n_aromatic"]       = (n_F + n_W + n_Y)[codes].astype(np.float32)
     df["gravy_score"]      = gravy_u[codes]
@@ -971,60 +887,35 @@ def compute_lcms_ccs_features(
 
 def compute_peptide_property_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute additional peptide property features (C2, C8, C9, C12, C15).
-
-    All features are computed from the peptide sequence column only — no
-    external API calls or pre-computed lookup tables beyond _PKA and _KD_SCALE.
+    Compute additional peptide property features.
 
     Features added
     --------------
-    nterm_basic              1 if N-terminal residue is R, K, or H (C2)
-    peptide_pi               isoelectric point via bisection (C8)
-    has_oxidized_met         1 if M present (oxidation susceptibility proxy, C9)
-    has_cys                  1 if C present (carbamidomethylation proxy, C9)
-    n_proline                count of P residues (C9)
-    nterm_pyroglu_risk       1 if N-terminal residue is Q or E (C9)
-    acidic_residue_density   (count(D)+count(E)) / length (C12)
-    n_tryptophan             count of W (C15)
-    n_tyrosine               count of Y (C15)
+    has_oxidized_met         1 if M present (oxidation susceptibility proxy)
+    has_cys                  1 if C present (carbamidomethylation proxy)
+    n_proline                count of P residues
+    acidic_residue_density   (count(D)+count(E)) / length
     """
     codes, uniques = pd.factorize(df["peptide"])
     uniques_list = uniques.tolist()
 
     try:
         from ms1rescore_rs import compute_property_features
-        n_D, n_E, n_C, n_P, n_M, n_W, n_Y, seq_lens_u, nterm_code_u, pi_u = \
+        n_D, n_E, n_C, n_P, n_M, _, _, seq_lens_u, _, _ = \
             compute_property_features(uniques_list)
         n_D = np.asarray(n_D); n_E = np.asarray(n_E); n_C = np.asarray(n_C)
         n_P = np.asarray(n_P); n_M = np.asarray(n_M)
-        n_W = np.asarray(n_W); n_Y = np.asarray(n_Y)
-        seq_lens_u = np.asarray(seq_lens_u); nterm_code_u = np.asarray(nterm_code_u)
-        pi_u = np.asarray(pi_u)
+        seq_lens_u = np.asarray(seq_lens_u)
     except ImportError:
-        cnt = _residue_counts_batch(uniques, "DEHCKYRPMW")
+        cnt = _residue_counts_batch(uniques, "DECPM")
         n_D = cnt["D"]; n_E = cnt["E"]; n_C = cnt["C"]
-        n_P = cnt["P"]; n_M = cnt["M"]; n_W = cnt["W"]; n_Y = cnt["Y"]
-        n_H = cnt["H"]; n_K = cnt["K"]; n_R = cnt["R"]
+        n_P = cnt["P"]; n_M = cnt["M"]
         seq_lens_u = np.array([len(s) for s in uniques], dtype=np.int32)
-        nterm_strs = np.array([s[0] if s else "" for s in uniques], dtype="U1")
-        nterm_code_u = np.array([ord(c) if c else 0 for c in nterm_strs], dtype=np.int32)
-        pi_u = _compute_pi_batch(uniques, n_D.astype(float), n_E.astype(float),
-                                 n_H.astype(float), n_C.astype(float),
-                                 n_Y.astype(float), n_K.astype(float),
-                                 n_R.astype(float))
 
-    nterm_is_basic   = np.isin(nterm_code_u, [ord("R"), ord("K"), ord("H")])
-    nterm_is_pyroglu = np.isin(nterm_code_u, [ord("Q"), ord("E")])
-
-    df["nterm_basic"]            = nterm_is_basic[codes].astype(float)
-    df["peptide_pi"]             = pi_u[codes]
     df["has_oxidized_met"]       = (n_M > 0)[codes].astype(float)
     df["has_cys"]                = (n_C > 0)[codes].astype(float)
     df["n_proline"]              = n_P[codes].astype(float)
-    df["nterm_pyroglu_risk"]     = nterm_is_pyroglu[codes].astype(float)
     df["acidic_residue_density"] = ((n_D + n_E).astype(float) / np.maximum(seq_lens_u, 1))[codes]
-    df["n_tryptophan"]           = n_W[codes].astype(float)
-    df["n_tyrosine"]             = n_Y[codes].astype(float)
 
     return df
 

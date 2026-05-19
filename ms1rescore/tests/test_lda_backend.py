@@ -48,7 +48,6 @@ def _make_features_df(n_per_class: int = 50, seed: int = 42) -> pd.DataFrame:
         "log_n_candidates": rng.uniform(0.0, 2.0, n),
         "peptide_length": rng.integers(7, 25, n).astype(float),
         "n_missed_cleavages": rng.integers(0, 3, n).astype(float),
-        "has_modifications": rng.integers(0, 2, n).astype(float),
     })
 
 

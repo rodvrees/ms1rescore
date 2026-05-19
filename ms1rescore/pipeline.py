@@ -754,7 +754,6 @@ def rescore(
     min_length: int = 7,
     max_length: int = 30,
     model: str = "svm",
-    compute_generative: bool = True,
     init_ppm_threshold: float = 5.0,
     init_isotope_threshold: float = 0.7,
     lcms_proteins_path: str | None = None,
@@ -829,11 +828,6 @@ def rescore(
         default), or "qda" (QuadraticDiscriminantAnalysis, reg_param=0.1).
         All backends use only MALDI_INTRINSIC_FEATURES for training. LC-MS/MS
         evidence is applied as an additive log-prior after scoring.
-    compute_generative
-        When True and model is "svm" or "catboost", run the generative scorer
-        first and add its ranking features (generative_score,
-        generative_score_rank, generative_score_gap, generative_score_z) to
-        MALDI_INTRINSIC_FEATURES before training. Default True.
     init_ppm_threshold
         CatBoost only: ppm_error_abs threshold for the initial positive seed.
     init_isotope_threshold
@@ -993,7 +987,7 @@ def rescore(
     # SCiLS CSV 'Intensity [Regions]' takes priority over raw-derived mean intensity.
     if maldi_intensities is not None:
         _maldi_intensities_arr = np.asarray(maldi_intensities, dtype=np.float32)
-        logger.info("  Using SCiLS per-feature intensities for log_maldi_intensity")
+        logger.info("  Using SCiLS per-feature intensities for log_maldi_intensity_p90")
     if decoy_method == "mz_shift":
         # Strip any shuffle decoys that may have been added (e.g. from extra_fasta).
         # generate_mz_shift_candidates() works exclusively with target peptides and
@@ -1172,28 +1166,9 @@ def rescore(
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
         features_df.to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
-    # --- Step 6b: Generative scoring (optional pre-step) ---
-    has_generative = False
-    if model in ("svm", "catboost") and compute_generative:
-        from ms1rescore.probabilistic_scorer import run_generative_scoring
-
-        logger.info("Step 6b: Running generative scorer...")
-        feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
-        features_df = run_generative_scoring(features_df, feature_col=feature_col)
-        has_generative = True
-        if verbose:
-            logger.debug(
-                f"Writing features with generative scores to "
-                f"{output_dir}/13b_debug_features_generative.tsv"
-            )
-            features_df.to_csv(
-                f"{output_dir}/13b_debug_features_generative.tsv", sep="\t", index=False
-            )
-
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
         has_ion_images=ion_images is not None,
-        has_generative=has_generative,
         has_ccs=observed_ccs_per_feature is not None,
     )
     logger.debug(f"Selected feature names: {feature_names}")
