@@ -110,6 +110,7 @@ _LCMS_MZML_FEATURES = [
     # DeepLC-anchored MS1 isotope features (per-candidate, fully symmetric)
     "lcms_ms1_isotope_cosine",
     "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
+    "log_theo_m1_ratio_diff_lcms", "log_theo_m2_ratio_diff_lcms",
     # MALDI vs LC-MS/MS isotope envelope similarity (requires maldi_envelopes)
     "isotope_envelope_pearson",
     "isotope_envelope_mse",
@@ -157,6 +158,62 @@ SPATIAL_PRIOR_FEATURES = [
 
 # Alias kept separate so LDA-specific feature selection can diverge later.
 LDA_FEATURES = MALDI_INTRINSIC_FEATURES
+
+# Reduced feature set: one representative per collinear group.
+# Use with --only-main-features to cut the feature count from ~46 to ~19
+# and remove inter-feature redundancy before training.
+MAIN_FEATURES = [
+    # ppm (from 6 → 1)
+    "ppm_error_abs",
+    # isotope_theo (from 5 → 1)
+    "theo_isotope_cosine",
+    # sequence_comp (from 8 → 2)
+    "gravy_score",
+    "peptide_length",
+    # adduct (keep all 3, not collinear across adduct types)
+    "adduct_colocalization_na",
+    "adduct_colocalization_k",
+    "adduct_colocalization_chca",
+    # chca
+    "chca_cluster_distance_ppm",
+    # maldi_intensity (from 2 → 1)
+    "log_maldi_intensity_p90",
+    # envelope_lcms (from 3 → 1)
+    "isotope_envelope_cosine",
+    # im2deep (from 4 → 1)
+    "im2deep_ccs_zscore",
+    # averagine (from 2 → 1)
+    "averagine_deviation",
+    # monoisotopic
+    "monoisotopic_confidence",
+    # isotope_image (from 3 → 1)
+    "isotope_image_colocalization_m2",
+    # candidates (from 2 → 1)
+    "n_candidates",
+    # sulfur (from 2 → 1)
+    "theo_has_sulfur",
+    # mass_defect (from 2 → 1)
+    "kendrick_mass_defect",
+    # other (keep both, not collinear)
+    "has_oxidized_met",
+    "n_missed_cleavages",
+]
+
+# Feature-specific NaN fill values applied before the generic median imputer.
+# Missing values for these features have a known structural meaning, so filling
+# with the column median would be misleading.
+#
+# Values:
+#   float      — fill with that constant
+#   "col_max"  — fill with np.nanmax of that column (worst-case penalty)
+#   "col_min"  — fill with np.nanmin of that column
+FEATURE_NAN_FILL: dict[str, float | str] = {
+    # No LC-MS/MS envelope match → treat as worst cosine similarity
+    "isotope_envelope_cosine": 0.0,
+    # No LC-MS/MS envelope match → worst ratio deviation (largest observed error)
+    "isotope_m1_ratio_diff": "col_max",
+    "isotope_m2_ratio_diff": "col_max",
+}
 
 # ---------------------------------------------------------------------------
 # Optional-feature membership sets (used by get_feature_names)
@@ -313,6 +370,7 @@ def compute_all_features(
         _median_fill_feats = [
             "lcms_ms1_isotope_cosine",
             "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
+            "log_theo_m1_ratio_diff_lcms", "log_theo_m2_ratio_diff_lcms",
             "isotope_envelope_pearson",
             "lcms_ms1_apex_rt_delta",
             "lcms_ms2_rt_delta",

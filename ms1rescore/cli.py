@@ -741,18 +741,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="FDR threshold for SVM model training.",
     )
     rescore_grp.add_argument(
-        "--winner-min-r1-q",
-        type=float,
-        default=1.00,
-        metavar="FLOAT",
-        help=(
-            "R1 TDC q-value threshold for winner selection. Only per-feature "
-            "winners with q ≤ this value are passed to R2 training. Features "
-            "below this threshold receive is_tdc_winner=False and q_value=NaN. "
-            "Default 0.80."
-        ),
-    )
-    rescore_grp.add_argument(
         "--init-ppm-threshold",
         type=float,
         default=2.0,
@@ -765,6 +753,46 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.7,
         metavar="FLOAT",
         help="CatBoost only: theo_isotope_cosine threshold for the initial positive seed.",
+    )
+    rescore_grp.add_argument(
+        "--n-interaction-features",
+        type=int,
+        default=5,
+        metavar="INT",
+        help=(
+            "LDA only: number of top-importance R1 features to expand with pairwise "
+            "interaction terms (PolynomialFeatures degree=2) before R2 training. "
+            "Set to 0 to disable. Default: 5."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--only-main-features",
+        action="store_true",
+        help=(
+            "Replace MALDI_INTRINSIC_FEATURES with a reduced set of ~19 "
+            "non-collinear representative features (MAIN_FEATURES). "
+            "Removes redundancy within collinear groups (ppm, isotope_theo, "
+            "sequence_comp, etc.) before training. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--storey-pi0",
+        action="store_true",
+        help=(
+            "Apply Storey pi0 correction to R2 TDC q-values. "
+            "Estimates the null fraction among target winners from the R2 score "
+            "distribution and multiplies raw q-values by pi0 (≤ 1.0). "
+            "Adds storey_q_value and storey_reweighted_q_value columns to the "
+            "output. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--lda-r2-median-filter",
+        action="store_true",
+        help=(
+            "LDA only: before R2 training, drop features whose |R1 importance| is "
+            "below the median across all R1 features. Disabled by default."
+        ),
     )
     rescore_grp.add_argument(
         "--use-protein-level-feats",
@@ -1224,13 +1252,16 @@ def main() -> None:
         msf_path=args.msf,
         ppm_tolerance=args.ppm_tolerance,
         train_fdr=args.train_fdr,
-        winner_min_r1_q=args.winner_min_r1_q,
         missed_cleavages=missed_cleavages,
         min_length=min_length,
         max_length=max_length,
         model=args.model,
         init_ppm_threshold=args.init_ppm_threshold,
         init_isotope_threshold=args.init_isotope_threshold,
+        n_interaction_features=args.n_interaction_features,
+        lda_r2_median_filter=args.lda_r2_median_filter,
+        storey_pi0=args.storey_pi0,
+        only_main_features=args.only_main_features,
         lcms_proteins_path=args.lcms_proteins,
         lcms_peptides_path=lcms_peptides_path,
         lcms_psms_path=args.lcms_psms,
@@ -1267,19 +1298,19 @@ def main() -> None:
     if gt_peptides and "is_tdc_winner" in result_df.columns:
         gt_set = set(gt_peptides)
         winners = result_df[result_df["is_tdc_winner"] & ~result_df["is_decoy"].astype(bool)]
-        n_gt_winners = winners["peptide"].isin(gt_set).sum()
+        n_gt_winners = winners.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
         logger.info(
             "%d/%d GT peptides are round-2 (feature-level) winners.",
             n_gt_winners, len(gt_set),
         )
         winners_fdr = winners[winners['q_value'] < 0.01]
-        n_gt_winners_fdr = winners_fdr["peptide"].isin(gt_set).sum()
+        n_gt_winners_fdr = winners_fdr.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
         logger.info(
             "%d/%d GT peptides are round-2 winners at 1%% FDR.",
             n_gt_winners_fdr, len(gt_set),
         )
         winners_fdr_5 = winners[winners['q_value'] < 0.05]
-        n_gt_winners_fdr_5 = winners_fdr_5["peptide"].isin(gt_set).sum()
+        n_gt_winners_fdr_5 = winners_fdr_5.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
         logger.debug(
             "%d/%d GT peptides are round-2 winners at 5%% FDR.",
             n_gt_winners_fdr_5, len(gt_set),

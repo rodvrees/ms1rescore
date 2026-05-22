@@ -533,6 +533,8 @@ def _parse_psm_utils(
     has_mob = pep_agg["ion_mobility_mean"].notna() & pep_agg["precursor_mz_mean"].notna()
     if has_mob.any():
         try:
+            import logging as _logging
+            _logging.getLogger("onnx2torch").setLevel(_logging.WARNING)
             from im2deep.utils import im2ccs
         except ImportError:
             im2ccs = None

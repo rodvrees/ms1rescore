@@ -19,6 +19,7 @@ Entry point: save_debug_figures()
 
 import logging
 import os
+import warnings
 
 import matplotlib
 matplotlib.use("Agg")
@@ -26,6 +27,12 @@ import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+warnings.filterwarnings(
+    "ignore",
+    message="This figure includes Axes that are not compatible with tight_layout",
+    category=UserWarning,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +198,48 @@ def _get(row: pd.Series, col: str) -> float:
 # ---------------------------------------------------------------------------
 # Subsystem 1: Ion image colocalization
 # ---------------------------------------------------------------------------
+
+def _mz_diverse_order(df: pd.DataFrame, mz_col: str = "feature_mz") -> pd.DataFrame:
+    """
+    Reorder rows so that features with the most spread-out m/z values appear
+    first.  Uses greedy farthest-point selection: seed with the row closest to
+    the median m/z, then iteratively pick the row whose m/z is farthest from
+    all already-selected rows.  Rows without a finite m/z sink to the end.
+
+    This prevents badly-extracted features (the same peptide peak split into
+    several nearby m/z entries) from dominating the beginning of the figure
+    output, where the most distinct/informative images should appear.
+    """
+    if len(df) <= 1 or mz_col not in df.columns:
+        return df
+    mzs = pd.to_numeric(df[mz_col], errors="coerce").values
+    valid_idx = np.where(np.isfinite(mzs))[0]
+    invalid_idx = np.where(~np.isfinite(mzs))[0]
+    if len(valid_idx) <= 1:
+        return df
+
+    mzs_v = mzs[valid_idx]
+    nv = len(mzs_v)
+    selected = np.zeros(nv, dtype=bool)
+    min_dist = np.full(nv, np.inf)
+
+    # Seed: valid row closest to the median m/z.
+    seed = int(np.argmin(np.abs(mzs_v - float(np.median(mzs_v)))))
+    order_v: list[int] = [seed]
+    selected[seed] = True
+    min_dist = np.abs(mzs_v - mzs_v[seed])
+
+    while len(order_v) < nv:
+        # Among unselected valid rows, pick the one farthest from all selected.
+        available = np.where(selected, -np.inf, min_dist)
+        nxt = int(np.argmax(available))
+        order_v.append(nxt)
+        selected[nxt] = True
+        min_dist = np.minimum(min_dist, np.abs(mzs_v - mzs_v[nxt]))
+
+    # Map local indices back to DataFrame row indices; invalid rows go last.
+    full_order = valid_idx[order_v].tolist() + invalid_idx.tolist()
+    return df.iloc[full_order].reset_index(drop=True)
 
 def plot_ion_image_colocalization(
     subset: pd.DataFrame,
@@ -742,44 +791,47 @@ def plot_isotope_envelope_figures(
 # ---------------------------------------------------------------------------
 
 def plot_feature_importance(
-    feature_names: list[str],
+    names_r1: list[str],
     importances_r1: np.ndarray | None,
     importances_r2: np.ndarray | None,
     out_dir: str,
     model_name: str = "model",
     top_n: int = 30,
+    names_r2: list[str] | None = None,
 ) -> None:
     """
     Save sorted horizontal bar charts of feature importances for rounds 1 and 2.
 
-    Positive values are shown in steelblue, negative in tomato.
+    ``names_r1`` and ``names_r2`` are the feature name lists aligned with the
+    respective importance arrays.  When ``names_r2`` is omitted it falls back
+    to ``names_r1``.  Positive values are shown in steelblue, negative in tomato.
     Files: ``{out_dir}/{model_name}_round1_feature_importance.png`` etc.
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    def _one(importances: np.ndarray | None, suffix: str) -> None:
+    def _one(importances: np.ndarray | None, names: list[str], suffix: str) -> None:
         if importances is None or len(importances) == 0:
             return
         importances = np.asarray(importances, dtype=float)
-        if len(importances) != len(feature_names):
+        if len(importances) != len(names):
             logger.warning(
                 "Feature importance length mismatch: %d importances vs %d names — skipping %s",
-                len(importances), len(feature_names), suffix,
+                len(importances), len(names), suffix,
             )
             return
         order = np.argsort(np.abs(importances))[-top_n:]
-        names = [feature_names[i] for i in order]
+        plot_names = [names[i] for i in order]
         vals = importances[order]
         colors = ["steelblue" if v >= 0 else "tomato" for v in vals]
 
-        fig, axi = plt.subplots(figsize=(9, max(4, len(names) * 0.32)))
-        axi.barh(range(len(names)), vals, color=colors, alpha=0.82)
-        axi.set_yticks(range(len(names)))
-        axi.set_yticklabels(names, fontsize=7)
+        fig, axi = plt.subplots(figsize=(9, max(4, len(plot_names) * 0.32)))
+        axi.barh(range(len(plot_names)), vals, color=colors, alpha=0.82)
+        axi.set_yticks(range(len(plot_names)))
+        axi.set_yticklabels(plot_names, fontsize=7)
         axi.axvline(0, color="black", lw=0.8)
         axi.set_xlabel("Importance", fontsize=9)
         round_label = suffix.replace("_", " ").title()
-        axi.set_title(f"{model_name} — {round_label} feature importance (top {len(names)})", fontsize=10)
+        axi.set_title(f"{model_name} — {round_label} feature importance (top {len(plot_names)})", fontsize=10)
         plt.tight_layout()
         fig.savefig(
             os.path.join(out_dir, f"{model_name}_{suffix}_feature_importance.png"),
@@ -787,8 +839,8 @@ def plot_feature_importance(
         )
         plt.close(fig)
 
-    _one(importances_r1, "round1")
-    _one(importances_r2, "round2")
+    _one(importances_r1, names_r1, "round1")
+    _one(importances_r2, names_r2 if names_r2 is not None else names_r1, "round2")
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +895,26 @@ def plot_feature_distributions(
     gt_mask = np.zeros(len(feat), dtype=bool)
     if gt_peptides and "peptide" in feat.columns:
         gt_set = set(gt_peptides)
-        gt_mask = target_mask & feat["peptide"].isin(gt_set).values
+        all_gt_mask = target_mask & feat["peptide"].isin(gt_set).values
+        if all_gt_mask.any():
+            # Each GT peptide may appear at multiple MALDI features; keep only the
+            # row with the highest round-1 score so each peptide contributes exactly
+            # one vertical line per feature distribution plot.
+            _r1_col = next(
+                (c for c in res.columns if c.endswith("_r1") and pd.api.types.is_numeric_dtype(res[c])),
+                None,
+            )
+            if _r1_col is None:
+                gt_mask = all_gt_mask
+            else:
+                gt_idx = np.where(all_gt_mask)[0]
+                tmp = pd.DataFrame({
+                    "row": gt_idx,
+                    "peptide": feat["peptide"].values[gt_idx],
+                    "score": pd.to_numeric(res[_r1_col].iloc[gt_idx].values, errors="coerce"),
+                })
+                best = tmp.sort_values("score", ascending=False).drop_duplicates("peptide")
+                gt_mask[best["row"].values] = True
 
     # Always plot every numeric column in features_df that is not in _DIST_SKIP.
     # Explicitly listed features (the ranker inputs) come first; the remaining
@@ -1080,33 +1151,40 @@ def plot_ccs_scatter(
 def plot_ids_vs_fdr(
     result_df: pd.DataFrame,
     out_dir: str,
-    model_name: str = "model",
     fdr_max: float = 0.20,
+    pi0: float | None = None,
 ) -> None:
     """
     Save a curve of target identifications as a function of FDR threshold.
 
-    Plots both the TDC q-value and the reweighted q-value (when present) so
-    the effect of the LC-MS/MS prior is immediately visible.  Vertical lines
-    mark 1 % and 5 % FDR.  Only TDC winner rows are considered; decoy winners
-    are excluded.
+    Backend-agnostic: the model name is inferred from the ``*_score_r1``
+    column in ``result_df``; no explicit model identifier is required.  Plots
+    both the TDC q-value and the reweighted q-value (when present) so the
+    effect of the LC-MS/MS prior is immediately visible.  Vertical lines mark
+    1 % and 5 % FDR.  Only TDC winner target rows are considered.
 
-    Output: ``{out_dir}/{model_name}_ids_vs_fdr.png``
+    Output: ``{out_dir}/ids_vs_fdr.png``
     """
     os.makedirs(out_dir, exist_ok=True)
+
+    # Infer model name from the first *_score_r1 column present.
+    r1_cols = [c for c in result_df.columns if c.endswith("_score_r1")]
+    model_name = r1_cols[0].removesuffix("_score_r1") if r1_cols else "model"
 
     is_winner = result_df.get("is_tdc_winner", pd.Series(False, index=result_df.index)).fillna(False).astype(bool)
     is_decoy = result_df.get("is_decoy", pd.Series(False, index=result_df.index)).fillna(False).astype(bool)
     target_winners = result_df[is_winner & ~is_decoy].copy()
 
-    q_col = "q_value"
-    rw_col = "reweighted_q_value"
-
+    pi0_label = f" (π₀={pi0:.3f})" if pi0 is not None else ""
     curves: list[tuple[str, str, str]] = []  # (column, label, colour)
-    if q_col in target_winners.columns:
-        curves.append((q_col, "TDC q-value", "steelblue"))
-    if rw_col in target_winners.columns and target_winners[rw_col].notna().any():
-        curves.append((rw_col, "Reweighted q-value", "darkorange"))
+    if "q_value" in target_winners.columns:
+        curves.append(("q_value", "TDC q-value", "steelblue"))
+    if "reweighted_q_value" in target_winners.columns and target_winners["reweighted_q_value"].notna().any():
+        curves.append(("reweighted_q_value", "Reweighted q-value", "darkorange"))
+    if "storey_q_value" in target_winners.columns and target_winners["storey_q_value"].notna().any():
+        curves.append(("storey_q_value", f"Storey q-value{pi0_label}", "seagreen"))
+    if "storey_reweighted_q_value" in target_winners.columns and target_winners["storey_reweighted_q_value"].notna().any():
+        curves.append(("storey_reweighted_q_value", f"Storey reweighted{pi0_label}", "tomato"))
 
     if not curves:
         logger.warning("plot_ids_vs_fdr: no q_value or reweighted_q_value column — skipping")
@@ -1145,7 +1223,7 @@ def plot_ids_vs_fdr(
     ax.grid(True, lw=0.4, alpha=0.4)
     plt.tight_layout()
     fig.savefig(
-        os.path.join(out_dir, f"{model_name}_ids_vs_fdr.png"),
+        os.path.join(out_dir, "ids_vs_fdr.png"),
         dpi=120, bbox_inches="tight",
     )
     plt.close(fig)
@@ -1485,6 +1563,7 @@ def _draw_pp_panel(
     decoy_scores: np.ndarray,
     title: str,
     n_points: int = 500,
+    pi0: float | None = None,
 ) -> None:
     """Draw a single PP-plot panel onto ax."""
     n_t = len(target_scores)
@@ -1508,6 +1587,15 @@ def _draw_pp_panel(
         label=f"y = (1−π₁)·x  [π₁≈{pi1_hat:.2f}]",
     )
 
+    # Reference line 3 (optional): y = pi0 × x from Storey pi0 estimate.
+    # The PP curve should track this line in the null-dominated (low-score) region.
+    if pi0 is not None:
+        ax.plot(
+            [0, 1], [0, pi0],
+            color="seagreen", lw=1.4, ls="--",
+            label=f"expected (pi0={pi0:.2f})",
+        )
+
     ax.plot(x, y, color="steelblue", lw=1.8, label=f"T (n={n_t})  vs  D (n={n_d})")
 
     ax.set_xlim(0, 1)
@@ -1525,6 +1613,7 @@ def plot_score_pp(
     result_df: pd.DataFrame,
     out_dir: str,
     n_points: int = 500,
+    pi0: float | None = None,
 ) -> None:
     """
     PP plot of score distributions: F_decoy(t) on the x-axis vs F_target(t)
@@ -1553,6 +1642,8 @@ def plot_score_pp(
 
     feat = features_df.reset_index(drop=True)
     res  = result_df.reset_index(drop=True)
+
+    assert len(feat) == len(res), f"Length mismatch: {len(feat)} vs {len(res)}"
 
     is_decoy = (
         feat.get("is_decoy", pd.Series(False, index=feat.index))
@@ -1594,7 +1685,7 @@ def plot_score_pp(
         finite_w = is_winner & np.isfinite(r2_scores)
         t_r2 = r2_scores[~is_decoy & finite_w]
         d_r2 = r2_scores[ is_decoy & finite_w]
-        _draw_pp_panel(ax, t_r2, d_r2, f"R1 winners — {r2_col}", n_points=n_points)
+        _draw_pp_panel(ax, t_r2, d_r2, f"R1 winners — {r2_col}", n_points=n_points, pi0=pi0)
     else:
         ax.set_visible(False)
 
@@ -1605,7 +1696,7 @@ def plot_score_pp(
         finite_rw = is_winner & np.isfinite(rw_scores)
         t_rw = rw_scores[~is_decoy & finite_rw]
         d_rw = rw_scores[ is_decoy & finite_rw]
-        _draw_pp_panel(ax, t_rw, d_rw, "R1 winners — reweighted_score", n_points=n_points)
+        _draw_pp_panel(ax, t_rw, d_rw, "R1 winners — reweighted_score", n_points=n_points, pi0=pi0)
     else:
         ax.set_visible(False)
 
@@ -2008,10 +2099,12 @@ def save_debug_figures(
     importances_r1: np.ndarray | None = None,
     importances_r2: np.ndarray | None = None,
     importance_names: list[str] | None = None,
+    importance_names_r2: list[str] | None = None,
     debug_dir: str = "debug",
     n_subset: int = 50,
     seed: int = 42,
     gt_peptides: list[str] | None = None,
+    storey_pi0_val: float | None = None,
 ) -> None:
     """
     Generate all debug figures and save them under ``debug_dir``.
@@ -2090,12 +2183,13 @@ def save_debug_figures(
             for _col in _display_cols:
                 id_subset[_col] = _res_id[_col].values
             id_subset["_score_r1"] = id_subset[_score_r1_cols[0]] if _score_r1_cols else np.nan
-            id_subset["_rank"] = (
-                id_subset["_score_r1"]
-                .rank(ascending=False, method="min", na_option="bottom")
-                .astype(int)
-            )
             id_subset["_total"] = len(feat_aligned)
+
+            # Reorder by m/z diversity so that maximally spread features appear
+            # first in the output directory.  Closely-spaced features (same peak
+            # badly split into multiple m/z entries) are pushed to the end.
+            id_subset = _mz_diverse_order(id_subset)
+            id_subset["_rank"] = np.arange(1, len(id_subset) + 1)
 
             # Combine: all ID rows + sampled R1/L rows from the existing subset.
             subset_for_images = pd.concat(
@@ -2157,12 +2251,8 @@ def save_debug_figures(
         logger.warning("CCS scatter failed: %s", exc)
 
     try:
-        plot_ids_vs_fdr(
-            result_df,
-            out_dir=debug_dir,
-            model_name=model_name,
-        )
-        logger.info("IDs vs FDR curve saved to %s/%s_ids_vs_fdr.png", debug_dir, model_name)
+        plot_ids_vs_fdr(result_df, out_dir=debug_dir, pi0=storey_pi0_val)
+        logger.info("IDs vs FDR curve saved to %s/ids_vs_fdr.png", debug_dir)
     except Exception as exc:
         logger.warning("IDs vs FDR curve failed: %s", exc)
 
@@ -2192,6 +2282,7 @@ def save_debug_figures(
         plot_score_pp(
             features_df, result_df,
             out_dir=debug_dir,
+            pi0=storey_pi0_val,
         )
         logger.info("Score PP plot saved to %s/score_pp_plot.png", debug_dir)
     except Exception as exc:
@@ -2224,6 +2315,7 @@ def save_debug_figures(
                 imp_names, importances_r1, importances_r2,
                 out_dir=os.path.join(debug_dir, "feature_importance"),
                 model_name=model_name,
+                names_r2=importance_names_r2,
             )
             logger.info("Feature importance figures saved to %s/feature_importance/", debug_dir)
         except Exception as exc:

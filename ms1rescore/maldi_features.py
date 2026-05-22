@@ -611,7 +611,9 @@ def _finetune_and_predict(
     Requires ≥ 5 calibration peptides; logs a warning and returns the
     uncalibrated predictions if fewer are available or finetuning fails.
     """
+    import logging
     import tempfile
+    logging.getLogger("onnx2torch").setLevel(logging.WARNING)
     from im2deep.core import finetune as _im2deep_finetune
     from im2deep.core import predict as _predict
     from psm_utils.psm import PSM
@@ -635,7 +637,7 @@ def _finetune_and_predict(
     with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as tmp:
         model_path = tmp.name
 
-    finetuned_model = _im2deep_finetune(cal_psm_list, model_save_path=model_path, epochs=20)
+    finetuned_model = _im2deep_finetune(cal_psm_list, model_save_path=model_path, epochs=40)
     logger.info(
         f"  IM2Deep transfer learning on {n_cal} unique peptides "
         f"({n_cal_rows} single-candidate features): model saved to {model_path}"

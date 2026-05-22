@@ -7,7 +7,10 @@ and return feature values. No function takes an is_decoy parameter.
 
 import logging
 import os
+import warnings
 from dataclasses import dataclass, field
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="alphatims")
 
 import numpy as np
 import pandas as pd
@@ -569,7 +572,7 @@ def finetune_deeplc_from_df(
         ]
     )
 
-    model = finetune(psm_list, train_kwargs={"epochs": 30})
+    model = finetune(psm_list, train_kwargs={"epochs": 40})
     return model
 
 
@@ -847,6 +850,8 @@ def compute_all_lcms_evidence(
             "lcms_ms1_isotope_cosine": np.nan,
             "theo_m1_ratio_diff_lcms": np.nan,
             "theo_m2_ratio_diff_lcms": np.nan,
+            "log_theo_m1_ratio_diff_lcms": np.nan,
+            "log_theo_m2_ratio_diff_lcms": np.nan,
             "isotope_envelope_cosine": np.nan,
             "isotope_envelope_pearson": np.nan,
             "isotope_envelope_mse": np.nan,
@@ -997,12 +1002,12 @@ def compute_all_lcms_evidence(
 
             result["lcms_ms1_isotope_cosine"] = float(cosine_similarity(env, theo_env))
             if theo_env[0] > 0 and env[0] > 0:
-                result["theo_m1_ratio_diff_lcms"] = float(
-                    abs(env[1] / env[0] - theo_env[1] / theo_env[0])
-                )
-                result["theo_m2_ratio_diff_lcms"] = float(
-                    abs(env[2] / env[0] - theo_env[2] / theo_env[0])
-                )
+                m1_diff = abs(env[1] / env[0] - theo_env[1] / theo_env[0])
+                m2_diff = abs(env[2] / env[0] - theo_env[2] / theo_env[0])
+                result["theo_m1_ratio_diff_lcms"] = float(m1_diff)
+                result["theo_m2_ratio_diff_lcms"] = float(m2_diff)
+                result["log_theo_m1_ratio_diff_lcms"] = float(np.log1p(m1_diff))
+                result["log_theo_m2_ratio_diff_lcms"] = float(np.log1p(m2_diff))
 
             # MALDI vs LC-MS/MS envelope comparison (if MALDI envelopes available)
             if maldi_envelopes is not None:

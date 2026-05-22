@@ -454,14 +454,13 @@ from ms1rescore.feature_generator import (
 **`MALDI_INTRINSIC_FEATURES`** — features passed to the ranker by default; computable from MALDI data alone plus in-silico properties:
 - Mass accuracy: `ppm_error_abs`, `ppm_rank`, `ppm_best_ratio`, `ppm_error_calibrated_z` (optional, requires pixel coords)
 - Ambiguity: `n_candidates`, `log_n_candidates`
-- Peptide (basic): `peptide_length`, `n_missed_cleavages`, `has_modifications`
-- Peptide (extended): `nterm_basic`, `peptide_pi`, `has_oxidized_met`, `has_cys`, `n_proline`, `nterm_pyroglu_risk`, `acidic_residue_density`, `n_tryptophan`, `n_tyrosine`
-- MALDI signal: `log_maldi_intensity_p90`, `log_maldi_intensity_sum`, `log_maldi_intensity` (alias for p90)
+- Peptide (basic): `peptide_length`, `n_missed_cleavages`
+- Peptide (extended): `has_oxidized_met`, `has_cys`, `n_proline`, `acidic_residue_density`
+- MALDI signal: `log_maldi_intensity_p90`, `log_maldi_intensity_sum`
 - Mass defect: `kendrick_mass_defect`, `mass_defect_residual`
 - CHCA matrix: `chca_cluster_distance_ppm`
 - Theoretical isotope: `theo_isotope_cosine`, `theo_isotope_chi2`, `theo_isotope_kl`, `theo_has_sulfur`, `averagine_deviation`, `averagine_deviation_sulfur`, `theo_m1_ratio_diff`, `theo_m2_ratio_diff`, `monoisotopic_confidence`
-- Generative model outputs (optional, requires `compute_generative=True`): `generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`
-- Ionization priors: `n_arginine`, `n_basic_residues`, `n_phenylalanine`, `n_aromatic`, `gravy_score`, `charge_proxy`
+- Ionization priors: `n_arginine`, `n_basic_residues`, `n_aromatic`, `gravy_score`, `charge_proxy`
 - Ion mobility (optional, requires im2deep + observed CCS): `im2deep_delta_ccs`, `im2deep_abs_delta_ccs_pct`, `im2deep_ccs_zscore`, `im2deep_ccs_rank`
 - Isotopologue co-localization (optional, requires ion_images): `isotope_image_colocalization_m1`, `isotope_image_colocalization_m2`, `isotope_image_colocalization_mean`
 - Adduct co-localization (optional, requires ion_images): `adduct_colocalization_na`, `adduct_colocalization_k`, `adduct_colocalization_chca`
@@ -485,7 +484,7 @@ The last group (`_LCMS_RANKER_FROM_EVIDENCE`) is appended to `MALDI_INTRINSIC_FE
 *mzML-derived* (`_LCMS_MZML_FEATURES`):
 - MS2: `lcms_ms2_spectral_angle`, `lcms_ms2_n_matches` (both filtered by DeepLC RT window when `rt_window_min > 0`)
 - DeepLC-anchored MS1 signal: `lcms_ms1_intensity`, `lcms_ms1_snr`
-- DeepLC-anchored MS1 isotope: `lcms_ms1_isotope_cosine`, `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`
+- DeepLC-anchored MS1 isotope: `lcms_ms1_isotope_cosine`, `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`, `log_theo_m1_ratio_diff_lcms`, `log_theo_m2_ratio_diff_lcms`
 - MALDI vs LC-MS/MS envelope similarity (requires `maldi_envelopes`): `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_n_matched`, `isotope_absolute_diff`
 - DeepLC-anchored RT-consistency (requires `rt_window_min > 0`): `lcms_ms1_apex_rt_delta`, `lcms_ms1_frac_apex_signal`, `lcms_ms1_n_scans_with_signal`, `lcms_ms2_rt_delta`
 
@@ -599,7 +598,7 @@ CLI flags: `--decoy-method {shuffle,mz_shift,balanced_shuffle}`, `--mz-shift-del
 All backends follow the same two-pass structure:
 
 1. **Round 1** — score all candidates globally. The model does not use per-feature grouping; every candidate is treated on equal footing.
-2. **Per-feature winner selection** (`_select_feature_winners`) — for each MALDI m/z feature, retain only the highest round-1 score candidate. Produces `winners_df` (~N rows for N features). After selection, `_filter_winners_by_r1_q` computes TDC q-values over the winner set and drops winners with R1 q > `winner_min_r1_q` (default 0.80, CLI `--winner-min-r1-q`). Dropped features get `is_tdc_winner=False`, `q_value=NaN`. Falls back to the unfiltered winner set with a warning when fewer than 20 target winners would survive the cut.
+2. **Per-feature winner selection** (`_select_feature_winners`) — for each MALDI m/z feature, retain only the highest round-1 score candidate. Produces `winners_df` (~N rows for N features). A strict Q1 filter is then applied: the 25th percentile of all winner R1 scores is computed and any feature whose winner falls below it is dropped (`is_tdc_winner=False`, `q_value=NaN`). This removes the bottom quartile of features by R1 confidence before R2 training.
 3. **Round 2** — retrain/rescore on the winner subset only. Because each feature contributes exactly one candidate, this is a cleaner training set than the full candidate pool.
 4. **FDR** — standard TDC (`_tdc_qvalues`) over all winners sorted by round-2 score. Q-values propagated to non-winners as NaN.
 
@@ -639,7 +638,8 @@ Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `p
 - Round 1 trains on all candidates → `catboost_score_r1`; round 2 retrains on `winners_df` → `catboost_score_r2`.
 - Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `peptide`, `protein`, `feature_mz`, `feature_idx`, `is_decoy`, `catboost_score_r1`, `catboost_score_r2`, `q_value`, `is_tdc_winner`, `reweighted_score`, `reweighted_q_value`.
 
-**Generative pre-scoring for SVM/CatBoost** (`compute_generative=True`, default when `model` is `"svm"` or `"catboost"`): `probabilistic_scorer.py` runs first (step 7b) and adds four ranking features (`generative_score`, `generative_score_rank`, `generative_score_gap`, `generative_score_z`) to `MALDI_INTRINSIC_FEATURES` before training. Not used for `model="lda"`. These features are carried into `winners_df` unchanged — no recomputation in R2.
+**`model="qda"`:** Semi-supervised `QuadraticDiscriminantAnalysis(reg_param=0.1)` on `MALDI_INTRINSIC_FEATURES`. Same pseudo-label iteration and seed logic as LDA. `reg_param=0.1` regularizes the per-class covariance toward a scaled identity matrix. Returns `(psm_list, result_df, feature_names)` where `result_df` has columns analogous to LDA but with `qda_score_r1`, `qda_score_r2`.
+
 
 **Post-scoring reweighting** (applied after all backends to winners only):
 
@@ -760,14 +760,16 @@ ms1rescore \
   --lcms-peptides /home/robbe/MALDI_MSI_score/data/amyloidosis/fragpipe_output_amyloidosis/Amyl_tissue_psm.tsv \
   --lcms-id-format psm_utils \
   --model lda \
-  --decoy-method balanced_shuffle \
-  --output-dir /home/robbe/MALDI_MSI_score/results/balanced_shuffle/ \
+  --output-dir /home/robbe/MALDI_MSI_score/results/new_algo_lda/ \
   -v --im2deep-calibration linear \
-  --debug-gt /home/robbe/MALDI_MSI_score/data/amyloidosis/GT_peptides.txt
+  --debug-gt /home/robbe/MALDI_MSI_score/data/amyloidosis/GT_peptides.txt \
+  --decoy-method balanced_shuffle \
+  --n-interaction-features 0
 ```
 
 Key parameter choices:
 - `--model lda`: LDA default; no extra dependencies, fast pseudo-label iteration.
 - `--decoy-method balanced_shuffle`: ensures ~1:1 T:D by retaining only shuffled peptides that match a MALDI feature. Prevents decoy starvation on sparse feature lists.
+- `--n-interaction-features 0`: polynomial interaction expansion disabled (default 5 was found to hurt performance).
 - `--im2deep-calibration linear`: IM2Deep CCS calibration mode.
 - `--debug-gt`: ground truth peptide list for diagnostic FDR plots (not used in scoring).

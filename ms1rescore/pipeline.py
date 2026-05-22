@@ -15,7 +15,9 @@ from ms1rescore.candidates import (
     match_to_maldi_features,
 )
 from ms1rescore.feature_generator import (
+    FEATURE_NAN_FILL,
     LCMS_PRIOR_FEATURES,
+    MAIN_FEATURES,
     MALDI_INTRINSIC_FEATURES,
     PROTEIN_LEVEL_FEATURES,
     SPATIAL_PRIOR_FEATURES,
@@ -154,7 +156,9 @@ def _rescore_svm(
             present_raw = [f for f in raw_names if f in features_df.columns]
             if not present_raw:
                 continue
-            X_all = features_df[present_raw].fillna(0.0).values.astype(float)
+            X_all = features_df[present_raw].values.astype(float)
+            _apply_nan_fill(X_all, present_raw, FEATURE_NAN_FILL)
+            X_all = np.where(np.isfinite(X_all), X_all, 0.0)
             X_scaled = fm.scaler.transform(X_all)
             fold_scores.append(_get_scores(fm.estimator, X_scaled))
             try:
@@ -210,7 +214,9 @@ def _rescore_catboost(
 
     df = features_df.reset_index(drop=True)
     present = [f for f in intrinsic_feature_names if f in df.columns]
-    X = df[present].fillna(0.0).values.astype(np.float32)
+    X = df[present].values.astype(np.float64)
+    _apply_nan_fill(X, present, FEATURE_NAN_FILL)
+    X = np.where(np.isfinite(X), X, 0.0).astype(np.float32)
     is_decoy = df["is_decoy"].values.astype(bool)
     is_target = ~is_decoy
 
@@ -296,11 +302,120 @@ def _rescore_catboost(
     return scores, importances, present
 
 
+def _apply_nan_fill(
+    X: np.ndarray,
+    feature_names: list[str],
+    fill_spec: dict[str, "float | str"],
+) -> np.ndarray:
+    """Apply feature-specific NaN fills before the generic median imputer.
+
+    Operates in-place on *X* (caller should pass a copy if the original must
+    be preserved).  Only columns present in both *feature_names* and
+    *fill_spec* are touched; remaining NaN values are left for the downstream
+    ``SimpleImputer`` (or ``fillna``) to handle.
+    """
+    for fname, fill_val in fill_spec.items():
+        if fname not in feature_names:
+            continue
+        j = feature_names.index(fname)
+        col = X[:, j]
+        nan_mask = np.isnan(col)
+        n_nan = int(nan_mask.sum())
+        if n_nan == 0:
+            continue
+        if isinstance(fill_val, str):
+            if fill_val == "col_max":
+                value = float(np.nanmax(col)) if np.isfinite(col[~nan_mask]).any() else 0.0
+            elif fill_val == "col_min":
+                value = float(np.nanmin(col)) if np.isfinite(col[~nan_mask]).any() else 0.0
+            else:
+                raise ValueError(f"Unknown fill_spec value {fill_val!r} for feature {fname!r}")
+        else:
+            value = float(fill_val)
+        col[nan_mask] = value
+        logger.debug(
+            "  _apply_nan_fill: %s — filled %d NaN with %.4f (%s)",
+            fname, n_nan, value, fill_val if isinstance(fill_val, str) else "constant",
+        )
+    return X
+
+
+def _log_imputation_debug(
+    label: str,
+    X_fit: np.ndarray,
+    fit_names: list[str],
+    is_target: np.ndarray,
+    is_decoy: np.ndarray,
+    pipe,
+) -> None:
+    """Log per-feature NaN counts and imputation values, split by target/decoy.
+
+    Gated on DEBUG level so it is a no-op in normal runs.
+
+    Columns:
+      nan_tgt / nan_dec  — how many rows of each group had NaN and were imputed
+      tgt% / dec%        — NaN rate per group
+      imputed            — value filled in (train-set median from SimpleImputer)
+      tgt_med            — median of real (non-NaN) target values
+      dec_med            — median of real (non-NaN) decoy values
+      bias               — imputed − dec_med  (positive = decoys with NaN got
+                           pulled above their natural median toward target territory)
+
+    A large positive bias on a feature with high dec% is a sign that imputation
+    may be inflating decoy scores for that feature.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    nan_mask = np.isnan(X_fit)
+    has_nan = nan_mask.any(axis=0)
+    if not has_nan.any():
+        logger.debug("  %s imputation: no NaN values in any feature", label)
+        return
+
+    n_tgt = int(is_target.sum())
+    n_dec = int(is_decoy.sum())
+    imp_vals = pipe["imputer"].statistics_
+
+    header = (
+        f"  {'feature':<42s}  {'nan_tgt':>7}  {'nan_dec':>7}"
+        f"  {'tgt%':>6}  {'dec%':>6}  {'imputed':>9}  {'tgt_med':>9}  {'dec_med':>9}  {'bias':>9}"
+    )
+    rows = [header]
+    for j, fname in enumerate(fit_names):
+        if not has_nan[j]:
+            continue
+        n_nan_tgt = int(nan_mask[is_target, j].sum())
+        n_nan_dec = int(nan_mask[is_decoy, j].sum())
+        pct_tgt = 100.0 * n_nan_tgt / n_tgt if n_tgt else 0.0
+        pct_dec = 100.0 * n_nan_dec / n_dec if n_dec else 0.0
+
+        tgt_real = X_fit[is_target & ~nan_mask[:, j], j]
+        dec_real = X_fit[is_decoy & ~nan_mask[:, j], j]
+        tgt_med = float(np.median(tgt_real)) if len(tgt_real) else float("nan")
+        dec_med = float(np.median(dec_real)) if len(dec_real) else float("nan")
+        bias = imp_vals[j] - dec_med if np.isfinite(dec_med) else float("nan")
+
+        rows.append(
+            f"  {fname:<42s}  {n_nan_tgt:>7d}  {n_nan_dec:>7d}"
+            f"  {pct_tgt:>5.1f}%  {pct_dec:>5.1f}%  {imp_vals[j]:>9.3f}"
+            f"  {tgt_med:>9.3f}  {dec_med:>9.3f}  {bias:>+9.3f}"
+        )
+
+    logger.debug(
+        "  %s imputation stats (n_tgt=%d, n_dec=%d, imputed=train-set median):\n%s",
+        label, n_tgt, n_dec, "\n".join(rows),
+    )
+
+
 def _rescore_lda(
     features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
     init_ppm_threshold: float,
     seed_mask: np.ndarray | None = None,
+    n_interaction_features: int = 0,
+    r1_importances: np.ndarray | None = None,
+    r1_feature_names: list[str] | None = None,
 ) -> np.ndarray:
     """
     Semi-supervised LDA on MALDI-intrinsic features.
@@ -315,10 +430,18 @@ def _rescore_lda(
     targets with ppm_error_abs < init_ppm_threshold OR n_candidates == 1 are
     used.
 
+    When ``n_interaction_features > 0`` and R1 importances are supplied via
+    ``r1_importances`` / ``r1_feature_names``, the top-k features by
+    |importance| are selected and pairwise interaction terms
+    (PolynomialFeatures degree=2, interaction_only=True) are added after
+    StandardScaler.  Only the selected top-k columns (plus their cross-terms)
+    are passed to LDA; the rest are dropped for this round.
+
     Returns ``(scores, importances, feature_names_used)`` where ``scores`` is
     a 1-D array (higher = more likely correct), ``importances`` is
     ``coef_[0]`` (signed) from the final LDA pipeline (or None), and
-    ``feature_names_used`` is the aligned feature name list.
+    ``feature_names_used`` is the aligned feature name list (expanded when
+    polynomial features are active).
     """
     from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
     from sklearn.impute import SimpleImputer
@@ -329,9 +452,40 @@ def _rescore_lda(
     present = [f for f in intrinsic_feature_names if f in df.columns]
     X_raw = df[present].values.astype(np.float64)
     X = np.where(np.isfinite(X_raw), X_raw, np.nan)  # ±inf → nan for imputer
+    _apply_nan_fill(X, present, FEATURE_NAN_FILL)
 
     is_decoy = df["is_decoy"].values.astype(bool)
     is_target = ~is_decoy
+
+    # --- Polynomial interaction setup (R2 only when importances supplied) ---
+    use_poly = (
+        n_interaction_features > 0
+        and r1_importances is not None
+        and r1_feature_names is not None
+        and len(r1_importances) == len(r1_feature_names)
+    )
+    if use_poly:
+        from sklearn.preprocessing import PolynomialFeatures
+        present_set = set(present)
+        r1_order = np.argsort(np.abs(r1_importances))[::-1]
+        top_names = [
+            r1_feature_names[i] for i in r1_order
+            if r1_feature_names[i] in present_set
+        ][:n_interaction_features]
+        top_col_idx = [present.index(n) for n in top_names]
+        X_fit = X[:, top_col_idx]
+        _poly_probe = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+        _poly_probe.fit(np.zeros((1, len(top_names))))
+        expanded_names = list(_poly_probe.get_feature_names_out(top_names))
+        n_cross = len(expanded_names) - len(top_names)
+        logger.info(
+            f"  LDA R2 interactions: top-{len(top_names)} features "
+            f"({', '.join(top_names)}) → {len(expanded_names)} total "
+            f"({len(top_names)} original + {n_cross} cross-terms)"
+        )
+    else:
+        X_fit = X
+        expanded_names = None
 
     if seed_mask is None:
         ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
@@ -360,16 +514,24 @@ def _rescore_lda(
         train_idx = np.concatenate([pos_idx, dec_idx])
         y_train = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(dec_idx))])
 
-        pipe = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
-        ])
-        pipe.fit(X[train_idx], y_train)
-        scores = pipe.decision_function(X).ravel()  # ensure 1-D for binary case
+        if use_poly:
+            pipe = Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("poly", PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)),
+                ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
+            ])
+        else:
+            pipe = Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
+            ])
+        pipe.fit(X_fit[train_idx], y_train)
+        scores = pipe.decision_function(X_fit).ravel()
 
         q_values = _tdc_qvalues(scores, is_decoy)
-        new_seed = is_target & (q_values <= 0.05)
+        new_seed = is_target & (q_values <= 0.10)
         n_new = new_seed.sum()
 
         logger.info(
@@ -377,7 +539,7 @@ def _rescore_lda(
         )
 
         if n_new == 0:
-            logger.warning("  LDA: no pseudo-positives at q≤0.05 — stopping early")
+            logger.warning("  LDA: no pseudo-positives at q≤0.10 — stopping early")
             break
 
         change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
@@ -388,13 +550,26 @@ def _rescore_lda(
         prev_pos_size = n_new
         seed_mask = new_seed.values if hasattr(new_seed, "values") else new_seed
 
+    if pipe is not None:
+        _log_imputation_debug(
+            "LDA",
+            X_fit,
+            top_names if use_poly else present,
+            is_target,
+            is_decoy,
+            pipe,
+        )
+
     importances = None
+    feature_names_out = present
     if pipe is not None:
         try:
             importances = pipe["lda"].coef_[0]
+            if use_poly:
+                feature_names_out = expanded_names
         except Exception:
             pass
-    return scores, importances, present
+    return scores, importances, feature_names_out
 
 
 def _rescore_qda(
@@ -422,6 +597,7 @@ def _rescore_qda(
     present = [f for f in intrinsic_feature_names if f in df.columns]
     X_raw = df[present].values.astype(np.float64)
     X = np.where(np.isfinite(X_raw), X_raw, np.nan)
+    _apply_nan_fill(X, present, FEATURE_NAN_FILL)
 
     is_decoy = df["is_decoy"].values.astype(bool)
     is_target = ~is_decoy
@@ -453,24 +629,55 @@ def _rescore_qda(
         train_idx = np.concatenate([pos_idx, dec_idx])
         y_train = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(dec_idx))])
 
+        n_train = len(train_idx)
+        n_feat = len(present)
+        # adaptive_reg = max(0.1, 1.0 - n_train / (2 * n_feat ** 2))\
+        adaptive_reg = 0.5
+
         pipe = Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            ("qda", QuadraticDiscriminantAnalysis(reg_param=0.1)),
+            ("qda", QuadraticDiscriminantAnalysis(reg_param=adaptive_reg)),
         ])
+        
         pipe.fit(X[train_idx], y_train)
         scores = pipe.decision_function(X).ravel()
 
         q_values = _tdc_qvalues(scores, is_decoy)
-        new_seed = is_target & (q_values <= 0.05)
-        n_new = new_seed.sum()
+        new_seed = is_target & (q_values <= 0.10)
+        if hasattr(new_seed, "values"):
+            new_seed = new_seed.values
 
+        prev_seed_mask = seed_mask.copy()
+
+        # Monotonic growth: union with current seed, then prune bottom 50% by
+        # score, but never shrink below the initial seed count (n_seed).
+        union_mask = seed_mask | new_seed
+        union_idx = np.where(union_mask)[0]
+        union_scores = scores[union_idx]
+        prune_threshold = np.percentile(union_scores, 50)
+        pruned_mask = union_mask.copy()
+        below = union_idx[union_scores < prune_threshold]
+        if len(union_idx) - len(below) >= n_seed:
+            pruned_mask[below] = False
+        seed_mask = pruned_mask
+
+        prev_seed_count = int(prev_seed_mask.sum())
+        changed_count = int(np.count_nonzero(prev_seed_mask != seed_mask))
+        changed_pct = 100.0 * changed_count / max(prev_seed_count, 1)
+        logger.debug(
+            f"  QDA iter {iteration + 1}: seed_positives changed by {changed_pct:.2f}% "
+            f"({changed_count}/{prev_seed_count}; {prev_seed_count} -> {int(seed_mask.sum())})"
+        )
+
+        n_new = int(seed_mask.sum())
         logger.info(
-            f"  QDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size})"
+            f"  QDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size}), "
+            f"reg_param = {adaptive_reg:.4f} (n_train={n_train}, n_feat={n_feat})"
         )
 
         if n_new == 0:
-            logger.warning("  QDA: no pseudo-positives at q≤0.05 — stopping early")
+            logger.warning("  QDA: no pseudo-positives at q≤0.10 — stopping early")
             break
 
         change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
@@ -479,7 +686,9 @@ def _rescore_qda(
             break
 
         prev_pos_size = n_new
-        seed_mask = new_seed.values if hasattr(new_seed, "values") else new_seed
+
+    if pipe is not None:
+        _log_imputation_debug("QDA", X, present, is_target, is_decoy, pipe)
 
     pep_proba = np.full(len(df), np.nan)
     importances = None
@@ -558,7 +767,7 @@ def _rescore_qda(
 #     return q_values, is_tdc_winner
 
 
-def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
+def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray, pi0: float = 1.0) -> np.ndarray:
     """
     Compute per-candidate target-decoy q-values (Storey/Käll TDC).
 
@@ -566,7 +775,8 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     FDR = (1 + n_decoy) / max(n_target, 1) at each position (the +1
     correction is the standard Storey/Käll adjustment for small-N), then
     take the minimum FDR seen at or below each score (rolling min from
-    the tail).
+    the tail).  When ``pi0 < 1``, the raw FDR is multiplied by ``pi0``
+    before the monotone accumulation (Storey 2002 correction).
     """
     scores = np.asarray(scores)
     is_decoy = np.asarray(is_decoy).astype(bool)
@@ -574,7 +784,7 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     n_target_cum = np.cumsum(~is_decoy[order]).astype(float)
     n_decoy_cum = np.cumsum(is_decoy[order]).astype(float)
 
-    fdr = (n_decoy_cum + 1.0) / np.maximum(n_target_cum, 1.0)
+    fdr = pi0 * (n_decoy_cum + 1.0) / np.maximum(n_target_cum, 1.0)
 
     # q-value: minimum FDR at or below this score (monotone from the tail)
     qval_ordered = np.minimum.accumulate(fdr[::-1])[::-1]
@@ -582,7 +792,53 @@ def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray) -> np.ndarray:
     # Map back to original order
     q_values = np.empty_like(qval_ordered)
     q_values[order] = qval_ordered
-    return q_values
+    return np.clip(q_values, 0.0, 1.0)
+
+
+def _estimate_pi0_storey(
+    scores: np.ndarray,
+    is_decoy: np.ndarray,
+    lambda_range: tuple[float, float] = (0.05, 0.95),
+    n_lambda: int = 20,
+) -> float:
+    """
+    Estimate the null fraction pi0 among targets using a Storey-style sweep.
+
+    Under the TDC null model, targets and decoys are drawn from the same
+    score distribution, so their empirical CDFs should be identical when
+    pi0 = 1.  True positives shift target scores upward, causing the target
+    CDF to fall below the decoy CDF at any threshold.  At each score
+    quantile lambda:
+
+        pi0(lambda) = (#{targets <= lambda} / n_targets)
+                    / (#{decoys  <= lambda} / n_decoys)
+
+    The minimum over all lambdas is returned, capped at 1.0.
+    Lambdas are quantiles of the combined target+decoy score distribution
+    spanning ``lambda_range``.
+    """
+    scores = np.asarray(scores)
+    is_decoy = np.asarray(is_decoy).astype(bool)
+    t_scores = scores[~is_decoy]
+    d_scores = scores[is_decoy]
+
+    if len(t_scores) == 0 or len(d_scores) == 0:
+        return 1.0
+
+    combined = np.concatenate([t_scores, d_scores])
+    lambda_vals = np.quantile(combined, np.linspace(lambda_range[0], lambda_range[1], n_lambda))
+
+    pi0_estimates = []
+    for lam in lambda_vals:
+        d_cdf = (d_scores <= lam).mean()
+        if d_cdf <= 0:
+            continue
+        t_cdf = (t_scores <= lam).mean()
+        pi0_estimates.append(t_cdf / d_cdf)
+
+    if not pi0_estimates:
+        return 1.0
+    return float(min(min(pi0_estimates), 1.0))
 
 
 def estimate_pep(
@@ -689,52 +945,34 @@ def _select_feature_winners(
     feature_col: str,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """
-    For each MALDI feature select the candidate with the highest round-1 score.
+    For each MALDI feature select the candidate with the highest round-1 score,
+    then drop features whose winner score falls below the 1st quartile of all
+    winner scores.  Filtered features receive ``is_tdc_winner=False`` and NaN
+    round-2 scores in the final result.
 
     Returns
     -------
     winner_pos : np.ndarray[int]
-        Integer positions (iloc-style) in ``features_df`` of the selected winners.
+        Integer positions (iloc-style) in ``features_df`` of the retained winners.
     winners_df : pd.DataFrame
-        Subset of ``features_df`` with one row per feature, reset index.
+        Subset of ``features_df`` with one row per retained feature, reset index.
     """
     score_series = pd.Series(scores, index=features_df.index)
     winner_idx = score_series.groupby(features_df[feature_col].values).idxmax().values
-    # Convert label-based index values to positional indices
     winner_pos = features_df.index.get_indexer(winner_idx)
     winners_df = features_df.loc[winner_idx].copy().reset_index(drop=True)
-    return winner_pos, winners_df
 
-
-def _filter_winners_by_r1_q(
-    winner_pos: np.ndarray,
-    winners_df: pd.DataFrame,
-    winner_r1_scores: np.ndarray,
-    r1_q_threshold: float = 0.80,
-) -> tuple[np.ndarray, pd.DataFrame]:
-    """
-    Drop winner rows whose R1 TDC q-value exceeds r1_q_threshold.
-
-    Dropped features remain in result_df as non-winners (is_tdc_winner=False,
-    q_value=NaN). Returns the unfiltered set with a warning if the threshold
-    would remove all winners or leave fewer than 20 targets.
-    """
-    is_decoy_w = winners_df["is_decoy"].values.astype(bool)
-    q1 = _tdc_qvalues(winner_r1_scores, is_decoy_w)
-    keep = q1 <= r1_q_threshold
-    n_kept_targets = int((keep & ~is_decoy_w).sum())
-    if n_kept_targets < 20:
-        logger.warning(
-            f"  R1 quality filter (q ≤ {r1_q_threshold:.2f}) would leave only "
-            f"{n_kept_targets} target winners — skipping filter to avoid R2 collapse"
+    winner_scores = scores[winner_pos]
+    q1 = np.quantile(winner_scores, 0.02)
+    keep = winner_scores >= q1
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        logger.info(
+            f"  R1 winner filter: dropped {n_dropped} features with score < Quantile(0.02) ({q1:.4f})"
         )
-        return winner_pos, winners_df
-    logger.info(
-        f"  R1 quality filter (q ≤ {r1_q_threshold:.2f}): "
-        f"{keep.sum()}/{len(keep)} winners kept "
-        f"({int((keep & is_decoy_w).sum())} decoys among kept)"
-    )
-    return winner_pos[keep], winners_df[keep].reset_index(drop=True)
+    winner_pos = winner_pos[keep]
+    winners_df = winners_df[keep].reset_index(drop=True)
+    return winner_pos, winners_df
 
 
 def rescore(
@@ -749,13 +987,16 @@ def rescore(
     msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
     train_fdr: float = 0.01,
-    winner_min_r1_q: float = 0.80,
     missed_cleavages: int = 2,
     min_length: int = 7,
     max_length: int = 30,
     model: str = "svm",
     init_ppm_threshold: float = 5.0,
     init_isotope_threshold: float = 0.7,
+    n_interaction_features: int = 5,
+    lda_r2_median_filter: bool = False,
+    storey_pi0: bool = False,
+    only_main_features: bool = False,
     lcms_proteins_path: str | None = None,
     lcms_peptides_path: str | None = None,
     lcms_psms_path: str | None = None,
@@ -812,10 +1053,6 @@ def rescore(
         Mass tolerance for MALDI-to-database matching in ppm.
     train_fdr
         FDR threshold for mokapot training (SVM backend only).
-    winner_min_r1_q
-        R1 TDC q-value threshold for winner selection. Only winners with
-        q ≤ winner_min_r1_q are passed to R2 training; features below this
-        receive is_tdc_winner=False and q_value=NaN in the output. Default 0.20.
     missed_cleavages
         Number of missed cleavages for in-silico digest.
     min_length
@@ -1176,7 +1413,13 @@ def rescore(
     # Intrinsic features that are actually present in the DataFrame.
     # Protein-level features are excluded by default (TDC correctness); opt-in
     # only when use_protein_level_features=True (--use-protein-level-feats).
-    _intrinsic_pool = MALDI_INTRINSIC_FEATURES + (
+    _base_features = MAIN_FEATURES if only_main_features else MALDI_INTRINSIC_FEATURES
+    if only_main_features:
+        logger.info(
+            f"  --only-main-features: using {len(MAIN_FEATURES)} representative features "
+            f"(vs {len(MALDI_INTRINSIC_FEATURES)} in the full set)"
+        )
+    _intrinsic_pool = _base_features + (
         PROTEIN_LEVEL_FEATURES if use_protein_level_features else []
     )
     intrinsic_present = [f for f in _intrinsic_pool if f in features_df.columns]
@@ -1213,7 +1456,7 @@ def rescore(
     psm_list = candidates_to_psm_list(features_df)
     if verbose:
         logger.debug(
-            f"Writing PSM list to {output_dir}/14_debug_psm_list.pkl for mokapot input"
+            f"Writing PSM list to {output_dir}/14_debug_psm_list.pkl for scorer input"
         )
         psm_list_df = psm_list.to_dataframe()
         psm_list_df.to_csv(f"{output_dir}/14_debug_psm_list.tsv", sep="\t", index=False)
@@ -1258,9 +1501,6 @@ def rescore(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
         )
-        winner_pos, winners_df = _filter_winners_by_r1_q(
-            winner_pos, winners_df, scores1[winner_pos], winner_min_r1_q
-        )
 
         # --- Round 2: retrain on winner subset ---
         psm_list_r2 = candidates_to_psm_list(winners_df)
@@ -1298,6 +1538,15 @@ def rescore(
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
+        # --- Optional Storey pi0 correction ---
+        if storey_pi0:
+            _pi0 = _estimate_pi0_storey(scores2, is_decoy_w)
+            logger.info(f"  Storey pi0 estimate: {_pi0:.4f}")
+            storey_q2 = _tdc_qvalues(scores2, is_decoy_w, pi0=_pi0)
+            storey_rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w, pi0=_pi0)
+        else:
+            _pi0 = None
+
         # --- Map back to full candidate table ---
         is_winner_full = np.zeros(len(features_df), dtype=bool)
         is_winner_full[winner_pos] = True
@@ -1334,13 +1583,24 @@ def rescore(
                 "reweighted_q_value": rw_q_full,
             }
         )
+        if storey_pi0 and _pi0 is not None:
+            storey_q_full = np.full(len(features_df), np.nan)
+            storey_q_full[winner_pos] = storey_q2
+            storey_rw_q_full = np.full(len(features_df), np.nan)
+            storey_rw_q_full[winner_pos] = storey_rw_q2
+            result_df["storey_q_value"] = storey_q_full
+            result_df["storey_reweighted_q_value"] = storey_rw_q_full
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
             n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
             n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
+            extra = ""
+            if storey_pi0 and _pi0 is not None:
+                n_st = (is_winner_full & ~is_decoy & (storey_q_full <= fdr_threshold)).sum()
+                extra = f", {n_st} (Storey π₀={_pi0:.3f})"
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
-                f"{n_rw} target features (reweighted)"
+                f"{n_rw} target features (reweighted){extra}"
             )
 
         if debug_dir is not None:
@@ -1353,7 +1613,7 @@ def rescore(
                 importances_r1=_imp_r1_svm, importances_r2=svm_imp_r2,
                 importance_names=svm_imp_names_r2 or _imp_names_r1_svm,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
-                gt_peptides=gt_peptides,
+                gt_peptides=gt_peptides, storey_pi0_val=_pi0,
             )
 
         return psm_list, result_df, feature_names
@@ -1378,9 +1638,6 @@ def rescore(
         logger.info(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
-        )
-        winner_pos, winners_df = _filter_winners_by_r1_q(
-            winner_pos, winners_df, scores1[winner_pos], winner_min_r1_q
         )
 
         # --- Round 2: retrain on winner subset ---
@@ -1414,6 +1671,15 @@ def rescore(
             + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+
+        # --- Optional Storey pi0 correction ---
+        if storey_pi0:
+            _pi0 = _estimate_pi0_storey(scores2, is_decoy_w)
+            logger.info(f"  Storey pi0 estimate: {_pi0:.4f}")
+            storey_q2 = _tdc_qvalues(scores2, is_decoy_w, pi0=_pi0)
+            storey_rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w, pi0=_pi0)
+        else:
+            _pi0 = None
 
         # --- Map back to full candidate table ---
         is_winner_full = np.zeros(len(features_df), dtype=bool)
@@ -1451,13 +1717,24 @@ def rescore(
                 "reweighted_q_value": rw_q_full,
             }
         )
+        if storey_pi0 and _pi0 is not None:
+            storey_q_full = np.full(len(features_df), np.nan)
+            storey_q_full[winner_pos] = storey_q2
+            storey_rw_q_full = np.full(len(features_df), np.nan)
+            storey_rw_q_full[winner_pos] = storey_rw_q2
+            result_df["storey_q_value"] = storey_q_full
+            result_df["storey_reweighted_q_value"] = storey_rw_q_full
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
             n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
             n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
+            extra = ""
+            if storey_pi0 and _pi0 is not None:
+                n_st = (is_winner_full & ~is_decoy & (storey_q_full <= fdr_threshold)).sum()
+                extra = f", {n_st} (Storey π₀={_pi0:.3f})"
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
-                f"{n_rw} target features (reweighted)"
+                f"{n_rw} target features (reweighted){extra}"
             )
 
         if debug_dir is not None:
@@ -1470,7 +1747,7 @@ def rescore(
                 importances_r1=_imp_r1_cb, importances_r2=cb_imp_r2,
                 importance_names=cb_imp_names_r2 or _imp_names_cb,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
-                gt_peptides=gt_peptides,
+                gt_peptides=gt_peptides, storey_pi0_val=_pi0,
             )
 
         return psm_list, result_df, feature_names
@@ -1502,9 +1779,6 @@ def rescore(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
         )
-        winner_pos, winners_df = _filter_winners_by_r1_q(
-            winner_pos, winners_df, scores1[winner_pos], winner_min_r1_q
-        )
 
         # --- Round 2: retrain on winner subset ---
         # Seed R2 from the top-20% of target winners by R1 score.  After winner
@@ -1523,11 +1797,26 @@ def rescore(
             f"(score ≥ {score_threshold:.3f}) → {r2_seed_mask.sum()} positives"
         )
 
+        # --- Feature selection for R2: drop below-median importance from R1 ---
+        if lda_r2_median_filter and _imp_r1_lda is not None and _imp_names_lda:
+            imp_abs = np.abs(_imp_r1_lda)
+            imp_median = np.median(imp_abs)
+            lda_r2_features = [f for f, a in zip(_imp_names_lda, imp_abs) if a >= imp_median]
+            logger.info(
+                f"  LDA R2: using {len(lda_r2_features)}/{len(_imp_names_lda)} features "
+                f"with |importance| ≥ median ({imp_median:.4f})"
+            )
+        else:
+            lda_r2_features = intrinsic_present
+
         scores2, lda_imp_r2, lda_imp_names_r2 = _rescore_lda(
             winners_df,
-            intrinsic_present,
+            lda_r2_features,
             init_ppm_threshold=init_ppm_threshold,
             seed_mask=r2_seed_mask,
+            n_interaction_features=n_interaction_features,
+            r1_importances=_imp_r1_lda,
+            r1_feature_names=_imp_names_lda,
         )
         # Output importances
         if verbose:
@@ -1560,6 +1849,15 @@ def rescore(
             + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+
+        # --- Optional Storey pi0 correction ---
+        if storey_pi0:
+            _pi0 = _estimate_pi0_storey(scores2, is_decoy_w)
+            logger.info(f"  Storey pi0 estimate: {_pi0:.4f}")
+            storey_q2 = _tdc_qvalues(scores2, is_decoy_w, pi0=_pi0)
+            storey_rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w, pi0=_pi0)
+        else:
+            _pi0 = None
 
         # --- Map back to full candidate table ---
         is_winner_full = np.zeros(len(features_df), dtype=bool)
@@ -1597,13 +1895,24 @@ def rescore(
                 "reweighted_q_value": rw_q_full,
             }
         )
+        if storey_pi0 and _pi0 is not None:
+            storey_q_full = np.full(len(features_df), np.nan)
+            storey_q_full[winner_pos] = storey_q2
+            storey_rw_q_full = np.full(len(features_df), np.nan)
+            storey_rw_q_full[winner_pos] = storey_rw_q2
+            result_df["storey_q_value"] = storey_q_full
+            result_df["storey_reweighted_q_value"] = storey_rw_q_full
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
             n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
             n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
+            extra = ""
+            if storey_pi0 and _pi0 is not None:
+                n_st = (is_winner_full & ~is_decoy & (storey_q_full <= fdr_threshold)).sum()
+                extra = f", {n_st} (Storey π₀={_pi0:.3f})"
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
-                f"{n_rw} target features (reweighted)"
+                f"{n_rw} target features (reweighted){extra}"
             )
 
         if debug_dir is not None:
@@ -1614,9 +1923,10 @@ def rescore(
                 maldi_envelopes=maldi_envelopes,
                 feature_names=intrinsic_present, model_name="lda",
                 importances_r1=_imp_r1_lda, importances_r2=lda_imp_r2,
-                importance_names=lda_imp_names_r2 or _imp_names_lda,
+                importance_names=_imp_names_lda,
+                importance_names_r2=lda_imp_names_r2 or _imp_names_lda,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
-                gt_peptides=gt_peptides,
+                gt_peptides=gt_peptides, storey_pi0_val=_pi0,
             )
 
         return psm_list, result_df, feature_names
@@ -1647,9 +1957,6 @@ def rescore(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
         )
-        winner_pos, winners_df = _filter_winners_by_r1_q(
-            winner_pos, winners_df, scores1[winner_pos], winner_min_r1_q
-        )
 
         # --- Round 2: retrain on winner subset ---
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
@@ -1661,9 +1968,20 @@ def rescore(
             f"(score ≥ {score_threshold:.3f}) → {r2_seed_mask.sum()} positives"
         )
 
+        if _imp_r1_qda is not None and _imp_names_qda:
+            imp_abs = np.abs(_imp_r1_qda)
+            imp_median = np.median(imp_abs)
+            r2_features = [f for f, a in zip(_imp_names_qda, imp_abs) if a >= imp_median]
+            logger.info(
+                f"  QDA R2: using {len(r2_features)}/{len(_imp_names_qda)} features "
+                f"with |importance| ≥ median ({imp_median:.4f})"
+            )
+        else:
+            r2_features = intrinsic_present
+
         scores2, pep_proba2, qda_imp_r2, qda_imp_names_r2 = _rescore_qda(
             winners_df,
-            intrinsic_present,
+            r2_features,
             init_ppm_threshold=init_ppm_threshold,
             seed_mask=r2_seed_mask,
         )
@@ -1694,6 +2012,15 @@ def rescore(
             + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
+
+        # --- Optional Storey pi0 correction ---
+        if storey_pi0:
+            _pi0 = _estimate_pi0_storey(scores2, is_decoy_w)
+            logger.info(f"  Storey pi0 estimate: {_pi0:.4f}")
+            storey_q2 = _tdc_qvalues(scores2, is_decoy_w, pi0=_pi0)
+            storey_rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w, pi0=_pi0)
+        else:
+            _pi0 = None
 
         # --- Map back to full candidate table ---
         is_winner_full = np.zeros(len(features_df), dtype=bool)
@@ -1731,13 +2058,24 @@ def rescore(
                 "reweighted_q_value": rw_q_full,
             }
         )
+        if storey_pi0 and _pi0 is not None:
+            storey_q_full = np.full(len(features_df), np.nan)
+            storey_q_full[winner_pos] = storey_q2
+            storey_rw_q_full = np.full(len(features_df), np.nan)
+            storey_rw_q_full[winner_pos] = storey_rw_q2
+            result_df["storey_q_value"] = storey_q_full
+            result_df["storey_reweighted_q_value"] = storey_rw_q_full
 
         for fdr_threshold in [0.01, 0.05, 0.10]:
             n = (is_winner_full & ~is_decoy & (q_full <= fdr_threshold)).sum()
             n_rw = (is_winner_full & ~is_decoy & (rw_q_full <= fdr_threshold)).sum()
+            extra = ""
+            if storey_pi0 and _pi0 is not None:
+                n_st = (is_winner_full & ~is_decoy & (storey_q_full <= fdr_threshold)).sum()
+                extra = f", {n_st} (Storey π₀={_pi0:.3f})"
             logger.info(
                 f"  At {fdr_threshold*100:.0f}% FDR: {n} target features (base), "
-                f"{n_rw} target features (reweighted)"
+                f"{n_rw} target features (reweighted){extra}"
             )
 
         if debug_dir is not None:
@@ -1749,9 +2087,10 @@ def rescore(
                 feature_names=intrinsic_present, model_name="qda",
                 pep_method="kde",
                 importances_r1=_imp_r1_qda, importances_r2=qda_imp_r2,
-                importance_names=qda_imp_names_r2 or _imp_names_qda,
+                importance_names=_imp_names_qda,
+                importance_names_r2=qda_imp_names_r2 or _imp_names_qda,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
-                gt_peptides=gt_peptides,
+                gt_peptides=gt_peptides, storey_pi0_val=_pi0,
             )
 
         return psm_list, result_df, feature_names
