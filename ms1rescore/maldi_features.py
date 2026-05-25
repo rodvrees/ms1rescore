@@ -603,6 +603,7 @@ def _finetune_and_predict(
     df: pd.DataFrame,
     n_cal: int,
     n_cal_rows: int,
+    im2deep_kwargs: dict | None = None,
 ) -> np.ndarray:
     """
     Fine-tune the IM2Deep model on single-candidate MALDI CCS observations
@@ -637,7 +638,17 @@ def _finetune_and_predict(
     with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as tmp:
         model_path = tmp.name
 
-    finetuned_model = _im2deep_finetune(cal_psm_list, model_save_path=model_path, epochs=40)
+    _ft_kwargs = im2deep_kwargs or {}
+    _ft_epochs = _ft_kwargs.get("finetune_epochs", 10)
+    _ft_batch_size = _ft_kwargs.get("finetune_batch_size", 64)
+    _ft_lr = _ft_kwargs.get("finetune_lr", 0.001)
+    finetuned_model = _im2deep_finetune(
+        cal_psm_list,
+        model_save_path=model_path,
+        epochs=_ft_epochs,
+        batch_size=_ft_batch_size,
+        learning_rate=_ft_lr,
+    )
     logger.info(
         f"  IM2Deep transfer learning on {n_cal} unique peptides "
         f"({n_cal_rows} single-candidate features): model saved to {model_path}"
@@ -658,6 +669,7 @@ def compute_im2deep_features(
     df: pd.DataFrame,
     observed_ccs_per_feature: dict | None = None,
     calibration_method: str = "linear",
+    im2deep_kwargs: dict | None = None,
 ) -> pd.DataFrame:
     """
     Compute IM2Deep CCS prediction features (B1–B6).
@@ -732,6 +744,7 @@ def compute_im2deep_features(
                     predicted_cal = _finetune_and_predict(
                         unique_seqs, cal_dedup, pred_dict, df,
                         n_cal, int(valid_cal.sum()),
+                        im2deep_kwargs=im2deep_kwargs,
                     )
                 else:
                     from im2deep.calibration import (

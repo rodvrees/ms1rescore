@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ms1rescore"
 version = "0.1.0"
 description = "Symmetric target-decoy rescoring for MALDI-MSI MS1 data"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.24",
     "pandas>=2.0",
@@ -17,6 +17,7 @@ dependencies = [
     "deeplc>=4.0.0a1",
     "scikit-learn>=1.3",
     "brain-isotopic-distribution>=1.5",
+    "cascade_config>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -34,3 +35,6 @@ testpaths = ["ms1rescore/tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools.package-data]
+ms1rescore = ["package_data/*.json"]

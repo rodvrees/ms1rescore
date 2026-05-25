@@ -1,0 +1,147 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "ms1rescore configuration schema",
+  "type": "object",
+  "required": ["ms1rescore"],
+  "additionalProperties": false,
+  "properties": {
+    "ms1rescore": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "config_file":    {"type": ["string", "null"]},
+        "output_dir":     {"type": ["string", "null"]},
+        "verbose":        {"type": ["boolean", "null"]},
+
+        "model": {
+          "type": ["string", "null"],
+          "enum": ["lda", "qda", "svm", "catboost", null]
+        },
+        "train_fdr":              {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "n_interaction_features": {"type": ["integer", "null"], "minimum": 0},
+        "storey_pi0":             {"type": ["boolean", "null"]},
+        "lda_r2_median_filter":   {"type": ["boolean", "null"]},
+        "only_main_features":     {"type": ["boolean", "null"]},
+        "use_protein_level_feats":{"type": ["boolean", "null"]},
+        "n_debug":                {"type": ["integer", "null"], "minimum": 0},
+        "debug_seed":             {"type": ["integer", "null"]},
+
+        "features_preset": {
+          "type": ["string", "null"],
+          "enum": ["all", "main", null]
+        },
+        "features_exclude": {
+          "type": ["array", "null"],
+          "items": {"type": "string"}
+        },
+
+        "pseudo_label_max_iter":  {"type": ["integer", "null"], "minimum": 1},
+        "pseudo_label_fdr":       {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "r1_seed_percentile":     {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "catboost_iterations":    {"type": ["integer", "null"], "minimum": 1},
+        "mokapot_max_iter":       {"type": ["integer", "null"], "minimum": 1},
+        "max_iter":               {"type": ["integer", "null"], "minimum": 1},
+        "init_ppm_threshold":     {"type": ["number", "null"], "minimum": 0},
+        "init_isotope_threshold": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+
+        "ppm_tolerance":   {"type": ["number", "null"], "minimum": 0},
+        "missed_cleavages":{"type": ["integer", "null"], "minimum": 0},
+        "min_length":      {"type": ["integer", "null"], "minimum": 1},
+        "max_length":      {"type": ["integer", "null"], "minimum": 1},
+
+        "decoy_method": {
+          "type": ["string", "null"],
+          "enum": ["shuffle", "mz_shift", "balanced_shuffle", null]
+        },
+        "mz_shift_delta_min":          {"type": ["number", "null"]},
+        "mz_shift_delta_max":          {"type": ["number", "null"]},
+        "mz_shift_snap_tolerance_ppm": {"type": ["number", "null"]},
+        "max_shuffle_rounds":          {"type": ["integer", "null"], "minimum": 1},
+        "decoy_target_ratio":          {"type": ["number", "null"], "minimum": 0},
+
+        "protein_fdr": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "peptide_fdr": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+
+        "lcms_id_format": {
+          "type": ["string", "null"],
+          "enum": ["percolator", "mzidentml", "psm_utils", "msf", null]
+        },
+
+        "fasta":            {"type": ["string", "null"]},
+        "extra_fasta":      {"type": ["string", "null"]},
+        "mzml":             {"type": ["array", "null"], "items": {"type": "string"}},
+        "maldi_npz":        {"type": ["string", "null"]},
+        "maldi_mzs":        {"type": ["string", "null"]},
+        "maldi_raw":        {"type": ["string", "null"]},
+        "maldi_imzml":      {"type": ["string", "null"]},
+        "maldi_d":          {"type": ["string", "null"]},
+        "feature_mzs":      {"type": ["string", "null"]},
+        "save_npz":         {"type": ["string", "null"]},
+        "save_spatial":     {"type": ["string", "null"]},
+        "spatial_features": {"type": ["string", "null"]},
+        "lcms_peptides":    {"type": ["string", "null"]},
+        "lcms_proteins":    {"type": ["string", "null"]},
+        "lcms_psms":        {"type": ["string", "null"]},
+        "msf":              {"type": ["string", "null"]},
+        "debug_gt":         {"type": ["string", "null"]},
+        "psm_utils_reader": {"type": ["string", "null"]},
+
+        "im2deep_calibration": {
+          "type": ["string", "null"],
+          "enum": ["linear", "spline", "finetune", null]
+        },
+        "im2deep": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "finetune_epochs":     {"type": "integer", "minimum": 1},
+            "finetune_batch_size": {"type": "integer", "minimum": 1},
+            "finetune_lr":         {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
+
+        "maldi_extraction": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "ppm_bin":                   {"type": "number", "exclusiveMinimum": 0},
+            "extraction_ppm":            {"type": "number", "exclusiveMinimum": 0},
+            "matching_ppm":              {"type": "number", "exclusiveMinimum": 0},
+            "min_fraction":              {"type": "number", "minimum": 0, "maximum": 1},
+            "peak_prominence":           {"type": "number", "minimum": 0},
+            "smoothing_window":          {"type": "integer", "minimum": 1},
+            "smoothing_polyorder":       {"type": "integer", "minimum": 0},
+            "interval_ppm_tolerance":    {"type": "number", "exclusiveMinimum": 0},
+            "min_interval_width_ppm":    {"type": "number", "minimum": 0},
+            "normalize_rms":             {"type": "boolean"},
+            "baseline_correction":       {"type": "boolean"},
+            "baseline_window_ppm":       {"type": "number", "exclusiveMinimum": 0},
+            "calibrant_mzs":             {"type": "array", "items": {"type": "number"}},
+            "calibrant_tol_ppm":         {"type": "number", "exclusiveMinimum": 0},
+            "deisotope":                 {"type": "boolean"},
+            "deisotope_error_ppm":       {"type": "number", "exclusiveMinimum": 0},
+            "deisotope_min_score":       {"type": "number"},
+            "deisotope_averagine":       {
+              "type": "string",
+              "enum": ["peptide", "glycopeptide", "glycan", "heparin"]
+            },
+            "deisotope_scorer":          {
+              "type": "string",
+              "enum": ["MSDeconVFitter", "PenalizedMSDeconVFitter"]
+            },
+            "deisotope_charge_range":    {
+              "type": "array",
+              "items": {"type": "integer", "minimum": 1},
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "filter_mass_defect":        {"type": "boolean"},
+            "mass_defect_halfwidth":     {"type": "number", "minimum": 0, "maximum": 0.5},
+            "picking_height":            {"type": "number", "minimum": 0, "maximum": 1},
+            "local_prominence_window_da":{"type": "number", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

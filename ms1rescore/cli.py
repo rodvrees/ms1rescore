@@ -246,6 +246,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--version", action="version", version=f"ms1rescore {__version__}"
     )
 
+    parser.add_argument(
+        "-c",
+        "--config-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "JSON or TOML configuration file. Values here override defaults but "
+            "are overridden by explicit CLI arguments."
+        ),
+    )
+
     # --- Required inputs ---
     req = parser.add_argument_group("required inputs")
     req.add_argument(
@@ -285,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mzml",
         "-l",
         required=False,
-        default=[],
+        default=None,
         action="append",
         metavar="PATH",
         help=(
@@ -298,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- MALDI input (mutually exclusive, one required) ---
     maldi_group = parser.add_argument_group("MALDI input (one required)")
-    maldi_exc = maldi_group.add_mutually_exclusive_group(required=True)
+    maldi_exc = maldi_group.add_mutually_exclusive_group(required=False)
     maldi_exc.add_argument(
         "--maldi-npz",
         metavar="PATH",
@@ -373,14 +384,14 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--ppm-bin",
         type=float,
-        default=5.0,
+        default=None,
         metavar="FLOAT",
         help="Peak-binning tolerance for feature detection (ppm). Default: 5.0.",
     )
     raw_grp.add_argument(
         "--extraction-ppm",
         type=float,
-        default=25.0,
+        default=None,
         metavar="FLOAT",
         help=(
             "m/z window for raw ion image extraction (ppm). Controls which raw "
@@ -391,7 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--matching-ppm",
         type=float,
-        default=20.0,
+        default=None,
         metavar="FLOAT",
         help=(
             "m/z window for candidate matching (ppm). Applied when linking "
@@ -401,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--min-fraction",
         type=float,
-        default=0.01,
+        default=None,
         metavar="FLOAT",
         help=(
             "Minimum fraction of pixels a peak must be detected in to be "
@@ -411,7 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--peak-prominence",
         type=float,
-        default=0.01,
+        default=None,
         metavar="FLOAT",
         help=(
             "Minimum peak prominence for SCiLS-style feature detection on profile "
@@ -423,7 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--smoothing-window",
         type=int,
-        default=11,
+        default=None,
         metavar="INT",
         help=(
             "Savitzky-Golay smoothing window length (odd integer ≥ 3) applied to "
@@ -434,7 +445,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--smoothing-polyorder",
         type=int,
-        default=2,
+        default=None,
         metavar="INT",
         help=(
             "Savitzky-Golay polynomial order for mean-spectrum smoothing "
@@ -444,7 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--interval-ppm-tolerance",
         type=float,
-        default=10.0,
+        default=None,
         metavar="FLOAT",
         help=(
             "Fallback interval half-width (ppm) used when no valley flanks a "
@@ -454,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--min-interval-width-ppm",
         type=float,
-        default=2.0,
+        default=None,
         metavar="FLOAT",
         help=(
             "Minimum interval full-width (ppm). Intervals narrower than this are "
@@ -481,7 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--baseline-window-ppm",
         type=float,
-        default=500.0,
+        default=None,
         metavar="FLOAT",
         help="Half-width (ppm) of the rolling-minimum baseline window. Default: 500.0.",
     )
@@ -501,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--calibrant-tol-ppm",
         type=float,
-        default=200.0,
+        default=None,
         metavar="FLOAT",
         help="Search window (ppm) for matching detected apices to calibrant m/z. Default: 200.0.",
     )
@@ -516,27 +527,27 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--deisotope-error-ppm",
         type=float,
-        default=15.0,
+        default=None,
         metavar="FLOAT",
         help="PPM error tolerance for isotope envelope fitting. Default: 15.0.",
     )
     raw_grp.add_argument(
         "--deisotope-min-score",
         type=float,
-        default=10.0,
+        default=None,
         metavar="FLOAT",
         help="Minimum MSDeconV fit score to accept an isotope envelope. Default: 10.0.",
     )
     raw_grp.add_argument(
         "--deisotope-averagine",
-        default="peptide",
+        default=None,
         choices=["peptide", "glycopeptide", "glycan", "heparin"],
         metavar="MODEL",
         help="Averagine model for isotope envelope prediction. Default: peptide.",
     )
     raw_grp.add_argument(
         "--deisotope-scorer",
-        default="MSDeconVFitter",
+        default=None,
         choices=["MSDeconVFitter", "PenalizedMSDeconVFitter"],
         metavar="SCORER",
         help="ms_deisotope scoring function. Default: MSDeconVFitter.",
@@ -545,7 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--deisotope-charge-range",
         type=int,
         nargs=2,
-        default=[1, 1],
+        default=None,
         metavar=("MIN", "MAX"),
         help="Charge range for deconvolution. Default: 1 1 (MALDI [M+H]+).",
     )
@@ -560,7 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--mass-defect-halfwidth",
         type=float,
-        default=0.5,
+        default=None,
         metavar="FLOAT",
         help=(
             "Half-width of the mass defect corridor. Default 0.5 passes all peaks "
@@ -570,7 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--picking-height",
         type=float,
-        default=0.75,
+        default=None,
         metavar="FLOAT",
         help=(
             "Picking height for apex m/z centroid refinement (mMass-style). "
@@ -583,7 +594,7 @@ def build_parser() -> argparse.ArgumentParser:
     raw_grp.add_argument(
         "--local-prominence-window-da",
         type=float,
-        default=0.0,
+        default=None,
         metavar="FLOAT",
         help=(
             "Half-width in Da of the sliding-window local maximum used as the "
@@ -620,7 +631,7 @@ def build_parser() -> argparse.ArgumentParser:
     cand.add_argument(
         "--ppm-tolerance",
         type=float,
-        default=20.0,
+        default=None,
         metavar="FLOAT",
         help="Mass tolerance for MALDI-to-database matching (ppm).",
     )
@@ -659,7 +670,7 @@ def build_parser() -> argparse.ArgumentParser:
     cand.add_argument(
         "--decoy-method",
         choices=("shuffle", "mz_shift", "balanced_shuffle"),
-        default="shuffle",
+        default=None,
         help=(
             "Decoy generation strategy. 'shuffle' (default): K/R-preserving protein "
             "shuffle, standard target-decoy competition. 'mz_shift': observation-space "
@@ -674,21 +685,21 @@ def build_parser() -> argparse.ArgumentParser:
     cand.add_argument(
         "--mz-shift-delta-min",
         type=float,
-        default=5.0,
+        default=None,
         metavar="FLOAT",
         help="mz_shift only: minimum absolute m/z shift in Da (default 5.0).",
     )
     cand.add_argument(
         "--mz-shift-delta-max",
         type=float,
-        default=20.0,
+        default=None,
         metavar="FLOAT",
         help="mz_shift only: maximum absolute m/z shift in Da (default 20.0).",
     )
     cand.add_argument(
         "--mz-shift-snap-tolerance-ppm",
         type=float,
-        default=50.0,
+        default=None,
         metavar="FLOAT",
         help=(
             "mz_shift only: maximum ppm distance between the shifted query and the "
@@ -699,7 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     cand.add_argument(
         "--max-shuffle-rounds",
         type=int,
-        default=50,
+        default=None,
         metavar="INT",
         help=(
             "balanced_shuffle only: maximum number of shuffle rounds to attempt when "
@@ -710,7 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
     cand.add_argument(
         "--decoy-target-ratio",
         type=float,
-        default=1.0,
+        default=None,
         metavar="FLOAT",
         help=(
             "balanced_shuffle only: target T:D candidate ratio (default 1.0). "
@@ -723,7 +734,7 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp.add_argument(
         "--model",
         choices=("svm", "catboost", "lda", "qda"),
-        default="lda",
+        default=None,
         help=(
             "Rescoring backend. 'lda': sklearn LDA with median imputation and "
             "standardization; no extra dependencies (default). 'qda': sklearn QDA "
@@ -736,28 +747,39 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp.add_argument(
         "--train-fdr",
         type=float,
-        default=0.01,
+        default=None,
         metavar="FLOAT",
-        help="FDR threshold for SVM model training.",
+        help=(
+            "FDR threshold used for: (1) SVM model training; "
+            "(2) best-feature seed initialization and pseudo-label iteration "
+            "threshold in LDA/QDA backends (default 0.01)."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--max-iter",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Maximum pseudo-label iterations for LDA/QDA backends (default 5).",
     )
     rescore_grp.add_argument(
         "--init-ppm-threshold",
         type=float,
-        default=2.0,
+        default=None,
         metavar="FLOAT",
         help="CatBoost only: ppm_error_abs threshold for the initial positive seed.",
     )
     rescore_grp.add_argument(
         "--init-isotope-threshold",
         type=float,
-        default=0.7,
+        default=None,
         metavar="FLOAT",
         help="CatBoost only: theo_isotope_cosine threshold for the initial positive seed.",
     )
     rescore_grp.add_argument(
         "--n-interaction-features",
         type=int,
-        default=5,
+        default=None,
         metavar="INT",
         help=(
             "LDA only: number of top-importance R1 features to expand with pairwise "
@@ -808,14 +830,14 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp.add_argument(
         "--n-debug",
         type=int,
-        default=15,
+        default=None,
         metavar="INT",
         help="Number of candidates to sample for per-candidate debug figures (default 50).",
     )
     rescore_grp.add_argument(
         "--debug-seed",
         type=int,
-        default=42,
+        default=None,
         metavar="INT",
         help="Random seed for debug candidate sampling (default 42).",
     )
@@ -830,6 +852,64 @@ def build_parser() -> argparse.ArgumentParser:
             "candidate set produce a 'not a candidate' placeholder figure. "
             "Ignored when --verbose is not set."
         ),
+    )
+    rescore_grp.add_argument(
+        "--features-preset",
+        choices=("all", "main"),
+        default=None,
+        help=(
+            "'all' (default): use MALDI_INTRINSIC_FEATURES. 'main': use the "
+            "reduced MAIN_FEATURES set. Overridden by --only-main-features."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--features-exclude",
+        nargs="*",
+        default=None,
+        metavar="FEATURE",
+        help=(
+            "Space-separated list of feature names to exclude from the ranker. "
+            "Example: --features-exclude peptide_length n_proline. "
+            "Useful for ablation studies without editing source code."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--pseudo-label-max-iter",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Maximum pseudo-label iterations for LDA/QDA/CatBoost (default 5).",
+    )
+    rescore_grp.add_argument(
+        "--pseudo-label-fdr",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="q-value threshold for pseudo-label expansion (default 0.10).",
+    )
+    rescore_grp.add_argument(
+        "--r1-seed-percentile",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Fallback top-N ppm percentile for initial positive seed when the "
+            "ppm/isotope threshold yields zero positives (default 0.10 = top 10%%)."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--catboost-iterations",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Number of boosting rounds for CatBoostRanker (default 500).",
+    )
+    rescore_grp.add_argument(
+        "--mokapot-max-iter",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Maximum iterations for mokapot PercolatorModel (default 10).",
     )
 
     # --- Strategy C: LC-MS/MS-guided candidates ---
@@ -864,7 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
     strat_c.add_argument(
         "--lcms-id-format",
         choices=("percolator", "mzidentml", "psm_utils", "msf"),
-        default="percolator",
+        default=None,
         help=(
             "Format of the LC-MS/MS identification files. "
             "Use 'msf' to read directly from a ProteomeDiscoverer .msf file "
@@ -885,14 +965,14 @@ def build_parser() -> argparse.ArgumentParser:
     strat_c.add_argument(
         "--protein-fdr",
         type=float,
-        default=0.01,
+        default=None,
         metavar="FLOAT",
         help="Protein FDR threshold for Strategy C protein filtering.",
     )
     strat_c.add_argument(
         "--peptide-fdr",
         type=float,
-        default=0.01,
+        default=None,
         metavar="FLOAT",
         help="Peptide FDR threshold for Strategy C candidate inclusion.",
     )
@@ -902,7 +982,7 @@ def build_parser() -> argparse.ArgumentParser:
     extras.add_argument(
         "--im2deep-calibration",
         choices=["linear", "spline", "finetune"],
-        default="linear",
+        default=None,
         metavar="METHOD",
         help=(
             "CCS calibration strategy for IM2Deep predictions when observed CCS "
@@ -931,7 +1011,7 @@ def build_parser() -> argparse.ArgumentParser:
     out_grp.add_argument(
         "--output-dir",
         "-o",
-        default=".",
+        default=None,
         metavar="PATH",
         help=(
             "Output directory. Written files: ms1rescore_psms.tsv (always), "
@@ -954,11 +1034,89 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    import json as _json
+    from argparse import Namespace as _Namespace
+    from pathlib import Path as _Path
+    from ms1rescore.config_parser import parse_configurations
+
     parser = build_parser()
     args = parser.parse_args()
 
+    # --- Cascade config: defaults → config file → CLI args ---
+    _config_sources = []
+    if getattr(args, "config_file", None):
+        _config_sources.append(args.config_file)
+
+    # store_true flags default to False (not None) in argparse, so we can't
+    # distinguish "not given" from "explicitly False". Convert False → None for
+    # these attrs so none_overrides_value=False lets the config file win when
+    # the flag is absent.
+    _STORE_TRUE_ATTRS = frozenset({
+        "verbose", "storey_pi0", "lda_r2_median_filter",
+        "only_main_features", "use_protein_level_feats",
+    })
+
+    # Only pass top-level configurable params (not file paths or extraction params)
+    # through the cascade; extraction params are handled separately below.
+    _TOP_LEVEL_ATTRS = (
+        "model", "train_fdr", "n_interaction_features", "storey_pi0",
+        "lda_r2_median_filter", "only_main_features", "use_protein_level_feats",
+        "n_debug", "debug_seed", "verbose", "output_dir",
+        "ppm_tolerance", "missed_cleavages", "min_length", "max_length",
+        "decoy_method", "mz_shift_delta_min", "mz_shift_delta_max",
+        "mz_shift_snap_tolerance_ppm", "max_shuffle_rounds", "decoy_target_ratio",
+        "protein_fdr", "peptide_fdr", "lcms_id_format",
+        "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
+        "features_preset", "features_exclude",
+        "pseudo_label_max_iter", "pseudo_label_fdr", "r1_seed_percentile",
+        "catboost_iterations", "mokapot_max_iter", "max_iter",
+        # file paths
+        "fasta", "extra_fasta", "mzml",
+        "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
+        "feature_mzs", "save_npz", "save_spatial", "spatial_features",
+        "lcms_peptides", "lcms_proteins", "lcms_psms", "msf",
+        "debug_gt", "psm_utils_reader",
+    )
+    _top_ns = _Namespace(**{
+        k: (True if getattr(args, k, False) else None)
+           if k in _STORE_TRUE_ATTRS
+           else getattr(args, k, None)
+        for k in _TOP_LEVEL_ATTRS
+    })
+    _config_sources.append(_top_ns)
+    _ms1cfg = parse_configurations(_config_sources)["ms1rescore"]
+
+    # Extraction params: config defaults overridden by non-None CLI args.
+    _extraction = dict(_ms1cfg.get("maldi_extraction", {}))
+    _EXTRACTION_SCALAR_ATTRS = (
+        "ppm_bin", "extraction_ppm", "matching_ppm", "min_fraction",
+        "peak_prominence", "smoothing_window", "smoothing_polyorder",
+        "interval_ppm_tolerance", "min_interval_width_ppm", "baseline_window_ppm",
+        "calibrant_tol_ppm", "deisotope_error_ppm", "deisotope_min_score",
+        "deisotope_averagine", "deisotope_scorer", "deisotope_charge_range",
+        "mass_defect_halfwidth", "picking_height", "local_prominence_window_da",
+        "calibrant_mzs",
+    )
+    for _attr in _EXTRACTION_SCALAR_ATTRS:
+        _val = getattr(args, _attr, None)
+        if _val is not None:
+            _extraction[_attr] = _val
+    for _bkey in ("normalize_rms", "baseline_correction", "deisotope", "filter_mass_defect"):
+        if getattr(args, _bkey, False):
+            _extraction[_bkey] = True
+
+    # Convenience aliases from config
+    output_dir = _ms1cfg["output_dir"]
+    verbose = _ms1cfg["verbose"]
+
+    # Write full merged config to output dir for reproducibility
+    os.makedirs(output_dir, exist_ok=True)
+    _Path(output_dir, ".full_config.json").write_text(
+        _json.dumps({"ms1rescore": _ms1cfg}, indent=2, default=str)
+    )
+
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stderr,
@@ -970,11 +1128,25 @@ def main() -> None:
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     # --- Validate argument combinations ---
-    if args.digest and not args.fasta:
+    if args.digest and not _ms1cfg.get("fasta"):
         parser.error("--digest requires --fasta.")
 
-    lcms_id_source = args.lcms_peptides if hasattr(args, "lcms_peptides") else None
-    if not args.digest and not lcms_id_source and not args.msf:
+    # Validate mutually exclusive MALDI inputs (argparse enforces CLI; check config too)
+    _maldi_input_keys = ("maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d")
+    _active_maldi = [k for k in _maldi_input_keys if _ms1cfg.get(k)]
+    if len(_active_maldi) > 1:
+        parser.error(
+            f"Only one MALDI input source may be specified; got: {_active_maldi}"
+        )
+    if len(_active_maldi) == 0:
+        parser.error(
+            "No MALDI input specified. Provide one of: --maldi-npz, --maldi-mzs, "
+            "--maldi-raw, --maldi-imzml, --maldi-d (or set the equivalent key in "
+            "the config file)."
+        )
+
+    lcms_id_source = _ms1cfg.get("lcms_peptides")
+    if not args.digest and not lcms_id_source and not _ms1cfg.get("msf"):
         parser.error(
             "No candidate source: provide --lcms-peptides (or --msf) to use "
             "LC-MS/MS identified peptides, or add --digest with --fasta to "
@@ -989,7 +1161,9 @@ def main() -> None:
     _mzs_intensities: np.ndarray | None = None  # per-feature intensity from SCiLS CSV
     _feature_mzs_intensities: np.ndarray | None = None  # set only in --maldi-raw/--maldi-d block
 
-    _maldi_raw_path: str | None = args.maldi_raw or args.maldi_d
+    _maldi_raw_path: str | None = _ms1cfg.get("maldi_raw") or _ms1cfg.get("maldi_d")
+    _maldi_imzml_path: str | None = _ms1cfg.get("maldi_imzml")
+    _feature_mzs_path: str | None = _ms1cfg.get("feature_mzs")
     if _maldi_raw_path:
         from ms1rescore.maldi_extraction import extract_maldi_data
 
@@ -999,13 +1173,13 @@ def main() -> None:
             "prior features only, not for feature selection."
         )
         precomputed_mzs = None
-        if args.feature_mzs:
-            logger.info(f"Loading pre-computed feature m/z values from {args.feature_mzs}")
+        if _feature_mzs_path:
+            logger.info(f"Loading pre-computed feature m/z values from {_feature_mzs_path}")
             try:
-                precomputed_mzs, _ccs_arr, _feature_mzs_intensities = _read_feature_mzs(args.feature_mzs)
+                precomputed_mzs, _ccs_arr, _feature_mzs_intensities = _read_feature_mzs(_feature_mzs_path)
                 _ccs_source_mzs = precomputed_mzs
             except Exception as exc:
-                logger.error(f"Could not read --feature-mzs {args.feature_mzs!r}: {exc}")
+                logger.error(f"Could not read --feature-mzs {_feature_mzs_path!r}: {exc}")
                 sys.exit(1)
             logger.info(f"  {len(precomputed_mzs)} features loaded (skipping detection)")
 
@@ -1013,41 +1187,41 @@ def main() -> None:
         maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes = extract_maldi_data(
             _maldi_raw_path,
             feature_mzs=precomputed_mzs,
-            ppm_bin=args.ppm_bin,
-            extraction_ppm=args.extraction_ppm,
-            matching_ppm=args.matching_ppm,
-            min_fraction=args.min_fraction,
-            peak_prominence=args.peak_prominence,
-            smoothing_window=args.smoothing_window,
-            smoothing_polyorder=args.smoothing_polyorder,
-            ppm_tolerance=args.interval_ppm_tolerance,
-            min_interval_width_ppm=args.min_interval_width_ppm,
-            normalize_rms=args.normalize_rms,
-            baseline_correction=args.baseline_correction,
-            baseline_window_ppm=args.baseline_window_ppm,
-            calibrant_mzs=args.calibrant_mzs,
-            calibrant_tol_ppm=args.calibrant_tol_ppm,
-            deisotope=args.deisotope,
-            deisotope_averagine=args.deisotope_averagine,
-            deisotope_scorer=args.deisotope_scorer,
-            deisotope_min_score=args.deisotope_min_score,
-            deisotope_charge_range=tuple(args.deisotope_charge_range),
-            deisotope_error_ppm=args.deisotope_error_ppm,
-            filter_mass_defect=args.filter_mass_defect,
-            mass_defect_halfwidth=args.mass_defect_halfwidth,
-            picking_height=args.picking_height,
-            local_prominence_window_da=args.local_prominence_window_da,
-            output_npz=args.save_npz,
-            output_spatial_tsv=args.save_spatial,
-            output_dir=args.output_dir,
-            verbose=args.verbose,
+            ppm_bin=_extraction["ppm_bin"],
+            extraction_ppm=_extraction["extraction_ppm"],
+            matching_ppm=_extraction["matching_ppm"],
+            min_fraction=_extraction["min_fraction"],
+            peak_prominence=_extraction["peak_prominence"],
+            smoothing_window=_extraction["smoothing_window"],
+            smoothing_polyorder=_extraction["smoothing_polyorder"],
+            ppm_tolerance=_extraction["interval_ppm_tolerance"],
+            min_interval_width_ppm=_extraction["min_interval_width_ppm"],
+            normalize_rms=_extraction["normalize_rms"],
+            baseline_correction=_extraction["baseline_correction"],
+            baseline_window_ppm=_extraction["baseline_window_ppm"],
+            calibrant_mzs=_extraction["calibrant_mzs"],
+            calibrant_tol_ppm=_extraction["calibrant_tol_ppm"],
+            deisotope=_extraction["deisotope"],
+            deisotope_averagine=_extraction["deisotope_averagine"],
+            deisotope_scorer=_extraction["deisotope_scorer"],
+            deisotope_min_score=_extraction["deisotope_min_score"],
+            deisotope_charge_range=tuple(_extraction["deisotope_charge_range"]),
+            deisotope_error_ppm=_extraction["deisotope_error_ppm"],
+            filter_mass_defect=_extraction["filter_mass_defect"],
+            mass_defect_halfwidth=_extraction["mass_defect_halfwidth"],
+            picking_height=_extraction["picking_height"],
+            local_prominence_window_da=_extraction["local_prominence_window_da"],
+            output_npz=_ms1cfg.get("save_npz"),
+            output_spatial_tsv=_ms1cfg.get("save_spatial"),
+            output_dir=output_dir,
+            verbose=verbose,
         )
         ion_image_mzs = maldi_mzs if ion_images is not None else None
         logger.info(
             f"  {len(maldi_mzs)} features extracted"
             + (f", ion image shape: {ion_images.shape[1:]}" if ion_images is not None else "")
         )
-    elif args.maldi_imzml:
+    elif _maldi_imzml_path:
         from ms1rescore.maldi_imzml import (
             SCiLSConfig, extract_scils_features,
             reconstruct_ion_images_from_intervals, build_envelopes_from_intervals,
@@ -1057,34 +1231,34 @@ def main() -> None:
             "MALDI features extracted from imzML data (SCiLS Lab-style interval extraction). "
             "Ion images reconstructed from interval intensity matrix."
         )
-        logger.info(f"Extracting MALDI features from imzML: {args.maldi_imzml}")
+        logger.info(f"Extracting MALDI features from imzML: {_maldi_imzml_path}")
         cfg = SCiLSConfig(
-            min_pixel_fraction=args.min_fraction,
-            peak_prominence=args.peak_prominence,
-            smoothing_window=args.smoothing_window,
-            smoothing_polyorder=args.smoothing_polyorder,
-            ppm_tolerance=args.interval_ppm_tolerance,
-            min_interval_width_ppm=args.min_interval_width_ppm,
-            normalize_rms=args.normalize_rms,
-            baseline_correction=args.baseline_correction,
-            baseline_window_ppm=args.baseline_window_ppm,
-            calibrant_mzs=args.calibrant_mzs or [],
-            calibrant_tol_ppm=args.calibrant_tol_ppm,
-            deisotope=args.deisotope,
-            deisotope_averagine=args.deisotope_averagine,
-            deisotope_scorer=args.deisotope_scorer,
-            deisotope_min_score=args.deisotope_min_score,
-            deisotope_charge_range=tuple(args.deisotope_charge_range),
-            deisotope_error_ppm=args.deisotope_error_ppm,
-            filter_mass_defect=args.filter_mass_defect,
-            mass_defect_halfwidth=args.mass_defect_halfwidth,
-            picking_height=args.picking_height,
-            local_prominence_window_da=args.local_prominence_window_da,
+            min_pixel_fraction=_extraction["min_fraction"],
+            peak_prominence=_extraction["peak_prominence"],
+            smoothing_window=_extraction["smoothing_window"],
+            smoothing_polyorder=_extraction["smoothing_polyorder"],
+            ppm_tolerance=_extraction["interval_ppm_tolerance"],
+            min_interval_width_ppm=_extraction["min_interval_width_ppm"],
+            normalize_rms=_extraction["normalize_rms"],
+            baseline_correction=_extraction["baseline_correction"],
+            baseline_window_ppm=_extraction["baseline_window_ppm"],
+            calibrant_mzs=_extraction.get("calibrant_mzs") or [],
+            calibrant_tol_ppm=_extraction["calibrant_tol_ppm"],
+            deisotope=_extraction["deisotope"],
+            deisotope_averagine=_extraction["deisotope_averagine"],
+            deisotope_scorer=_extraction["deisotope_scorer"],
+            deisotope_min_score=_extraction["deisotope_min_score"],
+            deisotope_charge_range=tuple(_extraction["deisotope_charge_range"]),
+            deisotope_error_ppm=_extraction["deisotope_error_ppm"],
+            filter_mass_defect=_extraction["filter_mass_defect"],
+            mass_defect_halfwidth=_extraction["mass_defect_halfwidth"],
+            picking_height=_extraction["picking_height"],
+            local_prominence_window_da=_extraction["local_prominence_window_da"],
         )
         intervals, intensity_matrix, pixel_coords, mean_1_over_k0 = extract_scils_features(
-            args.maldi_imzml,
+            _maldi_imzml_path,
             config=cfg,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
             visualize=False,
         )
         maldi_mzs = np.array([apex for _, _, apex in intervals])
@@ -1114,23 +1288,23 @@ def main() -> None:
             logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
     else:
         maldi_mzs, ion_images, ion_image_mzs, _ccs_arr, extra_ion_images, _mzs_intensities = _load_maldi(
-            args.maldi_npz, args.maldi_mzs
+            _ms1cfg.get("maldi_npz"), _ms1cfg.get("maldi_mzs")
         )
 
     # --- Optional spatial features (explicit file overrides extracted ones) ---
-    if args.spatial_features:
-        logger.info(f"Loading spatial features from {args.spatial_features}")
-        spatial_features = pd.read_csv(args.spatial_features, sep="\t")
+    if _ms1cfg.get("spatial_features"):
+        logger.info(f"Loading spatial features from {_ms1cfg['spatial_features']}")
+        spatial_features = pd.read_csv(_ms1cfg["spatial_features"], sep="\t")
 
     # --- Resolve Strategy C source ---
     # If --lcms-peptides is not given but --msf is, use the MSF for Strategy C.
-    lcms_peptides_path = args.lcms_peptides
-    lcms_id_format = args.lcms_id_format
-    if lcms_peptides_path is None and args.msf is not None:
-        lcms_peptides_path = args.msf
+    lcms_peptides_path = _ms1cfg.get("lcms_peptides")
+    lcms_id_format = _ms1cfg["lcms_id_format"]
+    if lcms_peptides_path is None and _ms1cfg.get("msf") is not None:
+        lcms_peptides_path = _ms1cfg.get("msf")
         lcms_id_format = "msf"
         logger.info(
-            f"No --lcms-peptides provided; using --msf ({args.msf}) "
+            f"No --lcms-peptides provided; using --msf ({_ms1cfg['msf']}) "
             f"as Strategy C ID source (format='msf')."
         )
 
@@ -1140,31 +1314,29 @@ def main() -> None:
 
         logger.info("Parsing LC-MS/MS identifications for Strategy C...")
         lcms_ids = parse_lcms_ids(
-            proteins_path=args.lcms_proteins,
+            proteins_path=_ms1cfg.get("lcms_proteins"),
             peptides_path=lcms_peptides_path,
-            psms_path=args.lcms_psms,
-            protein_fdr=args.protein_fdr,
-            peptide_fdr=args.peptide_fdr,
+            psms_path=_ms1cfg.get("lcms_psms"),
+            protein_fdr=_ms1cfg["protein_fdr"],
+            peptide_fdr=_ms1cfg["peptide_fdr"],
             format=lcms_id_format,
-            psm_utils_reader=args.psm_utils_reader,
+            psm_utils_reader=_ms1cfg.get("psm_utils_reader"),
         )
-        if args.verbose:
+        if verbose:
             logger.debug("Writing parsed LC-MS/MS IDs to debug_lcms_ids.tsv")
             lcms_ids.peptides.to_csv(
-                f"{args.output_dir}/4_debug_lcms_ids.tsv", sep="\t", index=False
+                f"{output_dir}/4_debug_lcms_ids.tsv", sep="\t", index=False
             )
         min_length, max_length, missed_cleavages = _infer_digest_params(
             lcms_ids,
-            missed_cleavages_override=args.missed_cleavages,
-            min_length_override=args.min_length,
-            max_length_override=args.max_length,
+            missed_cleavages_override=_ms1cfg["missed_cleavages"],
+            min_length_override=_ms1cfg["min_length"],
+            max_length_override=_ms1cfg["max_length"],
         )
     else:
-        min_length = args.min_length if args.min_length is not None else 7
-        max_length = args.max_length if args.max_length is not None else 30
-        missed_cleavages = (
-            args.missed_cleavages if args.missed_cleavages is not None else 2
-        )
+        min_length = _ms1cfg["min_length"]
+        max_length = _ms1cfg["max_length"]
+        missed_cleavages = _ms1cfg["missed_cleavages"]
 
     logger.info(
         f"Parameters extracted: min_length={min_length}, "
@@ -1228,73 +1400,83 @@ def main() -> None:
 
     # --- Load GT peptides (only relevant when debug is enabled) ---
     gt_peptides: list[str] | None = None
-    if args.verbose and args.debug_gt:
+    _debug_gt_path = _ms1cfg.get("debug_gt")
+    if verbose and _debug_gt_path:
         try:
-            with open(args.debug_gt) as _fh:
+            with open(_debug_gt_path) as _fh:
                 gt_peptides = [line.strip() for line in _fh if line.strip()]
-            logger.info("GT peptides loaded: %d from %s", len(gt_peptides), args.debug_gt)
+            logger.info("GT peptides loaded: %d from %s", len(gt_peptides), _debug_gt_path)
         except Exception as _exc:
-            logger.warning("Could not read --debug-gt file %s: %s", args.debug_gt, _exc)
+            logger.warning("Could not read --debug-gt file %s: %s", _debug_gt_path, _exc)
 
     # --- Run pipeline ---
     from ms1rescore.pipeline import rescore
 
     logger.info("Starting ms1rescore pipeline...")
     _, result_df, _ = rescore(
-        fasta_path=args.fasta,
+        fasta_path=_ms1cfg.get("fasta"),
         maldi_mzs=maldi_mzs,
-        mzml_paths=args.mzml,
+        mzml_paths=_ms1cfg.get("mzml") or [],
         ion_images=ion_images,
         ion_image_mzs=ion_image_mzs,
         extra_ion_images=extra_ion_images,
         spatial_features=spatial_features,
         maldi_envelopes=maldi_envelopes,
         msf_path=args.msf,
-        ppm_tolerance=args.ppm_tolerance,
-        train_fdr=args.train_fdr,
+        ppm_tolerance=_ms1cfg["ppm_tolerance"],
+        train_fdr=_ms1cfg["train_fdr"],
         missed_cleavages=missed_cleavages,
         min_length=min_length,
         max_length=max_length,
-        model=args.model,
-        init_ppm_threshold=args.init_ppm_threshold,
-        init_isotope_threshold=args.init_isotope_threshold,
-        n_interaction_features=args.n_interaction_features,
-        lda_r2_median_filter=args.lda_r2_median_filter,
-        storey_pi0=args.storey_pi0,
-        only_main_features=args.only_main_features,
-        lcms_proteins_path=args.lcms_proteins,
+        model=_ms1cfg["model"],
+        init_ppm_threshold=_ms1cfg["init_ppm_threshold"],
+        init_isotope_threshold=_ms1cfg["init_isotope_threshold"],
+        n_interaction_features=_ms1cfg["n_interaction_features"],
+        lda_r2_median_filter=_ms1cfg["lda_r2_median_filter"],
+        storey_pi0=_ms1cfg["storey_pi0"],
+        only_main_features=_ms1cfg["only_main_features"],
+        lcms_proteins_path=_ms1cfg.get("lcms_proteins"),
         lcms_peptides_path=lcms_peptides_path,
-        lcms_psms_path=args.lcms_psms,
+        lcms_psms_path=_ms1cfg.get("lcms_psms"),
         lcms_id_format=lcms_id_format,
-        psm_utils_reader=args.psm_utils_reader,
-        protein_fdr=args.protein_fdr,
-        peptide_fdr=args.peptide_fdr,
-        extra_fasta_path=args.extra_fasta,
-        use_protein_level_features=args.use_protein_level_feats,
-        verbose=args.verbose,
-        output_dir=args.output_dir,
-        debug_dir=os.path.join(args.output_dir, "debug") if args.verbose else None,
-        n_debug=args.n_debug,
-        debug_seed=args.debug_seed,
+        psm_utils_reader=_ms1cfg.get("psm_utils_reader"),
+        protein_fdr=_ms1cfg["protein_fdr"],
+        peptide_fdr=_ms1cfg["peptide_fdr"],
+        extra_fasta_path=_ms1cfg.get("extra_fasta"),
+        use_protein_level_features=_ms1cfg["use_protein_level_feats"],
+        verbose=verbose,
+        output_dir=output_dir,
+        debug_dir=os.path.join(output_dir, "debug") if verbose else None,
+        n_debug=_ms1cfg["n_debug"],
+        debug_seed=_ms1cfg["debug_seed"],
         observed_ccs_per_feature=observed_ccs,
-        im2deep_calibration=args.im2deep_calibration,
+        im2deep_calibration=_ms1cfg["im2deep_calibration"],
+        im2deep_kwargs=_ms1cfg.get("im2deep"),
         digest=args.digest,
         gt_peptides=gt_peptides,
         maldi_intensities=_mzs_intensities,
-        decoy_method=args.decoy_method,
-        mz_shift_delta_min=args.mz_shift_delta_min,
-        mz_shift_delta_max=args.mz_shift_delta_max,
-        mz_shift_snap_tolerance_ppm=args.mz_shift_snap_tolerance_ppm,
-        max_shuffle_rounds=args.max_shuffle_rounds,
-        target_ratio=args.decoy_target_ratio,
+        decoy_method=_ms1cfg["decoy_method"],
+        mz_shift_delta_min=_ms1cfg["mz_shift_delta_min"],
+        mz_shift_delta_max=_ms1cfg["mz_shift_delta_max"],
+        mz_shift_snap_tolerance_ppm=_ms1cfg["mz_shift_snap_tolerance_ppm"],
+        max_shuffle_rounds=_ms1cfg["max_shuffle_rounds"],
+        target_ratio=_ms1cfg["decoy_target_ratio"],
+        features_preset=_ms1cfg["features_preset"],
+        features_exclude=_ms1cfg["features_exclude"],
+        pseudo_label_max_iter=_ms1cfg["pseudo_label_max_iter"],
+        pseudo_label_fdr=_ms1cfg["pseudo_label_fdr"],
+        r1_seed_percentile=_ms1cfg["r1_seed_percentile"],
+        catboost_iterations=_ms1cfg["catboost_iterations"],
+        mokapot_max_iter=_ms1cfg["mokapot_max_iter"],
+        max_iter=_ms1cfg["max_iter"],
     )
 
     # --- Write results ---
-    logger.info(f"Writing results to {os.path.abspath(args.output_dir)}")
-    if args.verbose:
+    logger.info(f"Writing results to {os.path.abspath(output_dir)}")
+    if verbose:
         logger.debug("Writing complete result DataFrame to debug_result_df.tsv")
-        result_df.to_csv(f"{args.output_dir}/5_debug_result_df.tsv", sep="\t", index=False)
-    _write_results(result_df, args.output_dir)
+        result_df.to_csv(f"{output_dir}/5_debug_result_df.tsv", sep="\t", index=False)
+    _write_results(result_df, output_dir)
     if gt_peptides and "is_tdc_winner" in result_df.columns:
         gt_set = set(gt_peptides)
         winners = result_df[result_df["is_tdc_winner"] & ~result_df["is_decoy"].astype(bool)]

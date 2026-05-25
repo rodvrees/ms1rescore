@@ -855,8 +855,8 @@ def compute_all_lcms_evidence(
             "isotope_envelope_cosine": np.nan,
             "isotope_envelope_pearson": np.nan,
             "isotope_envelope_mse": np.nan,
-            "isotope_m1_ratio_diff": np.nan,
-            "isotope_m2_ratio_diff": np.nan,
+            "log_isotope_m1_ratio_diff": np.nan,
+            "log_isotope_m2_ratio_diff": np.nan,
             "isotope_n_matched": 0.0,
             "lcms_ms1_apex_rt_delta": np.nan,
             "lcms_ms1_frac_apex_signal": 0.0,
@@ -1036,12 +1036,12 @@ def compute_all_lcms_evidence(
                         a_n = a / a_sum if a_sum > 0 else a
                         result["isotope_envelope_mse"] = float(np.mean((a_n - b) ** 2))
                         if a[0] > 0 and b[0] > 0:
-                            result["isotope_m1_ratio_diff"] = float(
-                                abs(a[1] / a[0] - b[1] / b[0])
+                            result["log_isotope_m1_ratio_diff"] = float(
+                                np.log1p(abs(a[1] / a[0] - b[1] / b[0]))
                             )
                             if k >= 3:
-                                result["isotope_m2_ratio_diff"] = float(
-                                    abs(a[2] / a[0] - b[2] / b[0])
+                                result["log_isotope_m2_ratio_diff"] = float(
+                                    np.log1p(abs(a[2] / a[0] - b[2] / b[0]))
                                 )
 
         evidence[candidates_df.index[i]] = result

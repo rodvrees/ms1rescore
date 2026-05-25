@@ -747,6 +747,60 @@ With the human FASTA (~20K proteins) and 1,398 MALDI features at 20 ppm:
 
 ---
 
+## Configuration
+
+ms1rescore uses `cascade_config` for hierarchical configuration. Priority (lowest to highest):
+
+1. `ms1rescore/package_data/config_default.json` — all defaults
+2. User `--config-file` (JSON or TOML)
+3. CLI arguments (explicit only; `None` values never override lower-priority sources)
+
+The merged config is written to `<output_dir>/.full_config.json` at the start of every run for reproducibility.
+
+### Adding a new configurable parameter
+
+1. Add it to `package_data/config_default.json` with a default value.
+2. Add a schema entry in `package_data/config_schema.json` (type, constraints; use `["type", "null"]` to allow CLI `None` passthrough).
+3. Add `--param-name` to `cli.py` with `default=None`.
+4. Add it to the `rescore()` signature in `pipeline.py` with the same default as the JSON.
+5. Add a test in `tests/test_config_parser.py`.
+
+### Feature composition via config
+
+Instead of editing `feature_generator.py`, specify in a TOML config file:
+
+```toml
+[ms1rescore]
+features_preset = "all"          # "all" | "main"
+features_exclude = ["peptide_length", "adduct_colocalization_chca"]
+```
+
+`MALDI_INTRINSIC_FEATURES` and `MAIN_FEATURES` in `feature_generator.py` remain the canonical full definitions. Exclusions are applied at runtime in `pipeline.py`.
+
+### MALDI extraction parameters
+
+Raw extraction parameters (`ppm_bin`, smoothing, deisotoping, etc.) live under `[ms1rescore.maldi_extraction]` in TOML or `"maldi_extraction": {...}` in JSON. The default assumption is pre-extracted features (NPZ or m/z list); these parameters are only active when `--maldi-raw` or `--maldi-imzml` is used.
+
+Example config file:
+
+```toml
+[ms1rescore]
+model = "lda"
+decoy_method = "balanced_shuffle"
+features_exclude = ["peptide_length"]
+
+[ms1rescore.maldi_extraction]
+matching_ppm = 15.0
+deisotope = true
+deisotope_min_score = 12.0
+```
+
+```bash
+ms1rescore --config-file my_config.toml --maldi-raw data/MALDI.d --fasta human.fasta
+```
+
+---
+
 ## Reference pipeline command (amyloidosis dataset)
 
 Current default command used for development and benchmarking:

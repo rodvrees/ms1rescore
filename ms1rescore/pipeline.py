@@ -118,6 +118,7 @@ def _rescore_svm(
     features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
     train_fdr: float,
+    mokapot_max_iter: int = 10,
 ):
     """Run mokapot PercolatorModel on MALDI-intrinsic features.
 
@@ -134,7 +135,7 @@ def _rescore_svm(
     from ms2rescore.rescoring_engines.mokapot import convert_psm_list
 
     lin = convert_psm_list(psm_list, feature_names=intrinsic_feature_names)
-    model = PercolatorModel(train_fdr=train_fdr, max_iter=10)
+    model = PercolatorModel(train_fdr=train_fdr, max_iter=mokapot_max_iter)
     result = brew(lin, model=model, test_fdr=0.05)
     # brew always returns (confidence, [fold_models])
     conf_obj, trained_models = result if isinstance(result, tuple) else (result, [])
@@ -187,6 +188,10 @@ def _rescore_catboost(
     train_fdr: float,
     init_ppm_threshold: float,
     init_isotope_threshold: float,
+    pseudo_label_max_iter: int = 5,
+    pseudo_label_fdr: float = 0.10,
+    r1_seed_percentile: float = 0.10,
+    catboost_iterations: int = 500,
 ) -> np.ndarray:
     """
     Semi-supervised CatBoostRanker on MALDI-intrinsic features.
@@ -238,10 +243,10 @@ def _rescore_catboost(
     if n_seed == 0:
         logger.warning("  CatBoost: no seed positives — falling back to top-ppm init")
         ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
-        seed_mask = is_target & (ppm_col < ppm_col[is_target].quantile(0.10)).values
+        seed_mask = is_target & (ppm_col < ppm_col[is_target].quantile(r1_seed_percentile)).values
 
     catboost_params = dict(
-        iterations=500,
+        iterations=catboost_iterations,
         learning_rate=0.05,
         depth=6,
         loss_function="YetiRank",
@@ -253,7 +258,7 @@ def _rescore_catboost(
     prev_pos_size = -1
     model_cb = None
 
-    for iteration in range(5):
+    for iteration in range(pseudo_label_max_iter):
         # Build training set: pseudo-positives (label=1) + decoys (label=0)
         pos_idx = np.where(seed_mask)[0]
         dec_idx = np.where(is_decoy)[0]
@@ -276,8 +281,8 @@ def _rescore_catboost(
         # Provisional TDC q-values (higher score = better)
         q_values = _tdc_qvalues(scores, is_decoy)
 
-        # Expand pseudo-positives: all targets with q <= 0.1
-        new_seed = is_target & (q_values <= 0.1)
+        # Expand pseudo-positives: all targets with q <= pseudo_label_fdr
+        new_seed = is_target & (q_values <= pseudo_label_fdr)
         n_new = new_seed.sum()
 
         logger.info(
@@ -408,6 +413,96 @@ def _log_imputation_debug(
     )
 
 
+# Features excluded from best-feature initialization.  These measure amino acid
+# composition rather than spectral quality.  Since decoys are K/R-preserving
+# shuffles from the same protein pool, composition features can have arbitrary
+# systematic differences that produce spurious pseudo-positives.
+_BEST_FEAT_SKIP: frozenset[str] = frozenset({
+    # Basic sequence properties
+    "peptide_length", "n_missed_cleavages",
+    # Peptide composition (C-group)
+    "has_oxidized_met", "has_cys", "n_proline", "acidic_residue_density",
+    # Ionization / physicochemistry
+    "n_arginine", "n_basic_residues", "n_aromatic", "gravy_score", "charge_proxy",
+})
+
+
+def _find_best_feature_labels(
+    X: np.ndarray,
+    is_decoy: np.ndarray,
+    feature_names: list[str],
+    train_fdr: float,
+) -> tuple[np.ndarray, str, int] | None:
+    """
+    Mokapot-style best-feature seed initialization.
+
+    For each column in X and each ranking direction (ascending/descending),
+    run TDC q-value computation and count target candidates at q <= train_fdr.
+    Select the (feature, direction) pair that yields the most such targets.
+
+    Columns whose names appear in _BEST_FEAT_SKIP are excluded — they measure
+    amino acid composition rather than spectral quality and can yield spurious
+    pseudo-positives due to composition differences between shuffled decoys and
+    targets.
+
+    NaN values in X are filled with the column median before ranking.
+
+    Returns
+    -------
+    (labels, best_feature_name, n_passing) or None when n_passing == 0.
+        labels: int8 array aligned to X rows.
+            +1  — pseudo-positive: target at q <= train_fdr under best feature
+            -1  — pseudo-negative: decoy
+             0  — excluded: target at q > train_fdr
+    """
+    is_decoy = np.asarray(is_decoy, dtype=bool)
+
+    X_imp = X.copy()
+    for j in range(X_imp.shape[1]):
+        col = X_imp[:, j]
+        finite_vals = col[np.isfinite(col)]
+        fill = float(np.median(finite_vals)) if len(finite_vals) > 0 else 0.0
+        col[~np.isfinite(col)] = fill
+
+    # Sub-ULP random noise to break ties in argsort.  A stable sort on a feature
+    # with many tied values preserves the original DataFrame row order, which
+    # places targets before decoys (digest_fasta output order) and assigns them
+    # artificially low q-values.
+    rng = np.random.default_rng(0)
+    tiebreak = rng.uniform(-1e-9, 1e-9, X_imp.shape[0])
+
+    best_n = 0
+    best_j = -1
+    best_asc = True
+    best_q: np.ndarray | None = None
+
+    for j, fname in enumerate(feature_names):
+        if fname in _BEST_FEAT_SKIP:
+            continue
+        col = X_imp[:, j]
+        if col.std() == 0.0:
+            continue
+        for ascending in (True, False):
+            scores = (col if ascending else -col) + tiebreak
+            q = _tdc_qvalues(scores, is_decoy)
+            n_pass = int(((~is_decoy) & (q <= train_fdr)).sum())
+            if n_pass > best_n:
+                best_n = n_pass
+                best_j = j
+                best_asc = ascending
+                best_q = q.copy()
+
+    if best_n == 0 or best_j < 0:
+        return None
+
+    assert best_q is not None
+    labels = np.where(
+        is_decoy, np.int8(-1),
+        np.where(best_q <= train_fdr, np.int8(1), np.int8(0)),
+    ).astype(np.int8)
+    return labels, feature_names[best_j], best_n
+
+
 def _rescore_lda(
     features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
@@ -416,32 +511,33 @@ def _rescore_lda(
     n_interaction_features: int = 0,
     r1_importances: np.ndarray | None = None,
     r1_feature_names: list[str] | None = None,
+    train_fdr: float = 0.01,
+    max_iter: int = 5,
+    r1_seed_percentile: float = 0.10,
 ) -> np.ndarray:
     """
     Semi-supervised LDA on MALDI-intrinsic features.
 
     Pre-processing: ±inf replaced with NaN, then median imputation and
-    StandardScaler inside a sklearn Pipeline.  Pseudo-label iteration
-    follows the same structure as _rescore_catboost.
+    StandardScaler inside a sklearn Pipeline.
 
-    Seed positives: if ``seed_mask`` is provided (a boolean array aligned to
-    ``features_df``) it is used directly as the initial positive set — intended
-    for Round-2 where the seed is inherited from Round-1 q-values.  Otherwise
-    targets with ppm_error_abs < init_ppm_threshold OR n_candidates == 1 are
-    used.
+    Round-1 seed (when ``seed_mask`` is None): calls ``_find_best_feature_labels``
+    to pick the single feature that yields the most targets at q <= ``train_fdr``.
+    Falls back to ppm_error_abs < ``init_ppm_threshold`` OR n_candidates == 1
+    (with a top-percentile fallback) if no feature yields any targets.
 
-    When ``n_interaction_features > 0`` and R1 importances are supplied via
-    ``r1_importances`` / ``r1_feature_names``, the top-k features by
-    |importance| are selected and pairwise interaction terms
-    (PolynomialFeatures degree=2, interaction_only=True) are added after
-    StandardScaler.  Only the selected top-k columns (plus their cross-terms)
-    are passed to LDA; the rest are dropped for this round.
+    Round-2 seed (``seed_mask`` provided): the boolean mask is converted to the
+    same three-valued label scheme (+1 / -1 / 0) for the iteration loop.
 
-    Returns ``(scores, importances, feature_names_used)`` where ``scores`` is
-    a 1-D array (higher = more likely correct), ``importances`` is
-    ``coef_[0]`` (signed) from the final LDA pipeline (or None), and
-    ``feature_names_used`` is the aligned feature name list (expanded when
-    polynomial features are active).
+    Pseudo-label iteration (up to ``max_iter`` rounds): trains on +1 vs -1 rows
+    only (label-0 targets are excluded from training but still scored); updates
+    labels by running TDC q-values on the new scores and marking targets with
+    q <= ``train_fdr`` as +1. Stops when the positive count changes by < 1%.
+
+    When ``n_interaction_features > 0`` and R1 importances are supplied, the
+    top-k features are expanded with pairwise interaction terms before LDA.
+
+    Returns ``(scores, importances, feature_names_used)``.
     """
     from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
     from sklearn.impute import SimpleImputer
@@ -487,32 +583,59 @@ def _rescore_lda(
         X_fit = X
         expanded_names = None
 
-    if seed_mask is None:
-        ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
-        n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
-        seed_mask = (
-            is_target
-            & (
-                (ppm_col < init_ppm_threshold)
-                | (n_cand_col == 1)
-            )
-        ).values
-        if not seed_mask.any():
-            logger.warning("  LDA: no seed positives — falling back to top-ppm init")
-            seed_mask = (is_target & (ppm_col < ppm_col[is_target].quantile(0.10))).values
+    # --- Initial label assignment ---
+    n_init_positives: int | None = None  # for post-loop comparison (R1 only)
 
-    n_seed = seed_mask.sum()
+    if seed_mask is None:
+        bf_result = _find_best_feature_labels(X, is_decoy, present, train_fdr)
+        if bf_result is not None:
+            labels, _best_feat, _n_init = bf_result
+            n_init_positives = _n_init
+            logger.info(
+                f"  LDA: best-feature init on '{_best_feat}', "
+                f"{_n_init} targets at q≤{train_fdr:.3g}"
+            )
+        else:
+            logger.warning(
+                f"  LDA: best-feature init yielded 0 targets at q≤{train_fdr:.3g} "
+                "— falling back to ppm-based seeding"
+            )
+            ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+            n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
+            init_mask = (
+                is_target & ((ppm_col < init_ppm_threshold) | (n_cand_col == 1))
+            ).values
+            if not init_mask.any():
+                logger.warning("  LDA: no ppm-based seed positives — falling back to top-ppm init")
+                init_mask = (
+                    is_target & (ppm_col < ppm_col[is_target].quantile(r1_seed_percentile))
+                ).values
+            labels = np.where(
+                is_decoy, np.int8(-1), np.where(init_mask, np.int8(1), np.int8(0))
+            ).astype(np.int8)
+    else:
+        seed_arr = seed_mask.values if hasattr(seed_mask, "values") else np.asarray(seed_mask)
+        labels = np.where(
+            is_decoy, np.int8(-1), np.where(seed_arr, np.int8(1), np.int8(0))
+        ).astype(np.int8)
+
+    n_seed = int((labels == 1).sum())
     logger.info(f"  LDA: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
 
     scores = np.zeros(len(df))
     prev_pos_size = -1
     pipe = None
 
-    for iteration in range(5):
-        pos_idx = np.where(seed_mask)[0]
-        dec_idx = np.where(is_decoy)[0]
-        train_idx = np.concatenate([pos_idx, dec_idx])
-        y_train = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(dec_idx))])
+    for iteration in range(max_iter):
+        pos_idx = np.where(labels == 1)[0]
+        neg_idx = np.where(labels == -1)[0]  # all decoys
+
+        if len(pos_idx) == 0:
+            logger.warning(f"  LDA iter {iteration + 1}: no positives — stopping early")
+            break
+
+        train_idx = np.concatenate([pos_idx, neg_idx])
+        y_train = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(neg_idx))])
 
         if use_poly:
             pipe = Pipeline([
@@ -531,15 +654,18 @@ def _rescore_lda(
         scores = pipe.decision_function(X_fit).ravel()
 
         q_values = _tdc_qvalues(scores, is_decoy)
-        new_seed = is_target & (q_values <= 0.10)
-        n_new = new_seed.sum()
+        new_labels = np.where(
+            is_decoy, np.int8(-1),
+            np.where(q_values <= train_fdr, np.int8(1), np.int8(0)),
+        ).astype(np.int8)
+        n_new = int((new_labels == 1).sum())
 
         logger.info(
             f"  LDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size})"
         )
 
         if n_new == 0:
-            logger.warning("  LDA: no pseudo-positives at q≤0.10 — stopping early")
+            logger.warning(f"  LDA: no pseudo-positives at q≤{train_fdr:.3g} — stopping early")
             break
 
         change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
@@ -548,7 +674,13 @@ def _rescore_lda(
             break
 
         prev_pos_size = n_new
-        seed_mask = new_seed.values if hasattr(new_seed, "values") else new_seed
+        labels = new_labels
+
+    if n_init_positives is not None and 0 <= prev_pos_size < n_init_positives:
+        logger.warning(
+            f"  LDA: final iteration positives ({prev_pos_size}) < "
+            f"best-feature init ({n_init_positives}). Using model anyway."
+        )
 
     if pipe is not None:
         _log_imputation_debug(
@@ -577,16 +709,21 @@ def _rescore_qda(
     intrinsic_feature_names: list[str],
     init_ppm_threshold: float,
     seed_mask: np.ndarray | None = None,
+    train_fdr: float = 0.01,
+    max_iter: int = 5,
+    r1_seed_percentile: float = 0.10,
 ) -> np.ndarray:
     """
     Semi-supervised QDA on MALDI-intrinsic features.
 
-    Identical structure to _rescore_lda but uses QuadraticDiscriminantAnalysis
-    (reg_param=0.1) instead of LinearDiscriminantAnalysis.  Importances are
-    estimated as |mu_pos - mu_neg| / pooled_std in the standardized feature
-    space (a t-statistic proxy based on the final pseudo-label assignments).
+    Same seed and iteration logic as _rescore_lda (three-valued labels,
+    best-feature initialization, ppm fallback), but uses
+    QuadraticDiscriminantAnalysis(reg_param=0.5).
 
-    Returns ``(scores, importances, feature_names_used)``.
+    Importances are estimated as (mu_pos - mu_neg) / pooled_std in the
+    standardized feature space (a t-statistic proxy).
+
+    Returns ``(scores, pep_proba, importances, feature_names_used)``.
     """
     from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
     from sklearn.impute import SimpleImputer
@@ -602,82 +739,81 @@ def _rescore_qda(
     is_decoy = df["is_decoy"].values.astype(bool)
     is_target = ~is_decoy
 
-    if seed_mask is None:
-        ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
-        n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
-        seed_mask = (
-            is_target
-            & (
-                (ppm_col < init_ppm_threshold)
-                | (n_cand_col == 1)
-            )
-        ).values
-        if not seed_mask.any():
-            logger.warning("  QDA: no seed positives — falling back to top-ppm init")
-            seed_mask = (is_target & (ppm_col < ppm_col[is_target].quantile(0.10))).values
+    # --- Initial label assignment ---
+    n_init_positives: int | None = None
 
-    n_seed = seed_mask.sum()
+    if seed_mask is None:
+        bf_result = _find_best_feature_labels(X, is_decoy, present, train_fdr)
+        if bf_result is not None:
+            labels, _best_feat, _n_init = bf_result
+            n_init_positives = _n_init
+            logger.info(
+                f"  QDA: best-feature init on '{_best_feat}', "
+                f"{_n_init} targets at q≤{train_fdr:.3g}"
+            )
+        else:
+            logger.warning(
+                f"  QDA: best-feature init yielded 0 targets at q≤{train_fdr:.3g} "
+                "— falling back to ppm-based seeding"
+            )
+            ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
+            n_cand_col = df.get("n_candidates", pd.Series(np.inf, index=df.index))
+            init_mask = (
+                is_target & ((ppm_col < init_ppm_threshold) | (n_cand_col == 1))
+            ).values
+            if not init_mask.any():
+                logger.warning("  QDA: no ppm-based seed positives — falling back to top-ppm init")
+                init_mask = (
+                    is_target & (ppm_col < ppm_col[is_target].quantile(r1_seed_percentile))
+                ).values
+            labels = np.where(
+                is_decoy, np.int8(-1), np.where(init_mask, np.int8(1), np.int8(0))
+            ).astype(np.int8)
+    else:
+        seed_arr = seed_mask.values if hasattr(seed_mask, "values") else np.asarray(seed_mask)
+        labels = np.where(
+            is_decoy, np.int8(-1), np.where(seed_arr, np.int8(1), np.int8(0))
+        ).astype(np.int8)
+
+    n_seed = int((labels == 1).sum())
     logger.info(f"  QDA: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
 
     scores = np.zeros(len(df))
     prev_pos_size = -1
     pipe = None
 
-    for iteration in range(5):
-        pos_idx = np.where(seed_mask)[0]
-        dec_idx = np.where(is_decoy)[0]
-        train_idx = np.concatenate([pos_idx, dec_idx])
-        y_train = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(dec_idx))])
+    for iteration in range(max_iter):
+        pos_idx = np.where(labels == 1)[0]
+        neg_idx = np.where(labels == -1)[0]  # all decoys
 
-        n_train = len(train_idx)
-        n_feat = len(present)
-        # adaptive_reg = max(0.1, 1.0 - n_train / (2 * n_feat ** 2))\
-        adaptive_reg = 0.5
+        if len(pos_idx) == 0:
+            logger.warning(f"  QDA iter {iteration + 1}: no positives — stopping early")
+            break
+
+        train_idx = np.concatenate([pos_idx, neg_idx])
+        y_train = np.concatenate([np.ones(len(pos_idx)), np.zeros(len(neg_idx))])
 
         pipe = Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            ("qda", QuadraticDiscriminantAnalysis(reg_param=adaptive_reg)),
+            ("qda", QuadraticDiscriminantAnalysis(reg_param=0.5)),
         ])
-        
         pipe.fit(X[train_idx], y_train)
         scores = pipe.decision_function(X).ravel()
 
         q_values = _tdc_qvalues(scores, is_decoy)
-        new_seed = is_target & (q_values <= 0.10)
-        if hasattr(new_seed, "values"):
-            new_seed = new_seed.values
+        new_labels = np.where(
+            is_decoy, np.int8(-1),
+            np.where(q_values <= train_fdr, np.int8(1), np.int8(0)),
+        ).astype(np.int8)
+        n_new = int((new_labels == 1).sum())
 
-        prev_seed_mask = seed_mask.copy()
-
-        # Monotonic growth: union with current seed, then prune bottom 50% by
-        # score, but never shrink below the initial seed count (n_seed).
-        union_mask = seed_mask | new_seed
-        union_idx = np.where(union_mask)[0]
-        union_scores = scores[union_idx]
-        prune_threshold = np.percentile(union_scores, 50)
-        pruned_mask = union_mask.copy()
-        below = union_idx[union_scores < prune_threshold]
-        if len(union_idx) - len(below) >= n_seed:
-            pruned_mask[below] = False
-        seed_mask = pruned_mask
-
-        prev_seed_count = int(prev_seed_mask.sum())
-        changed_count = int(np.count_nonzero(prev_seed_mask != seed_mask))
-        changed_pct = 100.0 * changed_count / max(prev_seed_count, 1)
-        logger.debug(
-            f"  QDA iter {iteration + 1}: seed_positives changed by {changed_pct:.2f}% "
-            f"({changed_count}/{prev_seed_count}; {prev_seed_count} -> {int(seed_mask.sum())})"
-        )
-
-        n_new = int(seed_mask.sum())
         logger.info(
-            f"  QDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size}), "
-            f"reg_param = {adaptive_reg:.4f} (n_train={n_train}, n_feat={n_feat})"
+            f"  QDA iter {iteration + 1}: pseudo-positives = {n_new} (prev = {prev_pos_size})"
         )
 
         if n_new == 0:
-            logger.warning("  QDA: no pseudo-positives at q≤0.10 — stopping early")
+            logger.warning(f"  QDA: no pseudo-positives at q≤{train_fdr:.3g} — stopping early")
             break
 
         change = abs(n_new - prev_pos_size) / max(prev_pos_size, 1)
@@ -686,6 +822,13 @@ def _rescore_qda(
             break
 
         prev_pos_size = n_new
+        labels = new_labels
+
+    if n_init_positives is not None and 0 <= prev_pos_size < n_init_positives:
+        logger.warning(
+            f"  QDA: final iteration positives ({prev_pos_size}) < "
+            f"best-feature init ({n_init_positives}). Using model anyway."
+        )
 
     if pipe is not None:
         _log_imputation_debug("QDA", X, present, is_target, is_decoy, pipe)
@@ -694,24 +837,21 @@ def _rescore_qda(
     importances = None
     if pipe is not None:
         try:
-            # P(decoy | features): y=0 is decoy, so classes_[0] == 0 → column 0
-            # predict_proba returns columns ordered by pipe["qda"].classes_
             classes = list(pipe["qda"].classes_)
             decoy_col = classes.index(0)
             pep_proba = np.clip(pipe.predict_proba(X)[:, decoy_col], 0.0, 1.0)
         except Exception:
             pass
         try:
-            # t-statistic proxy in standardized space: |mu_pos - mu_neg| / pooled_std
             X_t = pipe[:-1].transform(X)
-            pos_mask = seed_mask.astype(bool)
+            pos_mask = (labels == 1)
             neg_mask = is_decoy
             mu_pos = np.nanmean(X_t[pos_mask], axis=0)
             mu_neg = np.nanmean(X_t[neg_mask], axis=0)
             std_pos = np.nanstd(X_t[pos_mask], axis=0)
             std_neg = np.nanstd(X_t[neg_mask], axis=0)
-            n_pos = pos_mask.sum()
-            n_neg = neg_mask.sum()
+            n_pos = int(pos_mask.sum())
+            n_neg = int(neg_mask.sum())
             pooled = np.sqrt(
                 ((n_pos - 1) * std_pos**2 + (n_neg - 1) * std_neg**2)
                 / max(n_pos + n_neg - 2, 1)
@@ -1022,6 +1162,15 @@ def rescore(
     mz_shift_snap_tolerance_ppm: float = 50.0,
     max_shuffle_rounds: int = 50,
     target_ratio: float = 1.0,
+    features_preset: str = "all",
+    features_exclude: list[str] | None = None,
+    pseudo_label_max_iter: int = 5,
+    pseudo_label_fdr: float = 0.10,
+    r1_seed_percentile: float = 0.10,
+    catboost_iterations: int = 500,
+    mokapot_max_iter: int = 10,
+    max_iter: int = 5,
+    im2deep_kwargs: dict | None = None,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -1029,86 +1178,199 @@ def rescore(
     Parameters
     ----------
     fasta_path
-        Path to protein FASTA file (forward sequences only, decoys are generated).
+        Path to protein FASTA file (forward sequences only; decoys are generated
+        internally via K/R-preserving protein-level shuffle).
     maldi_mzs
         Array of MALDI feature m/z values.
     mzml_paths
-        Paths to LC-MS/MS mzML files.
+        Paths to LC-MS/MS mzML or Bruker .d files. Pass an empty list to skip
+        all LC-MS/MS evidence steps.
     spatial_features
-        Pre-computed spatial features DataFrame (optional).
+        Pre-computed spatial features DataFrame aligned with ``maldi_mzs``
+        (optional; produced by ``compute_spatial_features`` or loaded from NPZ).
     ion_images
-        MALDI ion images array, shape (n_features, height, width) (optional).
+        MALDI ion images, shape ``(n_features, H, W)`` float32 (optional).
+        Required for colocalization and spatial autocorrelation features.
     ion_image_mzs
-        m/z values corresponding to ion_images (optional).
+        m/z values aligned with ``ion_images`` rows (optional).
     extra_ion_images
-        Dict of ion images at shifted m/z positions for colocalization features (optional).
-        Keys: "m1", "m2" (isotopologue) and "na", "k", "chca" (adduct).
-        Each value has shape (n_features, H, W). When provided, Pearson r is computed
-        directly without requiring these peaks to be in the feature list.
+        Dict of ion images extracted at shifted m/z positions for direct
+        colocalization without requiring those peaks in the feature list
+        (optional). Keys: ``"m1"``, ``"m2"`` (M+1/M+2 isotopologues) and
+        ``"na"``, ``"k"``, ``"chca"`` (adducts). Each value is
+        ``(n_features, H, W)`` float32. Populated by the Bruker .d extraction
+        path; ``None`` when loading from imzML or pre-computed NPZ.
     maldi_envelopes
-        MALDI isotope envelopes: feature_mz → normalized envelope (optional).
+        MALDI isotope envelopes: ``feature_mz → normalized envelope array``
+        (optional). When provided, MALDI vs LC-MS/MS envelope comparison
+        features are computed (``isotope_envelope_cosine`` etc.).
     msf_path
-        Path to PD .msf file for DeepLC finetuning (optional).
+        Path to ProteomeDiscoverer .msf SQLite file for DeepLC fine-tuning
+        (optional). When ``None``, DeepLC is used without fine-tuning unless
+        ``lcms_peptides_path`` is provided with RT information.
     ppm_tolerance
-        Mass tolerance for MALDI-to-database matching in ppm.
+        Mass accuracy window for matching in-silico peptides to MALDI features
+        (ppm). Also used as the extraction window for LC-MS/MS MS1 signal.
     train_fdr
-        FDR threshold for mokapot training (SVM backend only).
+        FDR threshold for: (1) pseudo-label iteration in LDA/QDA (best-feature
+        init and per-iteration label update); (2) mokapot SVM training target.
+    max_iter
+        Maximum pseudo-label iterations for LDA/QDA backends.
     missed_cleavages
-        Number of missed cleavages for in-silico digest.
+        Maximum missed cleavages for tryptic in-silico digest.
     min_length
-        Minimum peptide length.
+        Minimum peptide length (residues) after digest filtering.
     max_length
-        Maximum peptide length.
+        Maximum peptide length (residues) after digest filtering.
     model
-        Rescoring backend: "svm" (mokapot PercolatorModel), "catboost"
-        (semi-supervised CatBoostRanker), "lda" (LinearDiscriminantAnalysis,
-        default), or "qda" (QuadraticDiscriminantAnalysis, reg_param=0.1).
-        All backends use only MALDI_INTRINSIC_FEATURES for training. LC-MS/MS
-        evidence is applied as an additive log-prior after scoring.
+        Rescoring backend: ``"lda"`` (default, LinearDiscriminantAnalysis),
+        ``"qda"`` (QuadraticDiscriminantAnalysis, reg_param=0.1), ``"svm"``
+        (mokapot PercolatorModel), or ``"catboost"`` (semi-supervised
+        CatBoostRanker). All backends train on ``MALDI_INTRINSIC_FEATURES``
+        only; LC-MS/MS evidence is applied as an additive log-prior after
+        scoring.
     init_ppm_threshold
-        CatBoost only: ppm_error_abs threshold for the initial positive seed.
+        ppm_error_abs threshold for the initial positive seed in the LDA/QDA
+        ppm-fallback path and in the CatBoost backend. Targets below this
+        threshold (or with ``n_candidates == 1``) are used as the initial
+        pseudo-positive set when best-feature initialization yields no passing
+        targets.
     init_isotope_threshold
-        CatBoost only: theo_isotope_cosine threshold for the initial positive seed.
+        CatBoost only: ``theo_isotope_cosine`` threshold for the initial seed
+        (used in conjunction with ``init_ppm_threshold``).
+    n_interaction_features
+        Number of top LDA R1 features to expand into pairwise polynomial
+        interactions for R2. Set to 0 to disable interaction features.
+    lda_r2_median_filter
+        If True, apply a per-feature median filter to LDA R2 scores before
+        FDR computation (experimental).
+    storey_pi0
+        If True, estimate the null fraction pi0 via the Storey method and apply
+        it as a correction factor in ``_tdc_qvalues``.
+    only_main_features
+        If True, restrict the feature set to ``MAIN_FEATURES`` (one
+        representative per collinear group, ~19 features) instead of the full
+        ``MALDI_INTRINSIC_FEATURES`` (~46 features).
     lcms_peptides_path
         Path to LC-MS/MS peptide-level identification results. When provided,
-        activates Strategy C: candidates are generated by digesting only the
-        identified proteins plus the directly identified peptide sequences,
-        instead of the full FASTA (Strategy A). Falls back to Strategy A if no
+        activates Strategy C: candidates are generated by digesting only
+        identified proteins plus directly identified peptides, instead of the
+        full FASTA (Strategy A). Falls back to Strategy A with a warning if no
         identified proteins are found in the FASTA.
     lcms_proteins_path
-        Path to LC-MS/MS protein-level results (optional; proteins derived from
-        peptide table when omitted).
+        Path to LC-MS/MS protein-level results (optional; proteins are derived
+        from the peptide table when omitted).
     lcms_psms_path
-        Path to LC-MS/MS PSM-level file for RT/intensity aggregation (optional).
+        Path to LC-MS/MS PSM-level file for RT and intensity aggregation
+        (optional; improves DeepLC calibration when available).
     lcms_id_format
         Format of the LC-MS/MS ID files: ``"percolator"`` (default),
         ``"mzidentml"``, ``"psm_utils"``, or ``"msf"``.
     psm_utils_reader
-        Only used when ``lcms_id_format="psm_utils"``. Either a psm_utils
-        filetype key (e.g. ``"maxquant"``) or a reader class name (e.g.
-        ``"MSMSReader"``). When ``None``, auto-detection from filename is
-        attempted.
+        Reader hint for ``lcms_id_format="psm_utils"``. A psm_utils filetype
+        key (e.g. ``"maxquant"``) or reader class name. When ``None``,
+        auto-detection from the filename is attempted.
     protein_fdr
-        Protein FDR threshold for Strategy C protein filtering (default 0.01).
+        Protein-level FDR threshold for Strategy C protein filtering.
     peptide_fdr
-        Peptide FDR threshold for Strategy C candidate inclusion (default 0.01).
+        Peptide-level FDR threshold for Strategy C candidate inclusion.
     extra_fasta_path
-        Optional additional FASTA file (e.g. contaminants). All proteins in
-        this file are always included in the candidate database regardless of
-        LC-MS/MS identification status. Works with both Strategy A and C.
-        Proteins already present in the primary database (by peptide sequence)
-        are not duplicated; when the same peptide appears in both, the entry
-        from the primary digest (with any LC-MS/MS evidence) is kept.
+        Additional FASTA file (e.g. contaminants database). All proteins in
+        this file are always included regardless of LC-MS/MS identification
+        status. Peptides already present in the primary digest are not
+        duplicated; when the same sequence appears in both, the primary entry
+        (with LC-MS/MS evidence) is kept.
+    use_protein_level_features
+        If True, include ``PROTEIN_LEVEL_FEATURES`` (protein consistency and
+        colocalization) in the ranker feature set. Disabled by default because
+        decoys inherit inflated protein-level counts from co-occurring target
+        proteins, breaking TDC null-model symmetry.
+    verbose
+        If True, write per-step debug files to ``output_dir`` and enable DEBUG
+        logging.
+    output_dir
+        Directory for all output files (TSV results, debug files, config dump).
+    debug_dir
+        Directory for additional debug figures (optional; set by CLI when
+        ``--verbose`` is active).
+    n_debug
+        Number of MALDI features to include in debug visualizations.
+    debug_seed
+        Random seed for debug feature sampling.
+    observed_ccs_per_feature
+        Dict mapping ``feature_idx → observed CCS`` value from MALDI ion
+        mobility data (optional). When provided, enables IM2Deep CCS
+        comparison features (B-group).
+    im2deep_calibration
+        IM2Deep CCS calibration mode: ``"linear"``, ``"spline"``, or
+        ``"finetune"`` (transfer-learning fine-tune on single-candidate
+        MALDI observations).
+    im2deep_kwargs
+        Dict of keyword arguments forwarded to ``im2deep.core.finetune`` when
+        ``im2deep_calibration="finetune"``. Recognized keys:
+        ``finetune_epochs`` (default 10), ``finetune_batch_size`` (default 64),
+        ``finetune_lr`` (default 0.001).
+    digest
+        If True (and ``lcms_peptides_path`` is set), also digest identified
+        proteins from ``fasta_path`` for additional candidates (Strategy C
+        digest sub-mode). Ignored when ``lcms_peptides_path`` is ``None``.
+    gt_peptides
+        List of ground-truth peptide sequences for diagnostic FDR reporting
+        (optional; not used in scoring).
+    maldi_intensities
+        Raw MALDI intensity array aligned with ``maldi_mzs`` (optional).
+        Used when spatial features are not pre-computed.
+    decoy_method
+        Decoy generation strategy: ``"shuffle"`` (K/R-preserving protein
+        shuffle), ``"mz_shift"`` (observation-space m/z-shift decoys), or
+        ``"balanced_shuffle"`` (iterative shuffle with MALDI-match filtering
+        to achieve ~1:1 target:decoy ratio).
+    mz_shift_delta_min
+        Minimum mass shift (Da) for ``decoy_method="mz_shift"``.
+    mz_shift_delta_max
+        Maximum mass shift (Da) for ``decoy_method="mz_shift"``.
+    mz_shift_snap_tolerance_ppm
+        Collision-check tolerance (ppm) for ``decoy_method="mz_shift"``:
+        shifts landing within this window of any target m/z are resampled.
+    max_shuffle_rounds
+        Maximum shuffle rounds for ``decoy_method="balanced_shuffle"``.
+    target_ratio
+        Target decoy:target ratio for ``decoy_method="balanced_shuffle"``
+        (default 1.0 = 1:1).
+    features_preset
+        Feature set preset: ``"all"`` (full ``MALDI_INTRINSIC_FEATURES``) or
+        ``"main"`` (``MAIN_FEATURES``, one representative per collinear group).
+    features_exclude
+        List of feature names to remove from the ranker feature set after
+        applying the preset. Applied before optional protein-level feature
+        inclusion.
+    pseudo_label_max_iter
+        Legacy parameter (SVM/CatBoost): maximum pseudo-label iterations.
+        Use ``max_iter`` for LDA/QDA.
+    pseudo_label_fdr
+        Legacy parameter (SVM/CatBoost): FDR threshold for pseudo-label
+        iteration. Use ``train_fdr`` for LDA/QDA.
+    r1_seed_percentile
+        Percentile of target R1 scores used as the seed threshold for R2
+        (LDA/QDA). The top ``(1 - r1_seed_percentile)`` fraction of target
+        winners by R1 score are used as pseudo-positives for R2 training.
+    catboost_iterations
+        Number of boosting iterations for ``model="catboost"``.
+    mokapot_max_iter
+        Maximum mokapot training iterations for ``model="svm"``.
 
     Returns
     -------
     tuple of (psm_list, result_df, feature_names)
-        ``result_df`` is a DataFrame with columns ``[peptide, feature_idx,
-        is_decoy, svm_score/catboost_score, q_value, reweighted_score,
-        reweighted_q_value]`` for both backends. ``q_value`` and
-        ``reweighted_q_value`` are TDC q-values computed over all candidates
-        (targets + decoys). The reweighted values incorporate the LC-MS/MS
-        prior multiplicative weight.
+        ``psm_list`` is a ``PSMList`` of all candidates with rescoring features
+        populated. ``result_df`` is a DataFrame with per-candidate columns
+        including ``peptide``, ``protein``, ``feature_mz``, ``feature_idx``,
+        ``is_decoy``, backend-specific round-1 and round-2 scores
+        (e.g. ``lda_score_r1``, ``lda_score_r2``), ``q_value``,
+        ``is_tdc_winner``, ``reweighted_score``, and ``reweighted_q_value``.
+        Round-2 scores and q-values are ``NaN`` for non-winners. The reweighted
+        scores and q-values incorporate the LC-MS/MS and spatial log-priors.
+        ``feature_names`` is the list of ranker features used.
     """
     # --- Step 1: Candidate generation ---
     # Default (digest=False): use only LC-MS/MS identified peptides as candidates.
@@ -1398,6 +1660,7 @@ def rescore(
         maldi_envelopes=maldi_envelopes,
         observed_ccs_per_feature=observed_ccs_per_feature,
         im2deep_calibration=im2deep_calibration,
+        im2deep_kwargs=im2deep_kwargs,
     )
     if verbose:
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
@@ -1413,15 +1676,21 @@ def rescore(
     # Intrinsic features that are actually present in the DataFrame.
     # Protein-level features are excluded by default (TDC correctness); opt-in
     # only when use_protein_level_features=True (--use-protein-level-feats).
-    _base_features = MAIN_FEATURES if only_main_features else MALDI_INTRINSIC_FEATURES
-    if only_main_features:
+    # Feature list assembly: preset → exclude → optional protein-level
+    _use_main = only_main_features or features_preset == "main"
+    _base_features = MAIN_FEATURES if _use_main else MALDI_INTRINSIC_FEATURES
+    if _use_main:
         logger.info(
-            f"  --only-main-features: using {len(MAIN_FEATURES)} representative features "
+            f"  Features preset 'main': using {len(MAIN_FEATURES)} representative features "
             f"(vs {len(MALDI_INTRINSIC_FEATURES)} in the full set)"
         )
-    _intrinsic_pool = _base_features + (
-        PROTEIN_LEVEL_FEATURES if use_protein_level_features else []
-    )
+    _exclude_set = set(features_exclude or [])
+    if _exclude_set:
+        logger.info(f"  Excluding {len(_exclude_set)} features: {sorted(_exclude_set)}")
+    _intrinsic_pool = [
+        f for f in _base_features + (PROTEIN_LEVEL_FEATURES if use_protein_level_features else [])
+        if f not in _exclude_set
+    ]
     intrinsic_present = [f for f in _intrinsic_pool if f in features_df.columns]
     lcms_present = [f for f in LCMS_PRIOR_FEATURES if f in features_df.columns]
     spatial_present = [f for f in SPATIAL_PRIOR_FEATURES if f in features_df.columns]
@@ -1483,7 +1752,8 @@ def rescore(
                 f"{output_dir}/14_debug_psm_list_after_intrinsic.tsv", sep="\t", index=False
             )
         conf_obj_r1, scores1, _imp_r1_svm, _imp_names_r1_svm = _rescore_svm(
-            psm_list, features_df, intrinsic_present, train_fdr
+            psm_list, features_df, intrinsic_present, train_fdr,
+            mokapot_max_iter=mokapot_max_iter,
         )
         if verbose:
             with open(f"{output_dir}/15_debug_mokapot_conf_r1.pkl", "wb") as f:
@@ -1506,7 +1776,8 @@ def rescore(
         psm_list_r2 = candidates_to_psm_list(winners_df)
         populate_psm_features(psm_list_r2, winners_df, intrinsic_present)
         conf_obj_r2, scores2, svm_imp_r2, svm_imp_names_r2 = _rescore_svm(
-            psm_list_r2, winners_df, intrinsic_present, train_fdr
+            psm_list_r2, winners_df, intrinsic_present, train_fdr,
+            mokapot_max_iter=mokapot_max_iter,
         )
         if verbose:
             with open(f"{output_dir}/15_debug_mokapot_conf_r2.pkl", "wb") as f:
@@ -1628,6 +1899,10 @@ def rescore(
             train_fdr=train_fdr,
             init_ppm_threshold=init_ppm_threshold,
             init_isotope_threshold=init_isotope_threshold,
+            pseudo_label_max_iter=pseudo_label_max_iter,
+            pseudo_label_fdr=pseudo_label_fdr,
+            r1_seed_percentile=r1_seed_percentile,
+            catboost_iterations=catboost_iterations,
         )
         if verbose:
             with open(f"{output_dir}/16_debug_catboost_scores_r1.pkl", "wb") as f:
@@ -1647,6 +1922,10 @@ def rescore(
             train_fdr=train_fdr,
             init_ppm_threshold=init_ppm_threshold,
             init_isotope_threshold=init_isotope_threshold,
+            pseudo_label_max_iter=pseudo_label_max_iter,
+            pseudo_label_fdr=pseudo_label_fdr,
+            r1_seed_percentile=r1_seed_percentile,
+            catboost_iterations=catboost_iterations,
         )
         if verbose:
             with open(f"{output_dir}/16_debug_catboost_scores_r2.pkl", "wb") as f:
@@ -1760,6 +2039,9 @@ def rescore(
             features_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
+            train_fdr=train_fdr,
+            max_iter=max_iter,
+            r1_seed_percentile=r1_seed_percentile,
         )
         # Output importances
         if verbose:
@@ -1817,6 +2099,9 @@ def rescore(
             n_interaction_features=n_interaction_features,
             r1_importances=_imp_r1_lda,
             r1_feature_names=_imp_names_lda,
+            train_fdr=train_fdr,
+            max_iter=max_iter,
+            r1_seed_percentile=r1_seed_percentile,
         )
         # Output importances
         if verbose:
@@ -1939,6 +2224,9 @@ def rescore(
             features_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
+            train_fdr=train_fdr,
+            max_iter=max_iter,
+            r1_seed_percentile=r1_seed_percentile,
         )
         if verbose:
             with open(f"{output_dir}/17_debug_qda_scores_r1.pkl", "wb") as f:
@@ -1984,6 +2272,9 @@ def rescore(
             r2_features,
             init_ppm_threshold=init_ppm_threshold,
             seed_mask=r2_seed_mask,
+            train_fdr=train_fdr,
+            max_iter=max_iter,
+            r1_seed_percentile=r1_seed_percentile,
         )
         if verbose:
             with open(f"{output_dir}/17_debug_qda_scores_r2.pkl", "wb") as f:

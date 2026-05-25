@@ -11,3 +11,5 @@
     2. Check some stuff that looks off:
         - RT residual
         - log_mean_intensity and spatial_entropy
+
+IM2Deep finetuning - is it using best val_loss as early stopping?

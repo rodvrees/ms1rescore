@@ -9,7 +9,9 @@ import logging
 
 import numpy as np
 import pandas as pd
-from psm_utils import PSM, PSMList, Peptidoform
+from psm_utils.psm import PSM
+from psm_utils.psm_list import PSMList
+from psm_utils.peptidoform import Peptidoform
 
 from ms1rescore.maldi_features import (
     _pearson_r_matrix,
@@ -128,8 +130,8 @@ _LCMS_MZML_FEATURES = [
 # These go in the ranker (MALDI_INTRINSIC_FEATURES), not the prior.
 _LCMS_RANKER_FROM_EVIDENCE = [
     "isotope_envelope_cosine",
-    "isotope_m1_ratio_diff",
-    "isotope_m2_ratio_diff",
+    "log_isotope_m1_ratio_diff",
+    "log_isotope_m2_ratio_diff",
 ]
 
 _LCMS_ID_FEATURES = [
@@ -211,8 +213,8 @@ FEATURE_NAN_FILL: dict[str, float | str] = {
     # No LC-MS/MS envelope match → treat as worst cosine similarity
     "isotope_envelope_cosine": 0.0,
     # No LC-MS/MS envelope match → worst ratio deviation (largest observed error)
-    "isotope_m1_ratio_diff": "col_max",
-    "isotope_m2_ratio_diff": "col_max",
+    "log_isotope_m1_ratio_diff": "col_max",
+    "log_isotope_m2_ratio_diff": "col_max",
 }
 
 # ---------------------------------------------------------------------------
@@ -304,6 +306,7 @@ def compute_all_features(
     maldi_mzs: np.ndarray | None = None,
     observed_ccs_per_feature: dict | None = None,
     im2deep_calibration: str = "linear",
+    im2deep_kwargs: dict | None = None,
 ) -> pd.DataFrame:
     """
     Compute all features on the candidate DataFrame.
@@ -414,6 +417,7 @@ def compute_all_features(
             df,
             observed_ccs_per_feature=observed_ccs_per_feature,
             calibration_method=im2deep_calibration,
+            im2deep_kwargs=im2deep_kwargs,
         )
 
     # --- Spatial (optional) ---

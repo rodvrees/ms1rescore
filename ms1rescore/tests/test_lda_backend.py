@@ -151,6 +151,8 @@ class TestTwoPass:
         non_winner_r2 = result_df.loc[~result_df["is_tdc_winner"], "lda_score_r2"]
         assert non_winner_r2.isna().all()
 
-    def test_one_winner_per_feature(self, result_df):
+    def test_at_most_one_winner_per_feature(self, result_df):
+        # _select_feature_winners may drop low-confidence features (Q0.02 filter),
+        # so counts can be 0 or 1 but never > 1.
         counts = result_df.groupby("feature_idx")["is_tdc_winner"].sum()
-        assert counts.eq(1).all()
+        assert counts.le(1).all()
