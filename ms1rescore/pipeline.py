@@ -704,8 +704,10 @@ def _rescore_lda(
                 ("scaler", StandardScaler()),
                 ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
             ])
-        pipe.fit(X_fit[train_idx], y_train)
-        scores = pipe.decision_function(X_fit).ravel()
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=1, user_api="blas"):
+            pipe.fit(X_fit[train_idx], y_train)
+            scores = pipe.decision_function(X_fit).ravel()
 
         q_values = _tdc_qvalues(scores, is_decoy)
         new_labels = np.where(
@@ -855,8 +857,10 @@ def _rescore_qda(
             ("scaler", StandardScaler()),
             ("qda", QuadraticDiscriminantAnalysis(reg_param=0.5)),
         ])
-        pipe.fit(X[train_idx], y_train)
-        scores = pipe.decision_function(X).ravel()
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=1, user_api="blas"):
+            pipe.fit(X[train_idx], y_train)
+            scores = pipe.decision_function(X).ravel()
 
         q_values = _tdc_qvalues(scores, is_decoy)
         new_labels = np.where(

@@ -880,7 +880,7 @@ def digest_identified_proteins(
 
         # Find novel confirmed peptides not reachable from the protein digest
         existing_targets = set(df.loc[target_mask, "peptide"].values)
-        novel_seqs = [s for s in confirmed_seqs if s not in existing_targets]
+        novel_seqs = sorted(s for s in confirmed_seqs if s not in existing_targets)
 
         if novel_seqs:
             logger.info(
