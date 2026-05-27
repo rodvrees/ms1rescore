@@ -185,3 +185,35 @@ class TestGenerateBalancedShuffleCandidates:
             for prot in decoys["protein"].unique():
                 assert prot.startswith("DECOY_"), f"Unexpected decoy protein name: {prot}"
                 assert "_r" in prot, f"Round index missing from protein name: {prot}"
+
+    def test_length_distribution_stratified(self, tmp_path):
+        """Per-length T:D ratio should be close to 1 for all fillable bins."""
+        result = self._run(tmp_path, max_shuffle_rounds=30, target_ratio=1.0)
+        targets = result[~result["is_decoy"]]
+        decoys = result[result["is_decoy"]]
+        if len(targets) == 0 or len(decoys) == 0:
+            pytest.skip("Not enough candidates for length stratification test")
+
+        tgt_len = targets["peptide"].str.len().value_counts()
+        dec_len = decoys["peptide"].str.len().value_counts()
+
+        # For lengths that DO have decoys, the per-length ratio must be close to 1.
+        for length in dec_len.index:
+            t = tgt_len.get(length, 0)
+            d = dec_len[length]
+            if t == 0:
+                continue  # decoys at lengths without targets should not exist
+            ratio = d / t
+            assert 0.7 <= ratio <= 1.3, (
+                f"Length {length}: T={t}, D={d}, ratio={ratio:.3f} — "
+                "length-stratified sampling produced an unbalanced bin"
+            )
+
+        # No decoys should appear at lengths not present in targets.
+        extra_lengths = set(dec_len.index) - set(tgt_len.index)
+        assert not extra_lengths, f"Decoys at lengths absent from targets: {extra_lengths}"
+
+        # Mean length of decoys should be within 1 residue of target mean.
+        assert abs(targets["peptide"].str.len().mean() - decoys["peptide"].str.len().mean()) < 1.0, (
+            "Mean peptide length differs by more than 1 residue between targets and decoys"
+        )

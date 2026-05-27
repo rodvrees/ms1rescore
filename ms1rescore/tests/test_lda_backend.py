@@ -4,7 +4,12 @@ import pandas as pd
 import pytest
 
 from ms1rescore.feature_generator import LDA_FEATURES, MALDI_INTRINSIC_FEATURES
-from ms1rescore.pipeline import _rescore_lda, _select_feature_winners, _tdc_qvalues
+from ms1rescore.pipeline import (
+    _find_best_feature_labels,
+    _rescore_lda,
+    _select_feature_winners,
+    _tdc_qvalues,
+)
 
 _EXPECTED_RESULT_COLS = [
     "peptide", "protein", "feature_mz", "feature_idx", "is_decoy",
@@ -156,3 +161,110 @@ class TestTwoPass:
         # so counts can be 0 or 1 but never > 1.
         counts = result_df.groupby("feature_idx")["is_tdc_winner"].sum()
         assert counts.le(1).all()
+
+
+# ---------------------------------------------------------------------------
+# _find_best_feature_labels — pairwise combination fallback
+# ---------------------------------------------------------------------------
+
+
+class TestFindBestFeatureLabels:
+    """
+    Verify that _find_best_feature_labels takes the pairwise path when no
+    single feature yields enough pseudo-positives.
+
+    Construction:
+    - 100 targets, 100 decoys.
+    - Feature A: first 50 targets score 3, second 50 targets score 0, decoys ~0.
+    - Feature B: first 50 targets score 0, second 50 targets score 3, decoys ~0.
+    - A and B are complementary, so each individually scores the first
+      or second target half at the top but cannot reach q <= 0.01 (FDR at
+      top-50 = 1/50 = 0.02 > 0.01 → 0 targets pass individually).
+    - A + B gives all 100 targets a score of ~3 and all decoys a score of
+      ~0. After StandardScaler, sorted descending the top 100 items are all
+      targets → FDR at rank 100 = 1/100 = 0.01 → 100 targets at q <= 0.01.
+    """
+
+    @pytest.fixture(scope="class")
+    def xy(self):
+        n = 100
+        rng = np.random.default_rng(7)
+        is_decoy = np.array([False] * n + [True] * n)
+
+        feat_a = np.concatenate([
+            np.full(n // 2, 3.0),
+            np.full(n // 2, 0.0),
+            rng.uniform(-0.1, 0.1, n),
+        ])
+        feat_b = np.concatenate([
+            np.full(n // 2, 0.0),
+            np.full(n // 2, 3.0),
+            rng.uniform(-0.1, 0.1, n),
+        ])
+        X = np.column_stack([feat_a, feat_b])
+        feature_names = ["signal_a", "signal_b"]
+        return X, is_decoy, feature_names
+
+    def test_single_feature_gives_zero_positives(self, xy):
+        X, is_decoy, feature_names = xy
+        # Verify the premise: neither single feature reaches q <= 0.01.
+        from ms1rescore.pipeline import _tdc_qvalues
+
+        rng = np.random.default_rng(0)
+        tiebreak = rng.uniform(-1e-9, 1e-9, X.shape[0])
+        for col_idx in range(2):
+            col = X[:, col_idx].copy()
+            col[~np.isfinite(col)] = np.median(col[np.isfinite(col)])
+            for ascending in (True, False):
+                scores = (col if ascending else -col) + tiebreak
+                q = _tdc_qvalues(scores, is_decoy)
+                n_pass = int(((~is_decoy) & (q <= 0.01)).sum())
+                assert n_pass == 0, (
+                    f"Expected 0 targets at q<=0.01 for feature {col_idx} "
+                    f"(ascending={ascending}), got {n_pass}"
+                )
+
+    def test_pair_path_is_taken(self, xy):
+        X, is_decoy, feature_names = xy
+        result = _find_best_feature_labels(
+            X, is_decoy, feature_names, train_fdr=0.01, min_pair_threshold=10
+        )
+        assert result is not None, "Expected pair fallback to find a result"
+        labels, best_feat_name, n_passing = result
+        # The best feature name must describe a pair (contains a space, indicating
+        # the "feat_i + feat_j" or "feat_i - feat_j" format).
+        assert "signal_a" in best_feat_name and "signal_b" in best_feat_name, (
+            f"Expected pair name containing both features, got '{best_feat_name}'"
+        )
+
+    def test_pair_path_returns_enough_positives(self, xy):
+        X, is_decoy, feature_names = xy
+        result = _find_best_feature_labels(
+            X, is_decoy, feature_names, train_fdr=0.01, min_pair_threshold=10
+        )
+        assert result is not None
+        _, _, n_passing = result
+        assert n_passing >= 10, f"Expected at least 10 targets at q<=0.01, got {n_passing}"
+
+    def test_labels_consistent_with_decoy_mask(self, xy):
+        X, is_decoy, feature_names = xy
+        result = _find_best_feature_labels(
+            X, is_decoy, feature_names, train_fdr=0.01, min_pair_threshold=10
+        )
+        assert result is not None
+        labels, _, _ = result
+        assert labels.shape == (X.shape[0],)
+        assert np.all(labels[is_decoy] == -1), "All decoys must have label -1"
+        assert np.all(labels[~is_decoy] >= 0), "Targets must have label 0 or +1"
+
+    def test_skips_pair_search_when_single_feature_passes_threshold(self, xy):
+        X, is_decoy, feature_names = xy
+        # With min_pair_threshold=0, pair search should never be triggered
+        # (single-feature result of 0 is not < 0). The function falls back
+        # to returning None when no single feature works.
+        result = _find_best_feature_labels(
+            X, is_decoy, feature_names, train_fdr=0.01, min_pair_threshold=0
+        )
+        assert result is None, (
+            "Expected None when min_pair_threshold=0 and no single feature separates"
+        )

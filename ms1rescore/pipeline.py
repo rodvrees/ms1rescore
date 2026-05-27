@@ -432,6 +432,7 @@ def _find_best_feature_labels(
     is_decoy: np.ndarray,
     feature_names: list[str],
     train_fdr: float,
+    min_pair_threshold: int = 10,
 ) -> tuple[np.ndarray, str, int] | None:
     """
     Mokapot-style best-feature seed initialization.
@@ -439,6 +440,11 @@ def _find_best_feature_labels(
     For each column in X and each ranking direction (ascending/descending),
     run TDC q-value computation and count target candidates at q <= train_fdr.
     Select the (feature, direction) pair that yields the most such targets.
+
+    When the best single-feature result has fewer than ``min_pair_threshold``
+    targets, all unique pairwise sums and differences of eligible features are
+    tried. The composite score that yields the most targets is used if it beats
+    the single-feature result.
 
     Columns whose names appear in _BEST_FEAT_SKIP are excluded — they measure
     amino acid composition rather than spectral quality and can yield spurious
@@ -492,6 +498,51 @@ def _find_best_feature_labels(
                 best_asc = ascending
                 best_q = q.copy()
 
+    # --- Pairwise sweep when single-feature result is weak ---
+    if best_n < min_pair_threshold:
+        eligible = [
+            j for j, fname in enumerate(feature_names)
+            if fname not in _BEST_FEAT_SKIP and X_imp[:, j].std() > 0
+        ]
+        # Scale to zero mean, unit variance so both features contribute equally.
+        col_means = X_imp[:, eligible].mean(axis=0)
+        col_stds = X_imp[:, eligible].std(axis=0)
+        col_stds[col_stds == 0] = 1.0
+        X_sc = np.empty((X_imp.shape[0], len(eligible)), dtype=np.float64)
+        for k, j in enumerate(eligible):
+            X_sc[:, k] = (X_imp[:, j] - col_means[k]) / col_stds[k]
+
+        pair_best_n = best_n
+        pair_best_labels: np.ndarray | None = None
+        pair_best_name: str | None = None
+
+        for ii in range(len(eligible)):
+            for jj in range(ii + 1, len(eligible)):
+                gi, gj = eligible[ii], eligible[jj]
+                for sign in (+1, -1):
+                    composite = X_sc[:, ii] + sign * X_sc[:, jj]
+                    for ascending in (True, False):
+                        scores = (composite if ascending else -composite) + tiebreak
+                        q = _tdc_qvalues(scores, is_decoy)
+                        n_pass = int(((~is_decoy) & (q <= train_fdr)).sum())
+                        if n_pass > pair_best_n:
+                            pair_best_n = n_pass
+                            pair_best_labels = np.where(
+                                is_decoy, np.int8(-1),
+                                np.where(q <= train_fdr, np.int8(1), np.int8(0)),
+                            ).astype(np.int8)
+                            sign_str = "+" if sign == +1 else "-"
+                            pair_best_name = (
+                                f"{feature_names[gi]} {sign_str} {feature_names[gj]}"
+                            )
+
+        if pair_best_labels is not None:
+            logger.info(
+                "  Selected pair (%s) with %d PSMs at q<=%g",
+                pair_best_name, pair_best_n, train_fdr,
+            )
+            return pair_best_labels, pair_best_name, pair_best_n
+
     if best_n == 0 or best_j < 0:
         return None
 
@@ -514,6 +565,7 @@ def _rescore_lda(
     train_fdr: float = 0.01,
     max_iter: int = 5,
     r1_seed_percentile: float = 0.10,
+    min_pair_threshold: int = 10,
 ) -> np.ndarray:
     """
     Semi-supervised LDA on MALDI-intrinsic features.
@@ -587,7 +639,9 @@ def _rescore_lda(
     n_init_positives: int | None = None  # for post-loop comparison (R1 only)
 
     if seed_mask is None:
-        bf_result = _find_best_feature_labels(X, is_decoy, present, train_fdr)
+        bf_result = _find_best_feature_labels(
+            X, is_decoy, present, train_fdr, min_pair_threshold=min_pair_threshold
+        )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
             n_init_positives = _n_init
@@ -712,6 +766,7 @@ def _rescore_qda(
     train_fdr: float = 0.01,
     max_iter: int = 5,
     r1_seed_percentile: float = 0.10,
+    min_pair_threshold: int = 10,
 ) -> np.ndarray:
     """
     Semi-supervised QDA on MALDI-intrinsic features.
@@ -743,7 +798,9 @@ def _rescore_qda(
     n_init_positives: int | None = None
 
     if seed_mask is None:
-        bf_result = _find_best_feature_labels(X, is_decoy, present, train_fdr)
+        bf_result = _find_best_feature_labels(
+            X, is_decoy, present, train_fdr, min_pair_threshold=min_pair_threshold
+        )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
             n_init_positives = _n_init
@@ -1167,9 +1224,11 @@ def rescore(
     pseudo_label_max_iter: int = 5,
     pseudo_label_fdr: float = 0.10,
     r1_seed_percentile: float = 0.10,
+    r2_seed_percentile: float = 0.20,
     catboost_iterations: int = 500,
     mokapot_max_iter: int = 10,
     max_iter: int = 5,
+    min_pair_threshold: int = 10,
     im2deep_kwargs: dict | None = None,
 ):
     """
@@ -1354,6 +1413,11 @@ def rescore(
         Percentile of target R1 scores used as the seed threshold for R2
         (LDA/QDA). The top ``(1 - r1_seed_percentile)`` fraction of target
         winners by R1 score are used as pseudo-positives for R2 training.
+    r2_seed_percentile
+        Fraction of target R1 winners used as seeds for R2 training (LDA/QDA).
+        Seeds are selected as the top ``r2_seed_percentile`` fraction by R1
+        score, i.e. scores >= ``np.percentile(target_scores, 100*(1-r2_seed_percentile))``.
+        Default 0.20 (top 20%).
     catboost_iterations
         Number of boosting iterations for ``model="catboost"``.
     mokapot_max_iter
@@ -1591,7 +1655,7 @@ def rescore(
         )
 
         ms2pip_cache = get_ms2pip_predictions(
-            list(peptide_charge_pairs),
+            sorted(peptide_charge_pairs),
             model="timsTOF2024",
         )
 
@@ -1664,7 +1728,8 @@ def rescore(
     )
     if verbose:
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
-        features_df.to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
+        _debug_cols = [c for c in features_df.columns if c not in set(features_exclude or [])]
+        features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
@@ -2042,6 +2107,7 @@ def rescore(
             train_fdr=train_fdr,
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
+            min_pair_threshold=min_pair_threshold,
         )
         # Output importances
         if verbose:
@@ -2063,8 +2129,8 @@ def rescore(
         )
 
         # --- Round 2: retrain on winner subset ---
-        # Seed R2 from the top-20% of target winners by R1 score.  After winner
-        # selection the remaining target winners may have ppm > init_ppm_threshold
+        # Seed R2 from the top-r2_seed_percentile of target winners by R1 score.
+        # After winner selection the remaining targets may have ppm > init_ppm_threshold
         # (R1 lifted them on other features), so re-seeding from ppm alone would
         # leave only a handful of seeds, causing the LDA to degenerate.  Using
         # q-values from R1 has the same problem when R1 itself identified very few
@@ -2072,10 +2138,10 @@ def rescore(
         # produce a reasonably sized seed regardless of how well R1 converged.
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         target_scores_w = scores1[winner_pos][~is_decoy_w]
-        score_threshold = np.percentile(target_scores_w, 80)  # top 20% of targets
+        score_threshold = np.percentile(target_scores_w, 100.0 * (1.0 - r2_seed_percentile))
         r2_seed_mask = (~is_decoy_w) & (scores1[winner_pos] >= score_threshold)
         logger.info(
-            f"  LDA R2: seeding from top-20% R1 target scores "
+            f"  LDA R2: seeding from top-{r2_seed_percentile*100:.0f}% R1 target scores "
             f"(score ≥ {score_threshold:.3f}) → {r2_seed_mask.sum()} positives"
         )
 
@@ -2102,6 +2168,7 @@ def rescore(
             train_fdr=train_fdr,
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
+            min_pair_threshold=min_pair_threshold,
         )
         # Output importances
         if verbose:
@@ -2227,6 +2294,7 @@ def rescore(
             train_fdr=train_fdr,
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
+            min_pair_threshold=min_pair_threshold,
         )
         if verbose:
             with open(f"{output_dir}/17_debug_qda_scores_r1.pkl", "wb") as f:
@@ -2249,10 +2317,10 @@ def rescore(
         # --- Round 2: retrain on winner subset ---
         is_decoy_w = winners_df["is_decoy"].values.astype(bool)
         target_scores_w = scores1[winner_pos][~is_decoy_w]
-        score_threshold = np.percentile(target_scores_w, 80)
+        score_threshold = np.percentile(target_scores_w, 100.0 * (1.0 - r2_seed_percentile))
         r2_seed_mask = (~is_decoy_w) & (scores1[winner_pos] >= score_threshold)
         logger.info(
-            f"  QDA R2: seeding from top-20% R1 target scores "
+            f"  QDA R2: seeding from top-{r2_seed_percentile*100:.0f}% R1 target scores "
             f"(score ≥ {score_threshold:.3f}) → {r2_seed_mask.sum()} positives"
         )
 
@@ -2275,6 +2343,7 @@ def rescore(
             train_fdr=train_fdr,
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
+            min_pair_threshold=min_pair_threshold,
         )
         if verbose:
             with open(f"{output_dir}/17_debug_qda_scores_r2.pkl", "wb") as f:

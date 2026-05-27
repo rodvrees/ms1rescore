@@ -38,9 +38,11 @@
         "pseudo_label_max_iter":  {"type": ["integer", "null"], "minimum": 1},
         "pseudo_label_fdr":       {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "r1_seed_percentile":     {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "r2_seed_percentile":     {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "catboost_iterations":    {"type": ["integer", "null"], "minimum": 1},
         "mokapot_max_iter":       {"type": ["integer", "null"], "minimum": 1},
         "max_iter":               {"type": ["integer", "null"], "minimum": 1},
+        "min_pair_threshold":     {"type": ["integer", "null"], "minimum": 0},
         "init_ppm_threshold":     {"type": ["number", "null"], "minimum": 0},
         "init_isotope_threshold": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
 

@@ -898,6 +898,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--r2-seed-percentile",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Fraction of target R1 winners used as seeds for R2 training in LDA/QDA. "
+            "Seeds are the top FLOAT fraction by R1 score (default 0.20 = top 20%%)."
+        ),
+    )
+    rescore_grp.add_argument(
         "--catboost-iterations",
         type=int,
         default=None,
@@ -910,6 +920,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="INT",
         help="Maximum iterations for mokapot PercolatorModel (default 10).",
+    )
+    rescore_grp.add_argument(
+        "--min-pair-threshold",
+        type=int,
+        default=None,
+        metavar="INT",
+        help=(
+            "LDA/QDA only: minimum number of pseudo-positive targets required from "
+            "the single-feature sweep before the pairwise combination search is "
+            "skipped. When the single-feature result has fewer than this many "
+            "targets at q<=train_fdr, all unique feature pairs (sum and difference) "
+            "are tried and the best-performing composite score is used if it beats "
+            "the single-feature result. Default: 10."
+        ),
     )
 
     # --- Strategy C: LC-MS/MS-guided candidates ---
@@ -1068,8 +1092,8 @@ def main() -> None:
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
         "features_preset", "features_exclude",
-        "pseudo_label_max_iter", "pseudo_label_fdr", "r1_seed_percentile",
-        "catboost_iterations", "mokapot_max_iter", "max_iter",
+        "pseudo_label_max_iter", "pseudo_label_fdr", "r1_seed_percentile", "r2_seed_percentile",
+        "catboost_iterations", "mokapot_max_iter", "max_iter", "min_pair_threshold",
         # file paths
         "fasta", "extra_fasta", "mzml",
         "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
@@ -1466,9 +1490,11 @@ def main() -> None:
         pseudo_label_max_iter=_ms1cfg["pseudo_label_max_iter"],
         pseudo_label_fdr=_ms1cfg["pseudo_label_fdr"],
         r1_seed_percentile=_ms1cfg["r1_seed_percentile"],
+        r2_seed_percentile=_ms1cfg["r2_seed_percentile"],
         catboost_iterations=_ms1cfg["catboost_iterations"],
         mokapot_max_iter=_ms1cfg["mokapot_max_iter"],
         max_iter=_ms1cfg["max_iter"],
+        min_pair_threshold=_ms1cfg["min_pair_threshold"],
     )
 
     # --- Write results ---
@@ -1497,6 +1523,12 @@ def main() -> None:
             "%d/%d GT peptides are round-2 winners at 5%% FDR.",
             n_gt_winners_fdr_5, len(gt_set),
         )
+        winners_fdr_10 = winners[winners['q_value'] < 0.10]
+        n_gt_winners_fdr_10 = winners_fdr_10.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
+        logger.debug(
+            "%d/%d GT peptides are round-2 winners at 10%% FDR.",
+            n_gt_winners_fdr_10, len(gt_set),
+        )   
     logger.info("Done.")
 
 

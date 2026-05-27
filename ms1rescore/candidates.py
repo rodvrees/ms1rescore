@@ -547,16 +547,33 @@ def generate_balanced_shuffle_candidates(
         }
 
     # --- Step 4: Iterative shuffle rounds ---
+    # Early stopping is length-aware: continue until every target length bin that
+    # can produce MALDI-matching decoys has at least target_ratio * tgt_count entries
+    # in the pool, AND the total pool already has enough to subsample.  Lengths for
+    # which the pool never produces any decoys are excluded from the coverage check
+    # (they cannot be satisfied regardless of round count).
+    tgt_len_counts = target_candidates["peptide"].str.len().value_counts()
+    pool_len_counts: dict[int, int] = {}
     decoy_pool_parts: list[pd.DataFrame] = []
     n_pool = 0
 
     for r in range(max_shuffle_rounds):
+        # Length-aware early stop: every length bin that has ever produced pool
+        # entries must now have at least n_need entries.
         if n_pool >= n_decoys_needed:
-            logger.info(
-                "balanced_shuffle: %d/%d decoys collected after %d rounds — stopping early",
-                n_pool, n_decoys_needed, r,
+            all_covered = all(
+                pool_len_counts.get(llen, 0)
+                >= int(round(target_ratio * tgt_len_counts.get(llen, 0)))
+                for llen in tgt_len_counts.index
+                if pool_len_counts.get(llen, 0) > 0
             )
-            break
+            if all_covered:
+                logger.info(
+                    "balanced_shuffle: all reachable length bins covered after %d rounds "
+                    "(pool %d)",
+                    r, n_pool,
+                )
+                break
 
         round_rows = []
         for acc, seq in protein_seqs.items():
@@ -616,6 +633,9 @@ def generate_balanced_shuffle_candidates(
         if len(round_matched) == 0:
             continue
 
+        for llen, cnt in round_matched["peptide"].str.len().value_counts().items():
+            pool_len_counts[llen] = pool_len_counts.get(llen, 0) + cnt
+
         decoy_pool_parts.append(round_matched)
         n_pool += len(round_matched)
         logger.info(
@@ -632,20 +652,45 @@ def generate_balanced_shuffle_candidates(
 
     decoy_pool = pd.concat(decoy_pool_parts, ignore_index=True)
 
-    # --- Step 5: Subsample decoy pool to n_decoys_needed ---
-    if len(decoy_pool) > n_decoys_needed:
-        rng = np.random.default_rng(random_state)
-        keep_idx = np.sort(rng.choice(len(decoy_pool), size=n_decoys_needed, replace=False))
-        decoy_pool = decoy_pool.iloc[keep_idx].reset_index(drop=True)
-        logger.info(
-            "balanced_shuffle: subsampled decoy pool %d → %d", n_pool, n_decoys_needed
-        )
-    elif len(decoy_pool) < n_decoys_needed:
+    # --- Step 5: Length-stratified subsample ---
+    # For each target length bin take exactly min(pool_available, n_need) decoys.
+    # No fill from other lengths: adding decoys of the wrong length to compensate
+    # for truly unreachable lengths would introduce a length bias worse than the
+    # slight T:D count deficit.
+    dec_lengths = decoy_pool["peptide"].str.len()
+    rng = np.random.default_rng(random_state)
+
+    keep_indices: list[int] = []
+    unfilled: list[tuple[int, int, int]] = []  # (length, needed, available)
+    for length, tgt_count in tgt_len_counts.items():
+        dec_at_len = decoy_pool.index[dec_lengths == length].tolist()
+        n_need = int(round(target_ratio * tgt_count))
+        if n_need == 0:
+            continue
+        if not dec_at_len:
+            unfilled.append((length, n_need, 0))
+            continue
+        if len(dec_at_len) <= n_need:
+            if len(dec_at_len) < n_need:
+                unfilled.append((length, n_need, len(dec_at_len)))
+            keep_indices.extend(dec_at_len)
+        else:
+            keep_indices.extend(
+                rng.choice(dec_at_len, size=n_need, replace=False).tolist()
+            )
+
+    if unfilled:
         logger.warning(
-            "balanced_shuffle: collected only %d/%d decoys after %d rounds — "
-            "consider increasing --max-shuffle-rounds",
-            len(decoy_pool), n_decoys_needed, max_shuffle_rounds,
+            "balanced_shuffle: insufficient decoys at lengths %s "
+            "(format: length:needed/available) — consider increasing --max-shuffle-rounds",
+            ", ".join(f"{l}:{n}/{a}" for l, n, a in unfilled),
         )
+
+    decoy_pool = decoy_pool.loc[np.sort(keep_indices)].reset_index(drop=True)
+    logger.info(
+        "balanced_shuffle: subsampled decoy pool %d → %d (length-stratified, no fill)",
+        n_pool, len(decoy_pool),
+    )
 
     # --- Step 6: Mark decoys and wipe LC-MS/MS evidence ---
     decoy_pool["is_decoy"] = True

@@ -248,6 +248,7 @@ def plot_ion_image_colocalization(
     ion_image_mzs: np.ndarray,
     out_dir: str,
     max_co_features: int = 4,
+    feature_qvals: dict | None = None,
 ) -> None:
     """
     Per-candidate figure: precursor ion image + protein co-feature images + protein mean.
@@ -272,7 +273,7 @@ def plot_ion_image_colocalization(
             continue
         prec_img = ion_images[prec_idx]
 
-        # Collect co-feature images for the same protein
+        # Collect co-feature images for the same protein, ranked by reweighted q-value
         co_imgs: list[np.ndarray] = []
         co_mzs: list[float] = []
         if protein and "protein" in features_df.columns and "feature_mz" in features_df.columns:
@@ -281,7 +282,14 @@ def plot_ion_image_colocalization(
                 .dropna()
                 .unique()
             )
-            for mz in sorted(float(m) for m in prot_mzs if abs(float(m) - feature_mz) > 1e-6):
+            co_mz_candidates = [float(m) for m in prot_mzs if abs(float(m) - feature_mz) > 1e-6]
+            co_mz_candidates.sort(
+                key=lambda m: (
+                    0 if (feature_qvals and np.isfinite(feature_qvals.get(m, float("nan")))) else 1,
+                    feature_qvals.get(m, float("inf")) if feature_qvals else m,
+                )
+            )
+            for mz in co_mz_candidates:
                 if len(co_imgs) >= max_co_features:
                     break
                 idx = _find_image_idx(mz, ion_image_mzs)
@@ -307,7 +315,9 @@ def plot_ion_image_colocalization(
 
         _panel(axes[0], prec_img, f"Precursor\n{feature_mz:.4f}")
         for i, (cimg, cmz) in enumerate(zip(co_imgs, co_mzs)):
-            _panel(axes[1 + i], cimg, f"Co-feat\n{cmz:.4f}", r=_pearson_r(prec_img, cimg))
+            _q = feature_qvals.get(cmz, float("nan")) if feature_qvals else float("nan")
+            _q_s = f"\nq={_q:.3f}" if np.isfinite(_q) else ""
+            _panel(axes[1 + i], cimg, f"Co-feat\n{cmz:.4f}{_q_s}", r=_pearson_r(prec_img, cimg))
         _panel(axes[-1], prot_mean, f"Protein mean\n({len(all_imgs)} imgs)", r=_pearson_r(prec_img, prot_mean))
 
         fig.suptitle(_candidate_title(row), fontsize=8, y=1.01)
@@ -2143,6 +2153,31 @@ def save_debug_figures(
     subset = _sample_subset(features_df, result_df, n=n_subset, seed=seed)
     logger.info("Debug viz: sampled %d candidates from %d", len(subset), len(features_df))
 
+    # Build feature_mz → reweighted_q_value mapping once for co-feature ranking.
+    # Used by plot_ion_image_colocalization to rank co-features by match quality.
+    # Falls back to q_value when reweighted_q_value is NaN.
+    _feat_al = features_df.reset_index(drop=True)
+    _res_al = result_df.reset_index(drop=True)
+    _winner_arr = (
+        _res_al.get("is_tdc_winner", pd.Series(False, index=_res_al.index))
+        .fillna(False).astype(bool).values
+    )
+    _rw_q_arr = pd.to_numeric(
+        _res_al.get("reweighted_q_value", pd.Series(float("nan"), index=_res_al.index)),
+        errors="coerce",
+    ).values
+    _q_fb_arr = pd.to_numeric(
+        _res_al.get("q_value", pd.Series(float("nan"), index=_res_al.index)),
+        errors="coerce",
+    ).values
+    feature_qvals: dict[float, float] = {}
+    if "feature_mz" in _feat_al.columns:
+        _fmz_arr = _feat_al["feature_mz"].values
+        for _wi in np.where(_winner_arr)[0]:
+            _mz = float(_fmz_arr[_wi])
+            _q = float(_rw_q_arr[_wi]) if np.isfinite(_rw_q_arr[_wi]) else float(_q_fb_arr[_wi])
+            feature_qvals[_mz] = _q
+
     if ion_images is not None:
         try:
             # Build a full (unsampled) set of FDR ≤ 1% winners for ion images.
@@ -2205,6 +2240,7 @@ def save_debug_figures(
             plot_ion_image_colocalization(
                 subset_for_images, features_df, ion_images, ion_image_mzs,
                 out_dir=os.path.join(debug_dir, "ion_images"),
+                feature_qvals=feature_qvals,
             )
             logger.info("Ion image colocalization figures saved to %s/ion_images/", debug_dir)
         except Exception as exc:
@@ -2361,6 +2397,7 @@ def save_debug_figures(
                         plot_ion_image_colocalization(
                             gt_subset, features_df, ion_images, ion_image_mzs,
                             out_dir=os.path.join(debug_dir, "ion_images"),
+                            feature_qvals=feature_qvals,
                         )
                     except Exception as exc:
                         logger.warning("GT ion image figures failed: %s", exc)

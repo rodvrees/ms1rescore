@@ -535,6 +535,11 @@ def finetune_deeplc(
         ]
     )
 
+    import random as _random
+    import torch as _torch
+    _torch.manual_seed(42)
+    np.random.seed(42)
+    _random.seed(42)
     model = finetune(psm_list)
     return model
 
@@ -572,6 +577,11 @@ def finetune_deeplc_from_df(
         ]
     )
 
+    import random as _random
+    import torch as _torch
+    _torch.manual_seed(42)
+    np.random.seed(42)
+    _random.seed(42)
     model = finetune(psm_list, train_kwargs={"epochs": 40})
     return model
 
