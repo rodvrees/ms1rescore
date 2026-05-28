@@ -537,10 +537,15 @@ def finetune_deeplc(
 
     import random as _random
     import torch as _torch
+    from threadpoolctl import threadpool_limits
     _torch.manual_seed(42)
     np.random.seed(42)
     _random.seed(42)
-    model = finetune(psm_list)
+    _orig_threads = _torch.get_num_threads()
+    _torch.set_num_threads(1)
+    with threadpool_limits(limits=1):
+        model = finetune(psm_list)
+    _torch.set_num_threads(_orig_threads)
     return model
 
 
@@ -579,10 +584,15 @@ def finetune_deeplc_from_df(
 
     import random as _random
     import torch as _torch
+    from threadpoolctl import threadpool_limits
     _torch.manual_seed(42)
     np.random.seed(42)
     _random.seed(42)
-    model = finetune(psm_list, train_kwargs={"epochs": 40})
+    _orig_threads = _torch.get_num_threads()
+    _torch.set_num_threads(1)
+    with threadpool_limits(limits=1):
+        model = finetune(psm_list, train_kwargs={"epochs": 40})
+    _torch.set_num_threads(_orig_threads)
     return model
 
 

@@ -60,22 +60,22 @@ def digest_fasta(
     rows = []  # (peptide, protein, is_decoy)
     for desc, seq in fasta.read(fasta_path):
         protein_id = desc.split("|")[1] if "|" in desc else desc.split()[0]
-        cleaved = parser.cleave(
+        cleaved = sorted(parser.cleave(
             seq,
             parser.expasy_rules.get(enzyme, enzyme),
             missed_cleavages=missed_cleavages,
-        )
+        ))
         for pep in cleaved:
             if min_length <= len(pep) <= max_length:
                 rows.append((pep, protein_id, False))
 
         if generate_decoys:
             decoy_seq = _shuffle_protein(seq)
-            cleaved_d = parser.cleave(
+            cleaved_d = sorted(parser.cleave(
                 decoy_seq,
                 parser.expasy_rules.get(enzyme, enzyme),
                 missed_cleavages=missed_cleavages,
-            )
+            ))
             for pep in cleaved_d:
                 if min_length <= len(pep) <= max_length:
                     rows.append((pep, f"DECOY_{protein_id}", True))
@@ -576,9 +576,9 @@ def generate_balanced_shuffle_candidates(
                 break
 
         round_rows = []
-        for acc, seq in protein_seqs.items():
+        for acc, seq in sorted(protein_seqs.items()):
             shuffled = _shuffle_protein(seq, random_state=random_state + r)
-            for pep in parser.cleave(shuffled, enzyme_rule, missed_cleavages=missed_cleavages):
+            for pep in sorted(parser.cleave(shuffled, enzyme_rule, missed_cleavages=missed_cleavages)):
                 if min_length <= len(pep) <= max_length and pep not in target_seqs:
                     round_rows.append((pep, f"DECOY_{acc}_r{r}", True))
 
@@ -662,7 +662,7 @@ def generate_balanced_shuffle_candidates(
 
     keep_indices: list[int] = []
     unfilled: list[tuple[int, int, int]] = []  # (length, needed, available)
-    for length, tgt_count in tgt_len_counts.items():
+    for length, tgt_count in sorted(tgt_len_counts.items()):
         dec_at_len = decoy_pool.index[dec_lengths == length].tolist()
         n_need = int(round(target_ratio * tgt_count))
         if n_need == 0:
@@ -797,23 +797,23 @@ def digest_identified_proteins(
         else:
             # --- Step 2: Digest identified proteins (target + shuffled decoy) ---
             rows = []  # (peptide, protein, is_decoy)
-            for acc, seq in protein_seqs.items():
-                cleaved = parser.cleave(
+            for acc, seq in sorted(protein_seqs.items()):
+                cleaved = sorted(parser.cleave(
                     seq,
                     parser.expasy_rules.get(enzyme, enzyme),
                     missed_cleavages=missed_cleavages,
-                )
+                ))
                 for pep in cleaved:
                     if min_length <= len(pep) <= max_length:
                         rows.append((pep, acc, False))
 
                 if generate_decoys:
                     decoy_seq = _shuffle_protein(seq)
-                    cleaved_d = parser.cleave(
+                    cleaved_d = sorted(parser.cleave(
                         decoy_seq,
                         parser.expasy_rules.get(enzyme, enzyme),
                         missed_cleavages=missed_cleavages,
-                    )
+                    ))
                     for pep in cleaved_d:
                         if min_length <= len(pep) <= max_length:
                             rows.append((pep, f"DECOY_{acc}", True))
@@ -908,7 +908,7 @@ def digest_identified_proteins(
                     pseudo_protein = "".join(sorted_seqs)
                     shuffled_pseudo = _shuffle_protein(pseudo_protein, random_state=42)
                     target_set = set(novel_seqs)
-                    raw_decoys = list(parser.cleave(
+                    raw_decoys = sorted(parser.cleave(
                         shuffled_pseudo,
                         parser.expasy_rules.get(enzyme, enzyme),
                         missed_cleavages=missed_cleavages,

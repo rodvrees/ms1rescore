@@ -642,13 +642,23 @@ def _finetune_and_predict(
     _ft_epochs = _ft_kwargs.get("finetune_epochs", 10)
     _ft_batch_size = _ft_kwargs.get("finetune_batch_size", 64)
     _ft_lr = _ft_kwargs.get("finetune_lr", 0.001)
-    finetuned_model = _im2deep_finetune(
-        cal_psm_list,
-        model_save_path=model_path,
-        epochs=_ft_epochs,
-        batch_size=_ft_batch_size,
-        learning_rate=_ft_lr,
-    )
+    import random as _random
+    import torch as _torch
+    from threadpoolctl import threadpool_limits
+    _torch.manual_seed(42)
+    np.random.seed(42)
+    _random.seed(42)
+    _orig_threads = _torch.get_num_threads()
+    _torch.set_num_threads(1)
+    with threadpool_limits(limits=1):
+        finetuned_model = _im2deep_finetune(
+            cal_psm_list,
+            model_save_path=model_path,
+            epochs=_ft_epochs,
+            batch_size=_ft_batch_size,
+            learning_rate=_ft_lr,
+        )
+    _torch.set_num_threads(_orig_threads)
     logger.info(
         f"  IM2Deep transfer learning on {n_cal} unique peptides "
         f"({n_cal_rows} single-candidate features): model saved to {model_path}"
