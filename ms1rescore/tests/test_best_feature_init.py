@@ -213,7 +213,7 @@ class TestPpmFallback:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, importances, feat_names = _rescore_lda(
+        scores, importances, feat_names, _, _ = _rescore_lda(
             df,
             feat,
             init_ppm_threshold=4.0,
@@ -230,7 +230,7 @@ class TestPpmFallback:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, _, _ = _rescore_lda(
+        scores, _, _, _, _ = _rescore_lda(
             df,
             feat,
             init_ppm_threshold=4.0,
@@ -252,7 +252,7 @@ class TestBestFeatureSeedingInLDA:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, _, _ = _rescore_lda(df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=3)
+        scores, _, _, _, _ = _rescore_lda(df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=3)
 
         assert np.isfinite(scores).all()
 
@@ -260,7 +260,7 @@ class TestBestFeatureSeedingInLDA:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, _, _ = _rescore_lda(df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=3)
+        scores, _, _, _, _ = _rescore_lda(df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=3)
 
         is_decoy = df["is_decoy"].values
         assert scores[~is_decoy].mean() > scores[is_decoy].mean()
@@ -269,7 +269,7 @@ class TestBestFeatureSeedingInLDA:
         df = _make_clean_df(n_target=200, n_decoy=200)
         feat = ["good_feature", "noise_feature", "ppm_error_abs"]
 
-        scores, importances, feat_names = _rescore_lda(
+        scores, importances, feat_names, _, _ = _rescore_lda(
             df, feat, init_ppm_threshold=4.0, train_fdr=0.05, max_iter=2
         )
 

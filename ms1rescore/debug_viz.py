@@ -808,18 +808,36 @@ def plot_feature_importance(
     model_name: str = "model",
     top_n: int = 30,
     names_r2: list[str] | None = None,
+    structure_coefs_r1: np.ndarray | None = None,
+    structure_names_r1: list[str] | None = None,
+    structure_coefs_r2: np.ndarray | None = None,
+    structure_names_r2: list[str] | None = None,
 ) -> None:
     """
-    Save sorted horizontal bar charts of feature importances for rounds 1 and 2.
+    Save feature importance figures for rounds 1 and 2.
 
-    ``names_r1`` and ``names_r2`` are the feature name lists aligned with the
-    respective importance arrays.  When ``names_r2`` is omitted it falls back
-    to ``names_r1``.  Positive values are shown in steelblue, negative in tomato.
+    When structure coefficients are provided, each round produces a two-panel
+    figure (paired horizontal bar chart):
+      Left  — raw LDA coefficient, normalised to [-1, 1] by the maximum absolute
+               value.  Can be inflated by collinearity between features.
+      Right — structure coefficient: Pearson r between each (scaled) feature and
+               the discriminant score.  Bounded in [-1, 1] and unaffected by
+               collinearity.  Features are sorted top-to-bottom by |structure coef|.
+
+    When structure coefficients are absent the original single-panel plot is
+    produced.  Blue = positive (target-like), red = negative (decoy-like).
+
     Files: ``{out_dir}/{model_name}_round1_feature_importance.png`` etc.
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    def _one(importances: np.ndarray | None, names: list[str], suffix: str) -> None:
+    def _one(
+        importances: np.ndarray | None,
+        names: list[str],
+        suffix: str,
+        struct_coefs: np.ndarray | None = None,
+        struct_names: list[str] | None = None,
+    ) -> None:
         if importances is None or len(importances) == 0:
             return
         importances = np.asarray(importances, dtype=float)
@@ -829,19 +847,79 @@ def plot_feature_importance(
                 len(importances), len(names), suffix,
             )
             return
-        order = np.argsort(np.abs(importances))[-top_n:]
-        plot_names = [names[i] for i in order]
-        vals = importances[order]
-        colors = ["steelblue" if v >= 0 else "tomato" for v in vals]
 
-        fig, axi = plt.subplots(figsize=(9, max(4, len(plot_names) * 0.32)))
-        axi.barh(range(len(plot_names)), vals, color=colors, alpha=0.82)
-        axi.set_yticks(range(len(plot_names)))
-        axi.set_yticklabels(plot_names, fontsize=7)
-        axi.axvline(0, color="black", lw=0.8)
-        axi.set_xlabel("Importance", fontsize=9)
+        has_struct = (
+            struct_coefs is not None
+            and struct_names is not None
+            and len(struct_coefs) == len(struct_names)
+            and len(struct_coefs) > 0
+        )
+
         round_label = suffix.replace("_", " ").title()
-        axi.set_title(f"{model_name} — {round_label} feature importance (top {len(plot_names)})", fontsize=10)
+
+        if has_struct:
+            struct_coefs_arr = np.asarray(struct_coefs, dtype=float)
+            # Map raw coef by feature name; handles poly expansion where
+            # struct_names ⊆ names (original features ⊂ expanded names).
+            name_to_raw = dict(zip(names, importances))
+            raw_for_struct = np.array([name_to_raw.get(n, np.nan) for n in struct_names])
+
+            # Sort by |structure coef|, largest at top (barh: index 0 = bottom).
+            order = np.argsort(np.abs(struct_coefs_arr))[-top_n:]
+            plot_names = [struct_names[i] for i in order]
+            s_vals = struct_coefs_arr[order]
+            r_vals = raw_for_struct[order]
+
+            # Normalise raw coefs to [-1, 1] so both axes share the same scale.
+            r_max = np.nanmax(np.abs(r_vals)) if np.any(np.isfinite(r_vals)) else 1.0
+            r_norm = r_vals / (r_max + 1e-12)
+
+            n_feats = len(plot_names)
+            fig, (ax_raw, ax_struct) = plt.subplots(
+                1, 2,
+                figsize=(14, max(5, n_feats * 0.38)),
+                sharey=True,
+            )
+
+            raw_colors = ["steelblue" if v >= 0 else "tomato" for v in r_norm]
+            ax_raw.barh(range(n_feats), r_norm, color=raw_colors, alpha=0.80, height=0.65)
+            ax_raw.axvline(0, color="black", lw=0.8)
+            ax_raw.set_xlim(-1.12, 1.12)
+            ax_raw.set_yticks(range(n_feats))
+            ax_raw.set_yticklabels(plot_names, fontsize=7)
+            ax_raw.set_xlabel("Raw LDA coef  (normalised to max abs)", fontsize=9)
+            ax_raw.set_title("Raw LDA coefficient\n(can be inflated by collinearity)", fontsize=9)
+
+            struct_colors = ["steelblue" if v >= 0 else "tomato" for v in s_vals]
+            ax_struct.barh(range(n_feats), s_vals, color=struct_colors, alpha=0.80, height=0.65)
+            ax_struct.axvline(0, color="black", lw=0.8)
+            ax_struct.set_xlim(-1.12, 1.12)
+            ax_struct.set_xlabel("Structure coef  r(feature, discriminant score)", fontsize=9)
+            ax_struct.set_title("Structure coefficient\n(collinearity-robust, bounded [−1, 1])", fontsize=9)
+            ax_struct.tick_params(labelleft=False)
+
+            fig.suptitle(
+                f"{model_name} — {round_label}: raw vs structure importance "
+                f"(top {n_feats} by |structure coef|  ·  blue = target-like / red = decoy-like)",
+                fontsize=9, y=1.01,
+            )
+        else:
+            order = np.argsort(np.abs(importances))[-top_n:]
+            plot_names = [names[i] for i in order]
+            vals = importances[order]
+            colors = ["steelblue" if v >= 0 else "tomato" for v in vals]
+
+            fig, ax_raw = plt.subplots(figsize=(9, max(4, len(plot_names) * 0.32)))
+            ax_raw.barh(range(len(plot_names)), vals, color=colors, alpha=0.82)
+            ax_raw.set_yticks(range(len(plot_names)))
+            ax_raw.set_yticklabels(plot_names, fontsize=7)
+            ax_raw.axvline(0, color="black", lw=0.8)
+            ax_raw.set_xlabel("Importance", fontsize=9)
+            ax_raw.set_title(
+                f"{model_name} — {round_label} feature importance (top {len(plot_names)})",
+                fontsize=10,
+            )
+
         plt.tight_layout()
         fig.savefig(
             os.path.join(out_dir, f"{model_name}_{suffix}_feature_importance.png"),
@@ -849,8 +927,10 @@ def plot_feature_importance(
         )
         plt.close(fig)
 
-    _one(importances_r1, names_r1, "round1")
-    _one(importances_r2, names_r2 if names_r2 is not None else names_r1, "round2")
+    _one(importances_r1, names_r1, "round1",
+         struct_coefs=structure_coefs_r1, struct_names=structure_names_r1)
+    _one(importances_r2, names_r2 if names_r2 is not None else names_r1, "round2",
+         struct_coefs=structure_coefs_r2, struct_names=structure_names_r2)
 
 
 # ---------------------------------------------------------------------------
@@ -1250,8 +1330,8 @@ _COLOC_COLS = [
     ("protein_colocalization_n_partners", "Protein coloc. (n partners)"),
 ]
 
-_GROUP_ORDER  = ["ID @ 1% FDR", "R1 winner (below FDR)", "Non-winner"]
-_GROUP_COLORS = ["seagreen",     "darkorange",             "steelblue"]
+_GROUP_ORDER  = ["ID @ 1% FDR", "ID @ 5% FDR", "R1 winner (below FDR)", "Non-winner"]
+_GROUP_COLORS = ["seagreen",    "mediumseagreen", "darkorange",          "steelblue"]
 
 
 def plot_protein_colocalization_by_group(
@@ -1259,11 +1339,13 @@ def plot_protein_colocalization_by_group(
     result_df: pd.DataFrame,
     out_dir: str,
     fdr_threshold: float = 0.01,
+    fdr_threshold_loose: float = 0.05,
 ) -> None:
     """
-    Box + strip plot of protein-level colocalization values split into three groups:
+    Box + strip plot of protein-level colocalization values split into four groups:
       - ID @ 1% FDR  : round-2 TDC winner with reweighted_q_value <= fdr_threshold
-      - R1 winner     : round-2 TDC winner, but reweighted_q_value > fdr_threshold
+      - ID @ 5% FDR  : round-2 TDC winner with fdr_threshold < reweighted_q_value <= fdr_threshold_loose
+      - R1 winner     : round-2 TDC winner, but reweighted_q_value > fdr_threshold_loose
       - Non-winner    : did not make it to round 2
 
     Only target (non-decoy) rows are shown, since decoy colocalization values
@@ -1294,13 +1376,14 @@ def plot_protein_colocalization_by_group(
         errors="coerce",
     ).values
 
-    passes_fdr = is_winner & (rw_q <= fdr_threshold)
-    r1_only    = is_winner & ~passes_fdr
-    non_winner = ~is_winner
+    passes_fdr_strict = is_winner & (rw_q <= fdr_threshold)
+    passes_fdr_loose  = is_winner & (rw_q > fdr_threshold) & (rw_q <= fdr_threshold_loose)
+    r1_only           = is_winner & (rw_q > fdr_threshold_loose)
 
     group_label = np.where(
-        passes_fdr, _GROUP_ORDER[0],
-        np.where(r1_only, _GROUP_ORDER[1], _GROUP_ORDER[2]),
+        passes_fdr_strict, _GROUP_ORDER[0],
+        np.where(passes_fdr_loose, _GROUP_ORDER[1],
+        np.where(r1_only, _GROUP_ORDER[2], _GROUP_ORDER[3])),
     )
 
     # Restrict to targets only
@@ -1377,7 +1460,8 @@ def plot_protein_colocalization_by_group(
             ax.text(pos, y_ann, f"n={n}", ha="center", va="bottom", fontsize=7)
 
     fig.suptitle(
-        f"Protein colocalization by scoring group (targets only, FDR threshold {fdr_threshold:.0%})",
+        f"Protein colocalization by scoring group "
+        f"(targets only, strict FDR {fdr_threshold:.0%} / loose FDR {fdr_threshold_loose:.0%})",
         fontsize=10, y=1.02,
     )
     plt.tight_layout()
@@ -2110,6 +2194,10 @@ def save_debug_figures(
     importances_r2: np.ndarray | None = None,
     importance_names: list[str] | None = None,
     importance_names_r2: list[str] | None = None,
+    structure_coefs_r1: np.ndarray | None = None,
+    structure_names_r1: list[str] | None = None,
+    structure_coefs_r2: np.ndarray | None = None,
+    structure_names_r2: list[str] | None = None,
     debug_dir: str = "debug",
     n_subset: int = 50,
     seed: int = 42,
@@ -2352,6 +2440,10 @@ def save_debug_figures(
                 out_dir=os.path.join(debug_dir, "feature_importance"),
                 model_name=model_name,
                 names_r2=importance_names_r2,
+                structure_coefs_r1=structure_coefs_r1,
+                structure_names_r1=structure_names_r1,
+                structure_coefs_r2=structure_coefs_r2,
+                structure_names_r2=structure_names_r2,
             )
             logger.info("Feature importance figures saved to %s/feature_importance/", debug_dir)
         except Exception as exc:

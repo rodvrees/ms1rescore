@@ -749,6 +749,8 @@ def _rescore_lda(
         )
 
     importances = None
+    struct_coefs: np.ndarray | None = None
+    struct_names_out: list[str] = top_names if use_poly else present
     feature_names_out = present
     if pipe is not None:
         try:
@@ -757,7 +759,20 @@ def _rescore_lda(
                 feature_names_out = expanded_names
         except Exception:
             pass
-    return scores, importances, feature_names_out
+        try:
+            # Structure coefficients: correlation of each (imputed+scaled) original
+            # feature with the discriminant score.  Unlike raw LDA coefficients,
+            # these are unaffected by collinearity between features.
+            X_imp = pipe["imputer"].transform(X_fit)
+            X_sc = pipe["scaler"].transform(X_imp)
+            struct_coefs = np.array([
+                float(np.corrcoef(X_sc[:, j], scores)[0, 1])
+                for j in range(X_sc.shape[1])
+            ])
+            struct_coefs = np.nan_to_num(struct_coefs, nan=0.0)
+        except Exception:
+            pass
+    return scores, importances, struct_coefs, struct_names_out, feature_names_out
 
 
 def _rescore_qda(
@@ -2104,7 +2119,7 @@ def rescore(
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
 
         # --- Round 1: score all candidates ---
-        scores1, _imp_r1_lda, _imp_names_lda = _rescore_lda(
+        scores1, _imp_r1_lda, _struct_coefs_r1_lda, _struct_names_r1_lda, _imp_names_lda = _rescore_lda(
             features_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
@@ -2117,11 +2132,16 @@ def rescore(
         if verbose:
             with open(f"{output_dir}/17_debug_lda_scores_r1.pkl", "wb") as f:
                 pickle.dump(scores1, f)
-            lda_importances_df = pd.DataFrame({
+            _imp_df_r1 = pd.DataFrame({
                 "feature": _imp_names_lda,
                 "importance": _imp_r1_lda,
-            }).sort_values("importance", ascending=False)
-            lda_importances_df.to_csv(
+            })
+            if _struct_coefs_r1_lda is not None and _struct_names_r1_lda:
+                _imp_df_r1 = _imp_df_r1.merge(
+                    pd.DataFrame({"feature": _struct_names_r1_lda, "structure_coef": _struct_coefs_r1_lda}),
+                    on="feature", how="left",
+                )
+            _imp_df_r1.sort_values("importance", ascending=False).to_csv(
                 f"{output_dir}/17_debug_lda_importances_r1.tsv", sep="\t", index=False
             )
 
@@ -2161,7 +2181,7 @@ def rescore(
         else:
             lda_r2_features = intrinsic_present
 
-        scores2, lda_imp_r2, lda_imp_names_r2 = _rescore_lda(
+        scores2, lda_imp_r2, _struct_coefs_r2_lda, _struct_names_r2_lda, lda_imp_names_r2 = _rescore_lda(
             winners_df,
             lda_r2_features,
             init_ppm_threshold=init_ppm_threshold,
@@ -2178,11 +2198,16 @@ def rescore(
         if verbose:
             with open(f"{output_dir}/17_debug_lda_scores_r2.pkl", "wb") as f:
                 pickle.dump(scores2, f)
-            lda_importances_df = pd.DataFrame({
+            _imp_df_r2 = pd.DataFrame({
                 "feature": lda_imp_names_r2 or _imp_names_lda,
                 "importance": lda_imp_r2,
-            }).sort_values("importance", ascending=False)
-            lda_importances_df.to_csv(
+            })
+            if _struct_coefs_r2_lda is not None and _struct_names_r2_lda:
+                _imp_df_r2 = _imp_df_r2.merge(
+                    pd.DataFrame({"feature": _struct_names_r2_lda, "structure_coef": _struct_coefs_r2_lda}),
+                    on="feature", how="left",
+                )
+            _imp_df_r2.sort_values("importance", ascending=False).to_csv(
                 f"{output_dir}/17_debug_lda_importances_r2.tsv", sep="\t", index=False
             )
 
@@ -2281,6 +2306,10 @@ def rescore(
                 importances_r1=_imp_r1_lda, importances_r2=lda_imp_r2,
                 importance_names=_imp_names_lda,
                 importance_names_r2=lda_imp_names_r2 or _imp_names_lda,
+                structure_coefs_r1=_struct_coefs_r1_lda,
+                structure_names_r1=_struct_names_r1_lda,
+                structure_coefs_r2=_struct_coefs_r2_lda,
+                structure_names_r2=_struct_names_r2_lda,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
             )
