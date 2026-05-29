@@ -1159,6 +1159,7 @@ def _select_feature_winners(
     features_df: pd.DataFrame,
     scores: np.ndarray,
     feature_col: str,
+    winner_percentile: float = 0.02,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """
     For each MALDI feature select the candidate with the highest round-1 score,
@@ -1179,12 +1180,12 @@ def _select_feature_winners(
     winners_df = features_df.loc[winner_idx].copy().reset_index(drop=True)
 
     winner_scores = scores[winner_pos]
-    q1 = np.quantile(winner_scores, 0.02)
+    q1 = np.quantile(winner_scores, winner_percentile)
     keep = winner_scores >= q1
     n_dropped = int((~keep).sum())
     if n_dropped:
         logger.info(
-            f"  R1 winner filter: dropped {n_dropped} features with score < Quantile(0.02) ({q1:.4f})"
+            f"  R1 winner filter: dropped {n_dropped} features with score < Quantile({winner_percentile}) ({q1:.4f})"
         )
     winner_pos = winner_pos[keep]
     winners_df = winners_df[keep].reset_index(drop=True)
@@ -1249,6 +1250,14 @@ def rescore(
     max_iter: int = 5,
     min_pair_threshold: int = 10,
     im2deep_kwargs: dict | None = None,
+    matching_ppm: float = 20.0,
+    winner_percentile: float = 0.02,
+    rt_window_multiplier: float = 2.0,
+    lcms_prior_weight: float = 1.0,
+    spatial_prior_weight: float = 1.0,
+    fragment_tol_da: float = 0.02,
+    match_ccs: bool = False,
+    ccs_window_multiplier: float = 2.0,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -1582,7 +1591,7 @@ def rescore(
         candidates = generate_mz_shift_candidates(
             target_db,
             maldi_mzs,
-            matching_ppm=ppm_tolerance,
+            matching_ppm=matching_ppm,
             delta_min=mz_shift_delta_min,
             delta_max=mz_shift_delta_max,
             snap_tolerance_ppm=mz_shift_snap_tolerance_ppm,
@@ -1602,7 +1611,7 @@ def rescore(
             fasta_path=_bshuffle_fasta,
             lcms_ids=lcms_ids,
             feature_mzs=maldi_mzs,
-            matching_ppm=ppm_tolerance,
+            matching_ppm=matching_ppm,
             max_shuffle_rounds=max_shuffle_rounds,
             target_ratio=target_ratio,
             maldi_intensities=_maldi_intensities_arr,
@@ -1616,7 +1625,7 @@ def rescore(
         candidates = match_to_maldi_features(
             maldi_mzs,
             peptide_db,
-            ppm_tolerance,
+            matching_ppm,
             maldi_intensities=_maldi_intensities_arr,
             maldi_intensities_p90=maldi_intensities_p90,
             maldi_intensities_sum=maldi_intensities_sum,
@@ -1700,9 +1709,9 @@ def rescore(
             valid = ~np.isnan(pred_rts_cal) & ~np.isnan(obs_rts_cal)
             if valid.sum() > 10:
                 p95_mae = float(np.percentile(np.abs(pred_rts_cal[valid] - obs_rts_cal[valid]), 95))
-                rt_window_min = 2.0 * p95_mae
+                rt_window_min = rt_window_multiplier * p95_mae
                 logger.info(
-                    f"  DeepLC RT window: 2 × p95 MAE = {rt_window_min:.3f} min "
+                    f"  DeepLC RT window: {rt_window_multiplier} × p95 MAE = {rt_window_min:.3f} min "
                     f"({valid.sum()} calibration peptides, p95={p95_mae:.3f} min)"
                 )
 
@@ -1717,6 +1726,7 @@ def rescore(
             deeplc_cache,
             maldi_envelopes=maldi_envelopes,
             ppm_tolerance=ppm_tolerance,
+            fragment_tol_da=fragment_tol_da,
             rt_window_min=rt_window_min,
         )
 
@@ -1749,6 +1759,54 @@ def rescore(
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
         _debug_cols = [c for c in features_df.columns if c not in set(features_exclude or [])]
         features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
+
+    # --- CCS-based candidate filtering (optional) ---
+    # IM2Deep finetuning (inside compute_all_features) uses single-candidate
+    # (n_candidates==1) m/z matches as calibration reference.  After finetuning,
+    # im2deep_abs_delta_ccs_pct is available for all candidates.  We derive a
+    # data-driven threshold from the p95 calibration residual on that same single-
+    # candidate set (analogous to rt_window_min = rt_window_multiplier * p95_mae).
+    if match_ccs:
+        if observed_ccs_per_feature is not None and "im2deep_abs_delta_ccs_pct" in features_df.columns:
+            _single_ccs = features_df.loc[
+                features_df["n_candidates"] == 1, "im2deep_abs_delta_ccs_pct"
+            ].dropna()
+            if len(_single_ccs) >= 10:
+                _p95_ccs = float(np.percentile(_single_ccs, 95))
+                _ccs_tol_pct = ccs_window_multiplier * _p95_ccs
+                logger.info(
+                    f"CCS filter: p95 |delta_CCS%| on {len(_single_ccs)} single-candidate "
+                    f"matches = {_p95_ccs:.2f}%. Threshold = {ccs_window_multiplier}× = "
+                    f"{_ccs_tol_pct:.2f}%."
+                )
+                n_before = len(features_df)
+                _ccs_fail = (
+                    features_df["im2deep_abs_delta_ccs_pct"].notna()
+                    & (features_df["im2deep_abs_delta_ccs_pct"] > _ccs_tol_pct)
+                )
+                features_df = features_df[~_ccs_fail].reset_index(drop=True)
+                n_after = len(features_df)
+                logger.info(
+                    f"  Removed {n_before - n_after} of {n_before} candidates "
+                    f"({100*(n_before-n_after)/max(n_before,1):.1f}%). {n_after} remain."
+                )
+                # n_candidates / log_n_candidates are now stale; recompute per feature.
+                _feat_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
+                features_df["n_candidates"] = (
+                    features_df.groupby(_feat_col)[_feat_col].transform("count")
+                )
+                features_df["log_n_candidates"] = np.log1p(features_df["n_candidates"])
+            else:
+                logger.warning(
+                    f"CCS filter: only {len(_single_ccs)} single-candidate matches with "
+                    "observed CCS — too few for a reliable data-driven threshold. "
+                    "Skipping CCS filter."
+                )
+        else:
+            logger.warning(
+                "match_ccs=True but CCS filter cannot be applied: no observed CCS values "
+                "were provided or IM2Deep features were not computed. Skipping CCS filter."
+            )
 
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
@@ -1850,7 +1908,7 @@ def rescore(
             scores1 = np.zeros(len(features_df))
 
         # --- Per-feature winner selection ---
-        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col, winner_percentile)
         logger.info(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
@@ -1888,8 +1946,8 @@ def rescore(
         _LOG_EPS = 1e-12
         reweighted2 = (
             scores2
-            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
-            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+            + lcms_prior_weight * np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
@@ -1993,7 +2051,7 @@ def rescore(
                 pickle.dump(scores1, f)
 
         # --- Per-feature winner selection ---
-        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col, winner_percentile)
         logger.info(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
@@ -2030,8 +2088,8 @@ def rescore(
         _LOG_EPS = 1e-12
         reweighted2 = (
             scores2
-            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
-            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+            + lcms_prior_weight * np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
@@ -2146,7 +2204,7 @@ def rescore(
             )
 
         # --- Per-feature winner selection ---
-        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col, winner_percentile)
         logger.info(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
@@ -2226,8 +2284,8 @@ def rescore(
         _LOG_EPS = 1e-12
         reweighted2 = (
             scores2
-            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
-            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+            + lcms_prior_weight * np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 
@@ -2341,7 +2399,7 @@ def rescore(
             )
 
         # --- Per-feature winner selection ---
-        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col)
+        winner_pos, winners_df = _select_feature_winners(features_df, scores1, feature_col, winner_percentile)
         logger.info(
             f"  Round-1 winner selection: {len(winners_df)} candidates retained "
             f"({int(winners_df['is_decoy'].sum())} decoys)"
@@ -2401,8 +2459,8 @@ def rescore(
         _LOG_EPS = 1e-12
         reweighted2 = (
             scores2
-            + np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
-            + np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
+            + lcms_prior_weight * np.log(np.clip(lcms_prior_w, _LOG_EPS, None))
+            + spatial_prior_weight * np.log(np.clip(spatial_prior_w, _LOG_EPS, None))
         )
         rw_q2 = _tdc_qvalues(reweighted2, is_decoy_w)
 

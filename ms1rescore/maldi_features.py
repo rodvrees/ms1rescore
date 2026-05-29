@@ -642,6 +642,7 @@ def _finetune_and_predict(
     _ft_epochs = _ft_kwargs.get("finetune_epochs", 10)
     _ft_batch_size = _ft_kwargs.get("finetune_batch_size", 64)
     _ft_lr = _ft_kwargs.get("finetune_lr", 0.001)
+    _ft_patience = _ft_kwargs.get("finetune_patience", 10)
     import random as _random
     import torch as _torch
     from threadpoolctl import threadpool_limits
@@ -657,6 +658,7 @@ def _finetune_and_predict(
             epochs=_ft_epochs,
             batch_size=_ft_batch_size,
             learning_rate=_ft_lr,
+            patience=_ft_patience,
         )
     _torch.set_num_threads(_orig_threads)
     logger.info(

@@ -98,9 +98,18 @@
           "properties": {
             "finetune_epochs":     {"type": "integer", "minimum": 1},
             "finetune_batch_size": {"type": "integer", "minimum": 1},
-            "finetune_lr":         {"type": "number", "exclusiveMinimum": 0}
+            "finetune_lr":         {"type": "number", "exclusiveMinimum": 0},
+            "finetune_patience":   {"type": "integer", "minimum": 1}
           }
         },
+        "matching_ppm":        {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "fragment_tol_da":     {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "winner_percentile":   {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "rt_window_multiplier":{"type": ["number", "null"], "minimum": 0},
+        "lcms_prior_weight":   {"type": ["number", "null"], "minimum": 0},
+        "spatial_prior_weight":{"type": ["number", "null"], "minimum": 0},
+        "match_ccs":              {"type": ["boolean", "null"]},
+        "ccs_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
 
         "maldi_extraction": {
           "type": ["object", "null"],

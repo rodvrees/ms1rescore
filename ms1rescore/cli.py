@@ -936,6 +936,69 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    rescore_grp.add_argument(
+        "--fragment-tol-da",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="MS2 fragment matching tolerance in Da for spectral angle computation (default 0.02).",
+    )
+    rescore_grp.add_argument(
+        "--winner-percentile",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Round-1 winner filter: drop features whose winner score falls below "
+            "this quantile of all winner scores (default 0.02)."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--rt-window-multiplier",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "RT window = multiplier × p95 DeepLC MAE. Controls the ±window used "
+            "for MS1/MS2 RT-based filtering. Default 2.0."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--lcms-prior-weight",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Weight for the LC-MS/MS additive log-prior in reweighted scoring (default 1.0).",
+    )
+    rescore_grp.add_argument(
+        "--spatial-prior-weight",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Weight for the spatial quality additive log-prior in reweighted scoring (default 1.0).",
+    )
+    rescore_grp.add_argument(
+        "--match-ccs",
+        action="store_true",
+        default=False,
+        help=(
+            "After IM2Deep finetuning, filter candidates by predicted CCS. The tolerance "
+            "threshold is data-driven: p95 absolute %%CCS error on single-candidate (m/z "
+            "unambiguous) matches × --ccs-window-multiplier. Requires observed CCS values "
+            "in the feature m/z file and IM2Deep installed."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--ccs-window-multiplier",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "CCS filter threshold = multiplier × p95 |delta_CCS%%| on single-candidate "
+            "calibration matches. Analogous to --rt-window-multiplier. Default 2.0."
+        ),
+    )
+
     # --- Strategy C: LC-MS/MS-guided candidates ---
     strat_c = parser.add_argument_group(
         "Strategy C — LC-MS/MS-guided candidates (optional)",
@@ -1077,7 +1140,7 @@ def main() -> None:
     # the flag is absent.
     _STORE_TRUE_ATTRS = frozenset({
         "verbose", "storey_pi0", "lda_r2_median_filter",
-        "only_main_features", "use_protein_level_feats",
+        "only_main_features", "use_protein_level_feats", "match_ccs",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
@@ -1094,6 +1157,9 @@ def main() -> None:
         "features_preset", "features_exclude",
         "pseudo_label_max_iter", "pseudo_label_fdr", "r1_seed_percentile", "r2_seed_percentile",
         "catboost_iterations", "mokapot_max_iter", "max_iter", "min_pair_threshold",
+        "matching_ppm", "fragment_tol_da", "winner_percentile",
+        "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
+        "match_ccs", "ccs_window_multiplier",
         # file paths
         "fasta", "extra_fasta", "mzml",
         "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
@@ -1495,6 +1561,14 @@ def main() -> None:
         mokapot_max_iter=_ms1cfg["mokapot_max_iter"],
         max_iter=_ms1cfg["max_iter"],
         min_pair_threshold=_ms1cfg["min_pair_threshold"],
+        matching_ppm=_ms1cfg["matching_ppm"],
+        fragment_tol_da=_ms1cfg["fragment_tol_da"],
+        winner_percentile=_ms1cfg["winner_percentile"],
+        rt_window_multiplier=_ms1cfg["rt_window_multiplier"],
+        lcms_prior_weight=_ms1cfg["lcms_prior_weight"],
+        spatial_prior_weight=_ms1cfg["spatial_prior_weight"],
+        match_ccs=bool(_ms1cfg.get("match_ccs", False)),
+        ccs_window_multiplier=_ms1cfg["ccs_window_multiplier"],
     )
 
     # --- Write results ---
@@ -1511,21 +1585,21 @@ def main() -> None:
             "%d/%d GT peptides are round-2 (feature-level) winners.",
             n_gt_winners, len(gt_set),
         )
-        winners_fdr = winners[winners['q_value'] < 0.01]
+        winners_fdr = winners[winners['reweighted_q_value'] <= 0.01]
         n_gt_winners_fdr = winners_fdr.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
         logger.info(
             "%d/%d GT peptides are round-2 winners at 1%% FDR.",
             n_gt_winners_fdr, len(gt_set),
         )
-        winners_fdr_5 = winners[winners['q_value'] < 0.05]
+        winners_fdr_5 = winners[winners['reweighted_q_value'] <= 0.05]
         n_gt_winners_fdr_5 = winners_fdr_5.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
-        logger.debug(
+        logger.info(
             "%d/%d GT peptides are round-2 winners at 5%% FDR.",
             n_gt_winners_fdr_5, len(gt_set),
         )
-        winners_fdr_10 = winners[winners['q_value'] < 0.10]
+        winners_fdr_10 = winners[winners['reweighted_q_value'] <= 0.10]
         n_gt_winners_fdr_10 = winners_fdr_10.drop_duplicates(subset=["peptide"])["peptide"].isin(gt_set).sum()
-        logger.debug(
+        logger.info(
             "%d/%d GT peptides are round-2 winners at 10%% FDR.",
             n_gt_winners_fdr_10, len(gt_set),
         )   

@@ -35,8 +35,17 @@
     "im2deep": {
       "finetune_epochs": 10,
       "finetune_batch_size": 64,
-      "finetune_lr": 0.001
+      "finetune_lr": 0.001,
+      "finetune_patience": 10
     },
+    "matching_ppm": 20.0,
+    "fragment_tol_da": 0.02,
+    "winner_percentile": 0.02,
+    "rt_window_multiplier": 2.0,
+    "lcms_prior_weight": 1.0,
+    "spatial_prior_weight": 1.0,
+    "match_ccs": false,
+    "ccs_window_multiplier": 2.0,
     "maldi_extraction": {
       "ppm_bin": 5.0,
       "extraction_ppm": 25.0,
