@@ -1503,7 +1503,7 @@ def main() -> None:
     from ms1rescore.pipeline import rescore
 
     logger.info("Starting ms1rescore pipeline...")
-    _, result_df, _ = rescore(
+    _, result_df, _, _features_df = rescore(
         fasta_path=_ms1cfg.get("fasta"),
         maldi_mzs=maldi_mzs,
         mzml_paths=_ms1cfg.get("mzml") or [],

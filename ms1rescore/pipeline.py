@@ -1766,6 +1766,7 @@ def rescore(
     # im2deep_abs_delta_ccs_pct is available for all candidates.  We derive a
     # data-driven threshold from the p95 calibration residual on that same single-
     # candidate set (analogous to rt_window_min = rt_window_multiplier * p95_mae).
+    _ccs_tol_pct: float | None = None
     if match_ccs:
         if observed_ccs_per_feature is not None and "im2deep_abs_delta_ccs_pct" in features_df.columns:
             _single_ccs = features_df.loc[
@@ -1773,7 +1774,7 @@ def rescore(
             ].dropna()
             if len(_single_ccs) >= 10:
                 _p95_ccs = float(np.percentile(_single_ccs, 95))
-                _ccs_tol_pct = ccs_window_multiplier * _p95_ccs
+                _ccs_tol_pct = float(ccs_window_multiplier * _p95_ccs)
                 logger.info(
                     f"CCS filter: p95 |delta_CCS%| on {len(_single_ccs)} single-candidate "
                     f"matches = {_p95_ccs:.2f}%. Threshold = {ccs_window_multiplier}× = "
@@ -2027,9 +2028,10 @@ def rescore(
                 importance_names=svm_imp_names_r2 or _imp_names_r1_svm,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
+                ccs_tol_pct=_ccs_tol_pct,
             )
 
-        return psm_list, result_df, feature_names
+        return psm_list, result_df, feature_names, features_df
 
     elif model == "catboost":
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
@@ -2169,9 +2171,10 @@ def rescore(
                 importance_names=cb_imp_names_r2 or _imp_names_cb,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
+                ccs_tol_pct=_ccs_tol_pct,
             )
 
-        return psm_list, result_df, feature_names
+        return psm_list, result_df, feature_names, features_df
 
     elif model == "lda":
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
@@ -2370,9 +2373,10 @@ def rescore(
                 structure_names_r2=_struct_names_r2_lda,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
+                ccs_tol_pct=_ccs_tol_pct,
             )
 
-        return psm_list, result_df, feature_names
+        return psm_list, result_df, feature_names, features_df
 
     elif model == "qda":
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
@@ -2542,9 +2546,10 @@ def rescore(
                 importance_names_r2=qda_imp_names_r2 or _imp_names_qda,
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
+                ccs_tol_pct=_ccs_tol_pct,
             )
 
-        return psm_list, result_df, feature_names
+        return psm_list, result_df, feature_names, features_df
 
     else:
         raise ValueError(f"Unknown model '{model}'. Choose 'svm', 'catboost', 'lda', or 'qda'.")

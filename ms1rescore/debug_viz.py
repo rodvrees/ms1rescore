@@ -1106,6 +1106,9 @@ def plot_ccs_scatter(
     out_dir: str,
     fdr_threshold: float = 0.01,
     gt_peptides: list[str] | None = None,
+    ccs_tol_pct: float | None = None,
+    title_extra: str = "",
+    filename: str = "ccs_scatter.png",
 ) -> None:
     """
     Scatter plot of observed vs predicted CCS for all candidates.
@@ -1117,7 +1120,10 @@ def plot_ccs_scatter(
     Points are coloured by target/decoy status. "R2 winner" means the feature's
     best candidate AND reweighted_q_value <= fdr_threshold. R1 winners (best
     candidate but below FDR threshold) are shown at intermediate size.
-    Saved to ``{out_dir}/ccs_scatter.png``.
+
+    When ``ccs_tol_pct`` is provided, fan-shaped CCS filter boundaries are drawn:
+    ``obs = pred × (1 ± ccs_tol_pct/100)``. These diverge from the origin.
+    Saved to ``{out_dir}/{filename}``.
     """
     if "im2deep_observed_ccs" not in features_df.columns:
         return
@@ -1206,6 +1212,15 @@ def plot_ccs_scatter(
     hi = max(float(pred_v.max()), float(obs_v.max()))
     ax.plot([lo, hi], [lo, hi], "k--", lw=1.0, alpha=0.5, label="y = x")
 
+    # Fan-shaped CCS tolerance boundaries (diverge from origin)
+    if ccs_tol_pct is not None:
+        pred_range = np.linspace(float(pred_v.min()), float(pred_v.max()), 300)
+        fac = ccs_tol_pct / 100.0
+        ax.plot(pred_range, pred_range * (1 + fac), color="darkorange", lw=1.2,
+                ls="--", alpha=0.85, label=f"±{ccs_tol_pct:.1f}% CCS threshold")
+        ax.plot(pred_range, pred_range * (1 - fac), color="darkorange", lw=1.2,
+                ls="--", alpha=0.85)
+
     # Linear regression across all valid points
     try:
         coeffs = np.polyfit(pred_v, obs_v, 1)
@@ -1224,12 +1239,15 @@ def plot_ccs_scatter(
     else:
         corr_str = f"r = {corr_all:.3f}"
 
+    title = f"Observed vs Predicted CCS\n{corr_str}"
+    if title_extra:
+        title += f"\n{title_extra}"
     ax.set_xlabel("Predicted CCS (Å²)", fontsize=10)
     ax.set_ylabel("Observed CCS (Å²)", fontsize=10)
-    ax.set_title(f"Observed vs Predicted CCS\n{corr_str}", fontsize=10)
+    ax.set_title(title, fontsize=9)
     ax.legend(fontsize=7, markerscale=1.5)
     plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "ccs_scatter.png"), dpi=120, bbox_inches="tight")
+    fig.savefig(os.path.join(out_dir, filename), dpi=120, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -2203,6 +2221,7 @@ def save_debug_figures(
     seed: int = 42,
     gt_peptides: list[str] | None = None,
     storey_pi0_val: float | None = None,
+    ccs_tol_pct: float | None = None,
 ) -> None:
     """
     Generate all debug figures and save them under ``debug_dir``.
@@ -2368,6 +2387,7 @@ def save_debug_figures(
             features_df, result_df,
             out_dir=debug_dir,
             gt_peptides=gt_peptides,
+            ccs_tol_pct=ccs_tol_pct,
         )
         if "im2deep_observed_ccs" in features_df.columns:
             logger.info("CCS scatter saved to %s/ccs_scatter.png", debug_dir)

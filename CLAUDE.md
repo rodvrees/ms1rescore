@@ -577,6 +577,19 @@ P12345  →  P12345
 
 `rescore()` is the end-to-end entry point. Accepts `extra_ion_images: dict | None` (keys: `"m1"`, `"m2"`, `"na"`, `"k"`, `"chca"`) and passes it through to `compute_all_features` → `compute_isotopologue_colocalization` / `compute_adduct_colocalization`. Populated by `_load_maldi` in `cli.py` from the Bruker RAM extraction path or from NPZ `extra_*` keys. Steps 1-8 are identical for both backends; step 9 diverges:
 
+**Key `rescore()` parameters exposed since v0.1:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `matching_ppm` | 20.0 | ppm window for candidate-to-feature linking in `match_to_maldi_features` — separate from `ppm_tolerance` (extraction window) |
+| `fragment_tol_da` | 0.02 | MS2 fragment matching tolerance (Da) for spectral angle computation |
+| `winner_percentile` | 0.02 | `_select_feature_winners` quality filter: features whose R1 winner score falls below this quantile of all winner scores are dropped before R2 training |
+| `rt_window_multiplier` | 2.0 | RT window = multiplier × p95 DeepLC MAE; controls ±window for MS1/MS2 RT filtering |
+| `lcms_prior_weight` | 1.0 | Multiplicative weight on the LC-MS/MS log-prior in reweighted scoring |
+| `spatial_prior_weight` | 1.0 | Multiplicative weight on the spatial quality log-prior in reweighted scoring |
+| `match_ccs` | False | Enable CCS-based candidate filtering after IM2Deep finetuning (see below) |
+| `ccs_window_multiplier` | 2.0 | CCS filter threshold = multiplier × p95 \|delta_CCS%\| on single-candidate calibration set |
+
 **Decoy mode parameter:** `decoy_method` (str, default `"shuffle"`) controls Step 1c:
 - `"shuffle"` — standard K/R-preserving protein shuffle (via `digest_fasta` / `digest_identified_proteins`). Decoys are sequence-space decoys with distinct elemental compositions (different `theo_isotope_cosine`).
 - `"mz_shift"` — observation-space decoys via `generate_mz_shift_candidates()`. Shuffle decoys from Step 1b are filtered out; `generate_mz_shift_candidates` is called on the target-only candidate set. Decoy rows carry the real peptide's theoretical isotope pattern but are anchored to an off-target MALDI feature ±delta Da away. Use with `mz_shift_delta_min` (default 5.0 Da) and `mz_shift_delta_max` (default 20.0 Da).
@@ -589,7 +602,8 @@ CLI flags: `--decoy-method {shuffle,mz_shift,balanced_shuffle}`, `--mz-shift-del
 3. Find MS2 matches by neutral mass; run MS2PIP only for `(peptide, charge)` pairs at features with observed MS2 scans
 4. DeepLC: optionally fine-tune on PD MSF or FragPipe RT table, then predict RT for all unique peptides
 5. Compute LC-MS/MS evidence features (DeepLC-anchored MS1 features; fully symmetric)
-6. Compute all features
+6. Compute all features (includes IM2Deep finetuning on `n_candidates==1` matches when CCS data is available)
+6b. *(optional)* **CCS filter** — when `match_ccs=True`: compute p95 of `im2deep_abs_delta_ccs_pct` on single-candidate matches; remove all candidates where `im2deep_abs_delta_ccs_pct > ccs_window_multiplier × p95`; recompute `n_candidates` and `log_n_candidates`. LDA positive seeding at step 9 uses post-filter `n_candidates`, so newly unambiguous features (filtered down to one candidate) contribute as seed positives.
 7. Build PSMList + populate rescoring features
 8. Rescore using selected backend (see "Rescoring backends" below)
 
@@ -598,7 +612,7 @@ CLI flags: `--decoy-method {shuffle,mz_shift,balanced_shuffle}`, `--mz-shift-del
 All backends follow the same two-pass structure:
 
 1. **Round 1** — score all candidates globally. The model does not use per-feature grouping; every candidate is treated on equal footing.
-2. **Per-feature winner selection** (`_select_feature_winners`) — for each MALDI m/z feature, retain only the highest round-1 score candidate. Produces `winners_df` (~N rows for N features). A strict Q1 filter is then applied: the 25th percentile of all winner R1 scores is computed and any feature whose winner falls below it is dropped (`is_tdc_winner=False`, `q_value=NaN`). This removes the bottom quartile of features by R1 confidence before R2 training.
+2. **Per-feature winner selection** (`_select_feature_winners`) — for each MALDI m/z feature, retain only the highest round-1 score candidate. Produces `winners_df` (~N rows for N features). A quality filter is then applied: features whose winner R1 score falls below `np.quantile(winner_scores, winner_percentile)` are dropped (`is_tdc_winner=False`, `q_value=NaN`). `winner_percentile` defaults to 0.02 (2nd percentile); raise it to filter more aggressively before R2 training.
 3. **Round 2** — retrain/rescore on the winner subset only. Because each feature contributes exactly one candidate, this is a cleaner training set than the full candidate pool.
 4. **FDR** — standard TDC (`_tdc_qvalues`) over all winners sorted by round-2 score. Q-values propagated to non-winners as NaN.
 
@@ -647,13 +661,15 @@ Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `p
 
 `compute_spatial_prior()` min-max normalizes spatial quality features (`spatial_autocorrelation`, `spatial_gearys_c` negated, etc.) for the winner subset and returns a per-candidate weight in (0, 1]. Returns 1.0 if no informative spatial features are present.
 
-Both priors are combined as an **additive log-prior** (not a multiplicative prior):
+Both priors are combined as a **weighted additive log-prior** (not a multiplicative prior):
 
 ```
-reweighted_score = round2_score + log(lcms_prior) + log(spatial_prior)
+reweighted_score = round2_score
+                 + lcms_prior_weight  * log(lcms_prior)
+                 + spatial_prior_weight * log(spatial_prior)
 ```
 
-Multiplicative combination would invert the ranking for negative scores (a bad candidate with low prior would become less negative, i.e. higher ranked). The additive log form penalises low-prior candidates uniformly regardless of score sign. Q-values are recomputed on the reweighted scores with a second `_tdc_qvalues` call. Only winner rows receive non-NaN values.
+`lcms_prior_weight` and `spatial_prior_weight` (both default 1.0) scale the contribution of each prior independently. Values > 1 amplify the prior's influence; 0 disables it entirely. Multiplicative combination would invert the ranking for negative scores (a bad candidate with low prior would become less negative, i.e. higher ranked). The additive log form penalises low-prior candidates uniformly regardless of score sign. Q-values are recomputed on the reweighted scores with a second `_tdc_qvalues` call. Only winner rows receive non-NaN values.
 
 ---
 
@@ -761,7 +777,7 @@ The merged config is written to `<output_dir>/.full_config.json` at the start of
 
 1. Add it to `package_data/config_default.json` with a default value.
 2. Add a schema entry in `package_data/config_schema.json` (type, constraints; use `["type", "null"]` to allow CLI `None` passthrough).
-3. Add `--param-name` to `cli.py` with `default=None`.
+3. In `cli.py`: add `--param-name` to the appropriate argument group with `default=None`; add the snake_case name to `_TOP_LEVEL_ATTRS` (and to `_STORE_TRUE_ATTRS` for boolean flags); add it to the `rescore()` call at the bottom of `main()`.
 4. Add it to the `rescore()` signature in `pipeline.py` with the same default as the JSON.
 5. Add a test in `tests/test_config_parser.py`.
 
