@@ -696,13 +696,13 @@ def _rescore_lda(
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", StandardScaler()),
                 ("poly", PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)),
-                ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
+                ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=[0.5, 0.5])),
             ])
         else:
             pipe = Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", StandardScaler()),
-                ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
+                ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=[0.5, 0.5])),
             ])
         from threadpoolctl import threadpool_limits
         with threadpool_limits(limits=1, user_api="blas"):
@@ -1997,6 +1997,10 @@ def rescore(
                 "reweighted_q_value": rw_q_full,
             }
         )
+        _ccs_map = observed_ccs_per_feature or {}
+        result_df["feature_ccs"] = [
+            _ccs_map.get(int(i), np.nan) for i in result_df["feature_idx"]
+        ]
         if storey_pi0 and _pi0 is not None:
             storey_q_full = np.full(len(features_df), np.nan)
             storey_q_full[winner_pos] = storey_q2
@@ -2140,6 +2144,10 @@ def rescore(
                 "reweighted_q_value": rw_q_full,
             }
         )
+        _ccs_map = observed_ccs_per_feature or {}
+        result_df["feature_ccs"] = [
+            _ccs_map.get(int(i), np.nan) for i in result_df["feature_idx"]
+        ]
         if storey_pi0 and _pi0 is not None:
             storey_q_full = np.full(len(features_df), np.nan)
             storey_q_full[winner_pos] = storey_q2
@@ -2337,6 +2345,10 @@ def rescore(
                 "reweighted_q_value": rw_q_full,
             }
         )
+        _ccs_map = observed_ccs_per_feature or {}
+        result_df["feature_ccs"] = [
+            _ccs_map.get(int(i), np.nan) for i in result_df["feature_idx"]
+        ]
         if storey_pi0 and _pi0 is not None:
             storey_q_full = np.full(len(features_df), np.nan)
             storey_q_full[winner_pos] = storey_q2
@@ -2513,6 +2525,10 @@ def rescore(
                 "reweighted_q_value": rw_q_full,
             }
         )
+        _ccs_map = observed_ccs_per_feature or {}
+        result_df["feature_ccs"] = [
+            _ccs_map.get(int(i), np.nan) for i in result_df["feature_idx"]
+        ]
         if storey_pi0 and _pi0 is not None:
             storey_q_full = np.full(len(features_df), np.nan)
             storey_q_full[winner_pos] = storey_q2
