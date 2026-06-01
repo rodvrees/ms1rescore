@@ -1,8 +1,8 @@
 """
 Debug visualization for the MALDI-MSI rescoring pipeline.
 
-Eleven subsystems:
-  1. Ion image colocalization  — per-candidate precursor + protein co-feature images
+Thirteen subsystems:
+  1. Ion image colocalization  — per-candidate precursor + ALL same-protein co-feature images
   2. Feature diagnostics       — per-candidate 3×3 panel figure
   3. Isotope envelopes         — per-candidate spectrum-style envelope comparison
   4. Feature importance        — global sorted bar plots (rounds 1 and 2)
@@ -13,6 +13,8 @@ Eleven subsystems:
   9. T/D m/z distribution      — target vs decoy m/z coverage and competition status
  10. Score PP plot             — empirical CDF of decoy scores vs target scores
  11. Score distributions       — target/decoy score histograms at R1, R2, and reweighted
+ 12. Pearson r distribution    — same-protein vs different-protein ion image Pearson r at 5% FDR
+ 13. Protein spatial coherence — per-protein peptide count vs mean ion image Pearson r at 5% FDR
 
 Entry point: save_debug_figures()
 """
@@ -247,13 +249,19 @@ def plot_ion_image_colocalization(
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
     out_dir: str,
-    max_co_features: int = 4,
     feature_qvals: dict | None = None,
+    feature_peptides: dict | None = None,
 ) -> None:
     """
-    Per-candidate figure: precursor ion image + protein co-feature images + protein mean.
+    Per-candidate figure: precursor ion image + ALL same-protein co-feature images
+    (ranked by reweighted q-value ascending) + protein mean.
+
+    Co-feature panels show the same-protein candidate peptide as the label.  When
+    a different-protein peptide is the TDC winner at that feature, it is annotated
+    as "(not winner: <winner>)" so mass-coincidence competitors are visible.
 
     Files are saved as ``{out_dir}/{rank:03d}_{peptide}_{feature_mz:.4f}.png``.
+    Panels are arranged in a grid of up to 8 columns.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -273,9 +281,12 @@ def plot_ion_image_colocalization(
             continue
         prec_img = ion_images[prec_idx]
 
-        # Collect co-feature images for the same protein, ranked by reweighted q-value
+        # Collect co-feature images for the same protein, ranked by reweighted q-value.
+        # The label shows the same-protein candidate peptide; if a different-protein
+        # peptide is the TDC winner at that feature, it is noted as "(not winner: X)".
         co_imgs: list[np.ndarray] = []
         co_mzs: list[float] = []
+        co_pep_labels: list[str] = []
         if protein and "protein" in features_df.columns and "feature_mz" in features_df.columns:
             prot_mzs = (
                 features_df.loc[features_df["protein"] == protein, "feature_mz"]
@@ -290,21 +301,35 @@ def plot_ion_image_colocalization(
                 )
             )
             for mz in co_mz_candidates:
-                if len(co_imgs) >= max_co_features:
-                    break
                 idx = _find_image_idx(mz, ion_image_mzs)
                 if idx is not None:
+                    # Use the same-protein candidate peptide as label, not the winner
+                    same_prot_peps = features_df.loc[
+                        (features_df["feature_mz"] == mz) & (features_df["protein"] == protein),
+                        "peptide",
+                    ]
+                    co_pep = str(same_prot_peps.iloc[0]) if len(same_prot_peps) > 0 else ""
+                    winner_pep = feature_peptides.get(mz, "") if feature_peptides else ""
+                    label = co_pep
+                    if co_pep and winner_pep and co_pep != winner_pep:
+                        label += f"\n(not winner: {winner_pep})"
                     co_imgs.append(ion_images[idx])
                     co_mzs.append(mz)
+                    co_pep_labels.append(label)
 
         # Protein mean image across precursor + co-features
         all_imgs = [prec_img] + co_imgs
         prot_mean = np.mean(all_imgs, axis=0)
 
         n_panels = 1 + len(co_imgs) + 1
-        fig, axes = plt.subplots(1, n_panels, figsize=(3.2 * n_panels, 3.8))
-        if n_panels == 1:
-            axes = [axes]
+        _ncols = min(n_panels, 8)
+        _nrows = (n_panels + _ncols - 1) // _ncols
+        fig, _axes_grid = plt.subplots(
+            _nrows, _ncols,
+            figsize=(3.2 * _ncols, 3.8 * _nrows),
+            squeeze=False,
+        )
+        axes = _axes_grid.ravel()
 
         def _panel(ax: plt.Axes, img: np.ndarray, title: str, r: float | None = None) -> None:
             im = ax.imshow(img, cmap="hot", aspect="auto")
@@ -313,12 +338,18 @@ def plot_ion_image_colocalization(
             ax.set_title(cap, fontsize=7)
             ax.axis("off")
 
-        _panel(axes[0], prec_img, f"Precursor\n{feature_mz:.4f}")
-        for i, (cimg, cmz) in enumerate(zip(co_imgs, co_mzs)):
+        _prec_q = feature_qvals.get(feature_mz, float("nan")) if feature_qvals else float("nan")
+        _prec_q_s = f"\nq={_prec_q:.3f}" if np.isfinite(_prec_q) else ""
+        _panel(axes[0], prec_img, f"Precursor\n{feature_mz:.4f}{_prec_q_s}")
+        for i, (cimg, cmz, clabel) in enumerate(zip(co_imgs, co_mzs, co_pep_labels)):
             _q = feature_qvals.get(cmz, float("nan")) if feature_qvals else float("nan")
             _q_s = f"\nq={_q:.3f}" if np.isfinite(_q) else ""
-            _panel(axes[1 + i], cimg, f"Co-feat\n{cmz:.4f}{_q_s}", r=_pearson_r(prec_img, cimg))
-        _panel(axes[-1], prot_mean, f"Protein mean\n({len(all_imgs)} imgs)", r=_pearson_r(prec_img, prot_mean))
+            _co_pep_s = f"\n{clabel}" if clabel else ""
+            _panel(axes[1 + i], cimg, f"{cmz:.4f}{_co_pep_s}{_q_s}", r=_pearson_r(prec_img, cimg))
+        _panel(axes[n_panels - 1], prot_mean, f"Protein mean\n({len(all_imgs)} imgs)",
+               r=_pearson_r(prec_img, prot_mean))
+        for ax in axes[n_panels:]:
+            ax.axis("off")
 
         fig.suptitle(_candidate_title(row), fontsize=8, y=1.01)
         plt.tight_layout()
@@ -2195,6 +2226,286 @@ def plot_pep_mixture(
 
 
 # ---------------------------------------------------------------------------
+# Subsystem 12: Ion image Pearson r distribution
+# ---------------------------------------------------------------------------
+
+def plot_ion_image_pearson_distribution(
+    features_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    out_dir: str,
+    fdr_threshold: float = 0.05,
+) -> None:
+    """
+    Distribution of pairwise ion image Pearson r for same-protein vs different-protein
+    peptide pairs, restricted to target IDs at reweighted FDR <= fdr_threshold.
+
+    Output: ``{out_dir}/ion_image_pearson_distribution.png``
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat = features_df.reset_index(drop=True)
+    res  = result_df.reset_index(drop=True)
+
+    is_winner = (
+        res.get("is_tdc_winner", pd.Series(False, index=res.index))
+        .fillna(False).astype(bool).values
+    )
+    rw_q = pd.to_numeric(
+        res.get("reweighted_q_value", pd.Series(float("nan"), index=res.index)),
+        errors="coerce",
+    ).values
+    is_decoy = (
+        feat.get("is_decoy", pd.Series(False, index=feat.index))
+        .fillna(False).astype(bool).values
+    )
+
+    id_mask = is_winner & (rw_q <= fdr_threshold) & ~is_decoy
+    id_idx = np.where(id_mask)[0]
+    if len(id_idx) < 2:
+        logger.debug(
+            "plot_ion_image_pearson_distribution: fewer than 2 target IDs at FDR %.2f, skipping",
+            fdr_threshold,
+        )
+        return
+
+    id_mzs = (
+        feat["feature_mz"].values[id_idx]
+        if "feature_mz" in feat.columns
+        else np.full(len(id_idx), float("nan"))
+    )
+    id_proteins = (
+        feat["protein"].fillna("unknown").values[id_idx]
+        if "protein" in feat.columns
+        else np.full(len(id_idx), "unknown")
+    )
+
+    flat_imgs: list[np.ndarray] = []
+    valid_pos: list[int] = []
+    for pos, mz in enumerate(id_mzs):
+        if not np.isfinite(float(mz)):
+            continue
+        img_idx = _find_image_idx(float(mz), ion_image_mzs)
+        if img_idx is None:
+            continue
+        flat_imgs.append(ion_images[img_idx].ravel().astype(float))
+        valid_pos.append(pos)
+
+    if len(valid_pos) < 2:
+        return
+
+    n = len(valid_pos)
+    valid_proteins = np.array([id_proteins[p] for p in valid_pos])
+    images_flat = np.array(flat_imgs)  # (n, n_pixels)
+
+    # Full Pearson r matrix via normalised dot product
+    means = images_flat.mean(axis=1, keepdims=True)
+    stds  = images_flat.std(axis=1, keepdims=True)
+    constant = stds.ravel() < 1e-9
+    stds_safe = np.where(constant[:, None], 1.0, stds)
+    normed = (images_flat - means) / stds_safe
+    normed[constant] = 0.0
+    corr = np.clip((normed @ normed.T) / images_flat.shape[1], -1.0, 1.0)
+
+    same_r: list[float] = []
+    diff_r: list[float] = []
+    for i in range(n):
+        if constant[i]:
+            continue
+        for j in range(i + 1, n):
+            if constant[j]:
+                continue
+            r = float(corr[i, j])
+            if valid_proteins[i] == valid_proteins[j]:
+                same_r.append(r)
+            else:
+                diff_r.append(r)
+
+    if not same_r and not diff_r:
+        return
+
+    rng = np.random.default_rng(42)
+    max_bg = 10_000
+    if len(diff_r) > max_bg:
+        diff_r = rng.choice(diff_r, max_bg, replace=False).tolist()
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bins = np.linspace(-1.0, 1.0, 61)
+    if diff_r:
+        ax.hist(
+            diff_r, bins=bins, alpha=0.55, color="steelblue", density=True,
+            label=f"Different protein ({len(diff_r):,} pairs)",
+        )
+    if same_r:
+        ax.hist(
+            same_r, bins=bins, alpha=0.70, color="tomato", density=True,
+            label=f"Same protein ({len(same_r):,} pairs)",
+        )
+    ax.axvline(0, color="black", lw=0.8, ls=":")
+    ax.set_xlabel("Pearson r of ion images")
+    ax.set_ylabel("Density")
+    ax.set_title(
+        f"Ion image colocalization — peptide pairs at ≤{fdr_threshold:.0%} reweighted FDR\n"
+        f"(n={n} target IDs)"
+    )
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, "ion_image_pearson_distribution.png"),
+        dpi=120, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Subsystem 13: Protein spatial coherence scatter
+# ---------------------------------------------------------------------------
+
+def plot_protein_spatial_coherence(
+    features_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    out_dir: str,
+    fdr_threshold: float = 0.05,
+) -> None:
+    """
+    Per-protein scatter: number of unique peptides at reweighted FDR <= fdr_threshold
+    (x-axis) vs mean pairwise ion image Pearson r (y-axis).  Singletons are shown at
+    y = -0.15 with jitter.  Target and decoy proteins are coloured separately.
+
+    Output: ``{out_dir}/protein_spatial_coherence.png``
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat = features_df.reset_index(drop=True)
+    res  = result_df.reset_index(drop=True)
+
+    is_winner = (
+        res.get("is_tdc_winner", pd.Series(False, index=res.index))
+        .fillna(False).astype(bool).values
+    )
+    rw_q = pd.to_numeric(
+        res.get("reweighted_q_value", pd.Series(float("nan"), index=res.index)),
+        errors="coerce",
+    ).values
+    is_decoy = (
+        feat.get("is_decoy", pd.Series(False, index=feat.index))
+        .fillna(False).astype(bool).values
+    )
+
+    id_mask = is_winner & (rw_q <= fdr_threshold)
+    id_idx = np.where(id_mask)[0]
+    if len(id_idx) < 2:
+        return
+
+    id_mzs   = (
+        feat["feature_mz"].values[id_idx]
+        if "feature_mz" in feat.columns
+        else np.full(len(id_idx), float("nan"))
+    )
+    id_prots  = (
+        feat["protein"].fillna("unknown").values[id_idx]
+        if "protein" in feat.columns
+        else np.full(len(id_idx), "unknown")
+    )
+    id_decoys = is_decoy[id_idx]
+
+    prot_imgs: dict[str, list[np.ndarray]] = {}
+    prot_is_decoy: dict[str, bool] = {}
+    for mz, prot, dec in zip(id_mzs, id_prots, id_decoys):
+        if not np.isfinite(float(mz)):
+            continue
+        img_idx = _find_image_idx(float(mz), ion_image_mzs)
+        if img_idx is None:
+            continue
+        img = ion_images[img_idx].ravel().astype(float)
+        if prot not in prot_imgs:
+            prot_imgs[prot] = []
+            prot_is_decoy[prot] = bool(dec)
+        prot_imgs[prot].append(img)
+        if not bool(dec):
+            prot_is_decoy[prot] = False  # target evidence takes priority
+
+    rows = []
+    for prot, imgs in prot_imgs.items():
+        n_pep = len(imgs)
+        if n_pep == 1:
+            mean_r = float("nan")
+        else:
+            rs = [
+                _pearson_r(imgs[a], imgs[b])
+                for a in range(n_pep)
+                for b in range(a + 1, n_pep)
+            ]
+            finite_rs = [r for r in rs if np.isfinite(r)]
+            mean_r = float(np.mean(finite_rs)) if finite_rs else float("nan")
+        rows.append({
+            "protein": prot,
+            "n_peptides": n_pep,
+            "mean_r": mean_r,
+            "is_decoy": prot_is_decoy[prot],
+        })
+
+    if not rows:
+        return
+
+    df_p  = pd.DataFrame(rows)
+    multi  = df_p[df_p["n_peptides"] > 1]
+    single = df_p[df_p["n_peptides"] == 1]
+
+    rng = np.random.default_rng(42)
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for dec, color, lbl in [(False, "tomato", "target"), (True, "steelblue", "decoy")]:
+        sub = multi[multi["is_decoy"] == dec]
+        if not sub.empty:
+            ax.scatter(
+                sub["n_peptides"], sub["mean_r"],
+                c=color, alpha=0.75, s=50, zorder=3,
+                label=f"Multi-peptide {lbl} (n={len(sub)})",
+            )
+
+    for dec, color, lbl in [(False, "tomato", "target"), (True, "steelblue", "decoy")]:
+        sub = single[single["is_decoy"] == dec]
+        if not sub.empty:
+            jx = rng.uniform(-0.08, 0.08, len(sub))
+            jy = rng.uniform(-0.02, 0.02, len(sub))
+            ax.scatter(
+                sub["n_peptides"].values + jx, -0.15 + jy,
+                c=color, alpha=0.45, s=25, marker="x", zorder=2,
+                label=f"Singleton {lbl} (n={len(sub)})",
+            )
+
+    if not multi.empty:
+        top_n = multi.nlargest(min(10, len(multi)), "n_peptides")
+        for _, r in top_n.iterrows():
+            short = str(r["protein"]).split("|")[-1][:20]
+            ax.annotate(
+                short, (r["n_peptides"], r["mean_r"]),
+                textcoords="offset points", xytext=(5, 3),
+                fontsize=6, alpha=0.8,
+            )
+
+    ax.axhline(0.0, color="black", lw=0.8, ls=":")
+    ax.set_xlabel("Unique peptides at FDR threshold")
+    ax.set_ylabel("Mean pairwise ion image Pearson r")
+    ax.set_title(
+        f"Protein spatial coherence at ≤{fdr_threshold:.0%} reweighted FDR\n"
+        f"(n={len(df_p)} proteins; singletons shown at y=−0.15)"
+    )
+    ax.set_xlim(left=0.0)
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, "protein_spatial_coherence.png"),
+        dpi=120, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -2278,16 +2589,20 @@ def save_debug_figures(
         errors="coerce",
     ).values
     feature_qvals: dict[float, float] = {}
+    feature_peptides: dict[float, str] = {}
     if "feature_mz" in _feat_al.columns:
         _fmz_arr = _feat_al["feature_mz"].values
+        _pep_arr = _feat_al["peptide"].values if "peptide" in _feat_al.columns else None
         for _wi in np.where(_winner_arr)[0]:
             _mz = float(_fmz_arr[_wi])
             _q = float(_rw_q_arr[_wi]) if np.isfinite(_rw_q_arr[_wi]) else float(_q_fb_arr[_wi])
             feature_qvals[_mz] = _q
+            if _pep_arr is not None:
+                feature_peptides[_mz] = str(_pep_arr[_wi])
 
     if ion_images is not None:
         try:
-            # Build a full (unsampled) set of FDR ≤ 1% winners for ion images.
+            # Build a full (unsampled) set of FDR ≤ 5% winners for ion images.
             feat_aligned = features_df.reset_index(drop=True)
             res_aligned = result_df.reset_index(drop=True)
             _is_winner = (
@@ -2298,7 +2613,7 @@ def save_debug_figures(
                 res_aligned.get("reweighted_q_value", pd.Series(float("nan"), index=res_aligned.index)),
                 errors="coerce",
             )
-            _id_mask = _is_winner & (_rw_q <= 0.01)
+            _id_mask = _is_winner & (_rw_q <= 0.05)
             if not _id_mask.any() and "pep" in res_aligned.columns:
                 _pep = pd.to_numeric(res_aligned["pep"], errors="coerce")
                 _winner_idx = np.where(_is_winner.values)[0]
@@ -2327,10 +2642,11 @@ def save_debug_figures(
             id_subset["_score_r1"] = id_subset[_score_r1_cols[0]] if _score_r1_cols else np.nan
             id_subset["_total"] = len(feat_aligned)
 
-            # Reorder by m/z diversity so that maximally spread features appear
-            # first in the output directory.  Closely-spaced features (same peak
-            # badly split into multiple m/z entries) are pushed to the end.
-            id_subset = _mz_diverse_order(id_subset)
+            # Sort by reweighted_q_value ascending so the most confident IDs appear first.
+            if "reweighted_q_value" in id_subset.columns:
+                id_subset = id_subset.sort_values(
+                    "reweighted_q_value", ascending=True
+                ).reset_index(drop=True)
             id_subset["_rank"] = np.arange(1, len(id_subset) + 1)
 
             # Combine: all ID rows + sampled R1/L rows from the existing subset.
@@ -2348,10 +2664,35 @@ def save_debug_figures(
                 subset_for_images, features_df, ion_images, ion_image_mzs,
                 out_dir=os.path.join(debug_dir, "ion_images"),
                 feature_qvals=feature_qvals,
+                feature_peptides=feature_peptides,
             )
             logger.info("Ion image colocalization figures saved to %s/ion_images/", debug_dir)
         except Exception as exc:
             logger.warning("Ion image colocalization figures failed: %s", exc)
+
+        try:
+            plot_ion_image_pearson_distribution(
+                features_df, result_df, ion_images, ion_image_mzs,
+                out_dir=debug_dir,
+            )
+            logger.info(
+                "Ion image Pearson distribution saved to %s/ion_image_pearson_distribution.png",
+                debug_dir,
+            )
+        except Exception as exc:
+            logger.warning("Ion image Pearson distribution failed: %s", exc)
+
+        try:
+            plot_protein_spatial_coherence(
+                features_df, result_df, ion_images, ion_image_mzs,
+                out_dir=debug_dir,
+            )
+            logger.info(
+                "Protein spatial coherence saved to %s/protein_spatial_coherence.png",
+                debug_dir,
+            )
+        except Exception as exc:
+            logger.warning("Protein spatial coherence failed: %s", exc)
 
     try:
         plot_feature_diagnostics(
@@ -2510,6 +2851,7 @@ def save_debug_figures(
                             gt_subset, features_df, ion_images, ion_image_mzs,
                             out_dir=os.path.join(debug_dir, "ion_images"),
                             feature_qvals=feature_qvals,
+                            feature_peptides=feature_peptides,
                         )
                     except Exception as exc:
                         logger.warning("GT ion image figures failed: %s", exc)

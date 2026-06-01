@@ -220,7 +220,7 @@ def _write_results(
     if "is_tdc_winner" in result.columns and "reweighted_q_value" in result.columns:
         winners = result[result["is_tdc_winner"] & (result["reweighted_q_value"] <= 0.01)]
         peptides_out = os.path.join(output_dir, "ms1rescore_peptides.tsv")
-        cols = [c for c in ["feature_idx", "feature_mz", "peptide", "protein", "reweighted_q_value"] if c in winners.columns]
+        cols = [c for c in ["feature_idx", "feature_mz", "feature_ccs", "peptide", "protein", "reweighted_q_value"] if c in winners.columns]
         peptides = winners[cols].drop_duplicates().sort_values("reweighted_q_value")
         peptides.to_csv(peptides_out, sep="\t", index=False)
         logger.info(f"  Wrote {len(peptides)} peptide-level winners → {peptides_out}")

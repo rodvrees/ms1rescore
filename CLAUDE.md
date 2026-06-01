@@ -624,13 +624,42 @@ All backends follow the same two-pass structure:
 
 **`model="lda"` (default):** Semi-supervised `LinearDiscriminantAnalysis` (sklearn) on `MALDI_INTRINSIC_FEATURES`. No extra dependencies beyond sklearn (always installed). Preferred over SVM because it converges faster and produces cleaner feature importances.
 
-Preprocessing: ±inf replaced with NaN, then `SimpleImputer(strategy="median")` + `StandardScaler` inside a sklearn `Pipeline`.
+Preprocessing: ±inf replaced with NaN, then `SimpleImputer(strategy="median")` + `StandardScaler` inside a sklearn `Pipeline`. LDA is configured with `solver="lsqr"` and `shrinkage="auto"` (Ledoit-Wolf regularisation).
 
-Seed positives: targets where `ppm_error_abs < init_ppm_threshold` OR `n_candidates == 1`. Falls back to the top-10% of targets by ppm if no seeds pass.
+**Round-1 seed — `_find_best_feature_labels` (Mokapot-style):**
 
-Pseudo-label iteration (≤5 rounds): train on positives + all decoys → predict `decision_function` scores → update positive set to all targets at TDC q ≤ 0.05 → stop when < 1% change.
+For each feature column and each ranking direction (ascending / descending), TDC q-values are computed and the number of targets at q ≤ `train_fdr` is counted. Sub-ULP random noise (`np.random.default_rng(0).uniform(-1e-9, 1e-9)`) is added before argsort to break ties and prevent row-order bias (targets listed before decoys in the DataFrame would otherwise receive artificially low q-values under stable sort). The (feature, direction) pair yielding the most targets is selected.
 
-Round 2: seeds from the top-20% of target winners by R1 score (percentile cut, not ppm), because after winner selection most targets exceed `init_ppm_threshold` and ppm-based seeding would leave too few seeds.
+If the best single-feature result is below `min_pair_threshold` (default 10) targets, all pairwise sums and differences of eligible features are tried on standardised columns. The composite score beating the single-feature result is used if one exists.
+
+Columns in `_BEST_FEAT_SKIP` are excluded from both the single-feature and pairwise sweeps because they measure amino acid composition rather than spectral quality and can produce spurious pseudo-positives when shuffled decoys have a different residue composition than targets:
+
+```python
+_BEST_FEAT_SKIP = {
+    "peptide_length", "n_missed_cleavages",         # basic sequence
+    "has_oxidized_met", "has_cys", "n_proline", "acidic_residue_density",  # composition
+    "n_arginine", "n_basic_residues", "n_aromatic", "gravy_score", "charge_proxy",  # ionisation
+}
+```
+
+**Fallback chain when best-feature init yields 0 targets:**
+1. `ppm_error_abs < init_ppm_threshold` OR `n_candidates == 1`
+2. If that also yields nothing: top `r1_seed_percentile` (default 10%) of targets by `ppm_error_abs`
+
+**Pseudo-label iteration** (up to `max_iter` rounds, default 5): train on seed positives (+1) + all decoys (−1), excluding unlabelled targets (0) from the training set; score all candidates with `decision_function`; recompute TDC q-values; promote all targets at q ≤ `train_fdr` to +1. Stop when the positive count changes by < 1% or no positives remain.
+
+**Round-2 seed:** top `r2_seed_percentile` (default 20%) of target TDC winners by R1 score — i.e. targets with `R1_score ≥ np.percentile(target_winner_scores, 100*(1−r2_seed_percentile))`. Ppm-based seeding is not used for R2 because after winner selection most targets already satisfy `ppm_error_abs < init_ppm_threshold` and the criterion becomes uninformative.
+
+**Key parameters** (all configurable via CLI / TOML):
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `init_ppm_threshold` | 5.0 | ppm cutoff for the ppm-based fallback seed |
+| `train_fdr` | 0.01 | q-value threshold for pseudo-label promotion |
+| `max_iter` | 5 | Maximum pseudo-label iterations |
+| `min_pair_threshold` | 10 | Min targets required from single feature before trying pairs |
+| `r1_seed_percentile` | 0.10 | Top fraction of targets by ppm used as last-resort R1 seed |
+| `r2_seed_percentile` | 0.20 | Top fraction of target winners by R1 score used as R2 seed |
 
 Feature importances: `|coef_[0]|` from the final Pipeline LDA. Saved to `17_debug_lda_importances_r1/r2.tsv` when `--verbose`.
 
