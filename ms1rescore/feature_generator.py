@@ -81,6 +81,11 @@ MALDI_INTRINSIC_FEATURES = [
     "isotope_image_colocalization_mean",
     # --- adduct co-localization (E2) — optional, requires ion_images ---
     "adduct_colocalization_na", "adduct_colocalization_k", "adduct_colocalization_chca",
+    # --- per-candidate mobility-filtered colocalization — optional, requires tdf_path + im2deep ---
+    "isotope_colocalization_m1_mob", "isotope_colocalization_m2_mob",
+    "isotope_colocalization_mean_mob",
+    "adduct_colocalization_na_mob", "adduct_colocalization_k_mob",
+    "adduct_colocalization_chca_mob",
 ]
 
 # Protein-level features: aggregate signal across all candidates sharing a protein,
@@ -113,10 +118,6 @@ _LCMS_MZML_FEATURES = [
     "lcms_ms1_isotope_cosine",
     "theo_m1_ratio_diff_lcms", "theo_m2_ratio_diff_lcms",
     "log_theo_m1_ratio_diff_lcms", "log_theo_m2_ratio_diff_lcms",
-    # MALDI vs LC-MS/MS isotope envelope similarity (requires maldi_envelopes)
-    "isotope_envelope_pearson",
-    "isotope_envelope_mse",
-    "isotope_n_matched", "isotope_absolute_diff",
     # DeepLC-anchored RT-consistency and apex features
     "lcms_ms1_apex_rt_delta",
     "lcms_ms1_frac_apex_signal",
@@ -130,6 +131,10 @@ _LCMS_MZML_FEATURES = [
 # These go in the ranker (MALDI_INTRINSIC_FEATURES), not the prior.
 _LCMS_RANKER_FROM_EVIDENCE = [
     "isotope_envelope_cosine",
+    "isotope_envelope_pearson",
+    "isotope_envelope_mse",
+    "isotope_n_matched",
+    "isotope_absolute_diff",
     "log_isotope_m1_ratio_diff",
     "log_isotope_m2_ratio_diff",
 ]
@@ -156,6 +161,9 @@ SPATIAL_PRIOR_FEATURES = [
     "spatial_autocorrelation", "fraction_detected", "intensity_cv",
     "log_mean_intensity", "spatial_entropy",
     "spatial_morans_i", "spatial_gearys_c",
+    # per-candidate mobility-filtered spatial quality (optional, requires tdf_path + im2deep)
+    "fraction_detected_mob", "intensity_cv_mob",
+    "log_mean_intensity_mob", "spatial_morans_i_mob",
 ]
 
 # Alias kept separate so LDA-specific feature selection can diverge later.
@@ -180,8 +188,6 @@ MAIN_FEATURES = [
     "chca_cluster_distance_ppm",
     # maldi_intensity (from 2 → 1)
     "log_maldi_intensity_p90",
-    # envelope_lcms (from 3 → 1)
-    "isotope_envelope_cosine",
     # im2deep (from 4 → 1)
     "im2deep_ccs_zscore",
     # averagine (from 2 → 1)
@@ -210,8 +216,6 @@ MAIN_FEATURES = [
 #   "col_max"  — fill with np.nanmax of that column (worst-case penalty)
 #   "col_min"  — fill with np.nanmin of that column
 FEATURE_NAN_FILL: dict[str, float | str] = {
-    # No LC-MS/MS envelope match → treat as worst cosine similarity
-    "isotope_envelope_cosine": 0.0,
     # No LC-MS/MS envelope match → worst ratio deviation (largest observed error)
     "log_isotope_m1_ratio_diff": "col_max",
     "log_isotope_m2_ratio_diff": "col_max",
@@ -241,6 +245,16 @@ _ADDUCT_COLOC_FEATS = frozenset([
     "adduct_colocalization_na", "adduct_colocalization_k", "adduct_colocalization_chca",
 ])
 _MORANS_FEATS = frozenset(["spatial_morans_i", "spatial_gearys_c"])
+_MOB_COLOC_FEATS = frozenset([
+    "isotope_colocalization_m1_mob", "isotope_colocalization_m2_mob",
+    "isotope_colocalization_mean_mob",
+    "adduct_colocalization_na_mob", "adduct_colocalization_k_mob",
+    "adduct_colocalization_chca_mob",
+])
+_MOB_SPATIAL_FEATS = frozenset([
+    "fraction_detected_mob", "intensity_cv_mob",
+    "log_mean_intensity_mob", "spatial_morans_i_mob",
+])
 
 
 def get_feature_names(
@@ -249,6 +263,7 @@ def get_feature_names(
     has_envelopes: bool = False,  # kept for backwards compatibility; no longer used
     has_pixel_coords: bool = False,
     has_ccs: bool = False,
+    has_mob_coloc: bool = False,
 ) -> list[str]:
     """Return the full list of feature names based on available data.
 
@@ -263,6 +278,7 @@ def get_feature_names(
         and (f not in _ADDUCT_COLOC_FEATS or has_ion_images)
         and (f not in _PIXEL_FEATS or has_pixel_coords)
         and (f not in _CCS_FEATS or has_ccs)
+        and (f not in _MOB_COLOC_FEATS or has_mob_coloc)
     ]
     return intrinsic + LCMS_PRIOR_FEATURES
 
@@ -357,17 +373,9 @@ def compute_all_features(
     # when maldi_envelopes was passed to compute_all_lcms_evidence.
     if lcms_evidence is not None:
         ev_df = pd.DataFrame.from_dict(lcms_evidence, orient="index", dtype=float)
-        # Join prior and ranker evidence columns in one operation.
-        all_ev_cols = _LCMS_MZML_FEATURES + _LCMS_RANKER_FROM_EVIDENCE
-        ev_df = ev_df.reindex(columns=all_ev_cols)
+        ev_df = ev_df.reindex(columns=_LCMS_MZML_FEATURES)
         df = df.join(ev_df, how="left")
-        # Fill NaN for prior features with 0.0; ranker features keep NaN for LDA imputer.
         df[_LCMS_MZML_FEATURES] = df[_LCMS_MZML_FEATURES].fillna(0.0)
-        # Drop any ranker evidence column that is entirely NaN (e.g. maldi_envelopes not
-        # provided): an all-NaN column breaks SimpleImputer → StandardScaler → LDA.
-        for feat in _LCMS_RANKER_FROM_EVIDENCE:
-            if feat in df.columns and df[feat].isna().all():
-                df = df.drop(columns=[feat])
         # For similarity/ratio features and NaN-sentinel RT-delta features, replace
         # 0-fill with column median so candidates without signal are not penalised.
         _median_fill_feats = [
@@ -387,8 +395,6 @@ def compute_all_features(
     else:
         for feat in _LCMS_MZML_FEATURES:
             df[feat] = 0.0
-        # _LCMS_RANKER_FROM_EVIDENCE columns are not added when no mzML is provided;
-        # pipeline.py's intrinsic_present filter excludes absent columns automatically.
 
     # --- MALDI vs LC-MS/MS CCS features (optional) ---
     df = compute_lcms_ccs_features(df, observed_ccs_per_feature=observed_ccs_per_feature)

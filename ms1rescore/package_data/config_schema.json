@@ -17,6 +17,7 @@
           "type": ["string", "null"],
           "enum": ["lda", "qda", "svm", "catboost", null]
         },
+        "init_fdr":               {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "train_fdr":              {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "n_interaction_features": {"type": ["integer", "null"], "minimum": 0},
         "storey_pi0":             {"type": ["boolean", "null"]},
@@ -42,7 +43,7 @@
         "catboost_iterations":    {"type": ["integer", "null"], "minimum": 1},
         "mokapot_max_iter":       {"type": ["integer", "null"], "minimum": 1},
         "max_iter":               {"type": ["integer", "null"], "minimum": 1},
-        "min_pair_threshold":     {"type": ["integer", "null"], "minimum": 0},
+        "min_seed_positives":     {"type": ["integer", "null"], "minimum": 0},
         "init_ppm_threshold":     {"type": ["number", "null"], "minimum": 0},
         "init_isotope_threshold": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
 
@@ -110,6 +111,8 @@
         "spatial_prior_weight":{"type": ["number", "null"], "minimum": 0},
         "match_ccs":              {"type": ["boolean", "null"]},
         "ccs_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
+        "mob_coloc":              {"type": ["boolean", "null"]},
+        "mob_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
 
         "maldi_extraction": {
           "type": ["object", "null"],

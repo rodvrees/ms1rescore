@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -745,14 +746,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--init-fdr",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "LDA/QDA only: FDR threshold used for best-feature seed initialization "
+            "and pairwise combination search (default 0.2)."
+        ),
+    )
+    rescore_grp.add_argument(
         "--train-fdr",
         type=float,
         default=None,
         metavar="FLOAT",
         help=(
             "FDR threshold used for: (1) SVM model training; "
-            "(2) best-feature seed initialization and pseudo-label iteration "
-            "threshold in LDA/QDA backends (default 0.01)."
+            "(2) pseudo-label iteration threshold in LDA/QDA backends (default 0.05)."
         ),
     )
     rescore_grp.add_argument(
@@ -922,17 +932,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum iterations for mokapot PercolatorModel (default 10).",
     )
     rescore_grp.add_argument(
-        "--min-pair-threshold",
+        "--min-seed-positives",
         type=int,
         default=None,
         metavar="INT",
         help=(
             "LDA/QDA only: minimum number of pseudo-positive targets required from "
             "the single-feature sweep before the pairwise combination search is "
-            "skipped. When the single-feature result has fewer than this many "
-            "targets at q<=train_fdr, all unique feature pairs (sum and difference) "
-            "are tried and the best-performing composite score is used if it beats "
-            "the single-feature result. Default: 10."
+            "triggered. When fewer than this many targets pass at q<=init_fdr, all "
+            "unique feature pairs are tried. Default: 50."
         ),
     )
 
@@ -1156,10 +1164,11 @@ def main() -> None:
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
         "features_preset", "features_exclude",
         "pseudo_label_max_iter", "pseudo_label_fdr", "r1_seed_percentile", "r2_seed_percentile",
-        "catboost_iterations", "mokapot_max_iter", "max_iter", "min_pair_threshold",
+        "catboost_iterations", "mokapot_max_iter", "max_iter", "init_fdr", "min_seed_positives",
         "matching_ppm", "fragment_tol_da", "winner_percentile",
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
         "match_ccs", "ccs_window_multiplier",
+        "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         # file paths
         "fasta", "extra_fasta", "mzml",
         "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
@@ -1197,6 +1206,10 @@ def main() -> None:
 
     # Convenience aliases from config
     output_dir = _ms1cfg["output_dir"]
+    if Path(output_dir).exists() and not Path(output_dir).is_dir():
+        parser.error(f"Output path {output_dir!r} exists and is not a directory.")
+    elif not Path(output_dir).exists():
+        os.makedirs(output_dir, exist_ok=True)
     verbose = _ms1cfg["verbose"]
 
     # Write full merged config to output dir for reproducibility
@@ -1514,6 +1527,7 @@ def main() -> None:
         maldi_envelopes=maldi_envelopes,
         msf_path=args.msf,
         ppm_tolerance=_ms1cfg["ppm_tolerance"],
+        init_fdr=_ms1cfg["init_fdr"],
         train_fdr=_ms1cfg["train_fdr"],
         missed_cleavages=missed_cleavages,
         min_length=min_length,
@@ -1542,6 +1556,9 @@ def main() -> None:
         observed_ccs_per_feature=observed_ccs,
         im2deep_calibration=_ms1cfg["im2deep_calibration"],
         im2deep_kwargs=_ms1cfg.get("im2deep"),
+        deeplc_finetune_epochs=_ms1cfg["deeplc_finetune_epochs"],
+        deeplc_finetune_lr=_ms1cfg["deeplc_finetune_lr"],
+        deeplc_finetune_patience=_ms1cfg["deeplc_finetune_patience"],
         digest=args.digest,
         gt_peptides=gt_peptides,
         maldi_intensities=_mzs_intensities,
@@ -1560,7 +1577,7 @@ def main() -> None:
         catboost_iterations=_ms1cfg["catboost_iterations"],
         mokapot_max_iter=_ms1cfg["mokapot_max_iter"],
         max_iter=_ms1cfg["max_iter"],
-        min_pair_threshold=_ms1cfg["min_pair_threshold"],
+        min_seed_positives=_ms1cfg["min_seed_positives"],
         matching_ppm=_ms1cfg["matching_ppm"],
         fragment_tol_da=_ms1cfg["fragment_tol_da"],
         winner_percentile=_ms1cfg["winner_percentile"],
@@ -1569,6 +1586,9 @@ def main() -> None:
         spatial_prior_weight=_ms1cfg["spatial_prior_weight"],
         match_ccs=bool(_ms1cfg.get("match_ccs", False)),
         ccs_window_multiplier=_ms1cfg["ccs_window_multiplier"],
+        tdf_path=_maldi_raw_path,
+        mob_coloc=bool(_ms1cfg.get("mob_coloc", False)),
+        mob_window_multiplier=_ms1cfg["mob_window_multiplier"],
     )
 
     # --- Write results ---

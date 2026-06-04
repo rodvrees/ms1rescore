@@ -1205,6 +1205,441 @@ def _morans_gearys_chunk(
     return morans, gearys
 
 
+def _pearson_r_images(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson r between two same-shape images. Returns nan for constant images."""
+    af = a.ravel().astype(np.float32)
+    bf = b.ravel().astype(np.float32)
+    af -= af.mean()
+    bf -= bf.mean()
+    denom = np.sqrt((af * af).sum()) * np.sqrt((bf * bf).sum())
+    if denom < 1e-10:
+        return np.nan
+    return float((af * bf).sum() / denom)
+
+
+def compute_mobility_colocalization_features(
+    df: pd.DataFrame,
+    tdf_path: str,
+    mob_window_multiplier: float = 2.0,
+    extraction_ppm: float = 25.0,
+) -> pd.DataFrame:
+    """
+    Per-candidate isotopologue and adduct colocalization using mobility-filtered images.
+
+    Requires im2deep_predicted_ccs and im2deep_observed_ccs to be present in df.
+    The 1/K0 window half-width is derived from p95(|Δ1/K0|) on single-candidate
+    (n_candidates==1) features.
+
+    Adds ten new columns:
+      isotope_colocalization_m1_mob, isotope_colocalization_m2_mob,
+      isotope_colocalization_mean_mob,
+      adduct_colocalization_na_mob, adduct_colocalization_k_mob,
+      adduct_colocalization_chca_mob,
+      fraction_detected_mob, intensity_cv_mob,
+      log_mean_intensity_mob, spatial_morans_i_mob.
+
+    When ms1rescore_rs is available, builds a flat CSR once (one alphatims call
+    per pixel) and dispatches to a rayon-parallel Rust kernel that processes all
+    feature groups simultaneously.  Falls back to the per-feature Python loop
+    if the Rust extension is unavailable.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    NEW_COLS = [
+        "isotope_colocalization_m1_mob", "isotope_colocalization_m2_mob",
+        "isotope_colocalization_mean_mob",
+        "adduct_colocalization_na_mob", "adduct_colocalization_k_mob",
+        "adduct_colocalization_chca_mob",
+        "fraction_detected_mob", "intensity_cv_mob",
+        "log_mean_intensity_mob", "spatial_morans_i_mob",
+    ]
+
+    if "im2deep_predicted_ccs" not in df.columns:
+        logger.warning("im2deep_predicted_ccs not found — skipping mobility colocalization.")
+        for col in NEW_COLS:
+            df[col] = np.nan
+        return df
+
+    from im2deep.utils import ccs2im
+
+    # Convert predicted CCS → predicted 1/K0; MALDI is always [M+H]+ (charge=1)
+    df = df.copy()
+    df["_pred_inv_k0"] = ccs2im(
+        df["im2deep_predicted_ccs"].values, mz=df["feature_mz"].values, charge=1
+    )
+
+    # Data-driven 1/K0 window from single-candidate calibration set
+    k0_half_win = 0.05  # fallback
+    if "im2deep_observed_ccs" in df.columns:
+        single = df[df["n_candidates"] == 1].dropna(
+            subset=["im2deep_observed_ccs", "_pred_inv_k0"]
+        )
+        if len(single) >= 10:
+            obs_inv_k0 = ccs2im(
+                single["im2deep_observed_ccs"].values,
+                mz=single["feature_mz"].values,
+                charge=1,
+            )
+            delta = np.abs(single["_pred_inv_k0"].values - obs_inv_k0)
+            p95 = float(np.percentile(delta, 95))
+            k0_half_win = mob_window_multiplier * p95
+            logger.info(
+                f"Mobility colocalization: p95 |Δ1/K0| = {p95:.4f} V·s/cm² on "
+                f"{len(single)} single-candidate features → window = "
+                f"{mob_window_multiplier}× = {k0_half_win:.4f} V·s/cm²"
+            )
+        else:
+            logger.warning(
+                f"Mobility colocalization: only {len(single)} single-candidate matches "
+                f"with observed CCS — using fallback window {k0_half_win} V·s/cm²."
+            )
+    else:
+        logger.warning(
+            "im2deep_observed_ccs not found — using fallback 1/K0 window "
+            f"{k0_half_win} V·s/cm²."
+        )
+
+    # Load alphatims TimsTOF object and pixel coordinate map
+    tdf_path = Path(tdf_path)
+    try:
+        import alphatims.bruker as atb
+    except ImportError:
+        logger.warning("alphatims not installed — skipping mobility colocalization.")
+        for col in NEW_COLS:
+            df[col] = np.nan
+        return df
+
+    logger.info(f"Mobility colocalization: loading TDF from {tdf_path}")
+    tims = atb.TimsTOF(str(tdf_path))
+
+    with sqlite3.connect(str(tdf_path / "analysis.tdf")) as conn:
+        frames_meta = pd.read_sql(
+            "SELECT Frame, XIndexPos, YIndexPos FROM MaldiFrameInfo ORDER BY Frame",
+            conn,
+        ).dropna(subset=["XIndexPos", "YIndexPos"])
+
+    coord_map = {
+        int(r.Frame): (int(r.XIndexPos), int(r.YIndexPos))
+        for r in frames_meta.itertuples()
+    }
+    max_x = int(frames_meta["XIndexPos"].max()) + 1
+    max_y = int(frames_meta["YIndexPos"].max()) + 1
+
+    mob_arr = tims.mobility_values  # (n_scans,) float64
+
+    # m/z offsets: m0, m1, m2, na, k, chca (same order assumed by Rust)
+    _MZ_OFFSET_VALUES = [
+        0.0,
+        NEUTRON,
+        2.0 * NEUTRON,
+        _ADDUCT_DELTAS["na"],
+        _ADDUCT_DELTAS["k"],
+        _ADDUCT_DELTAS["chca"],
+    ]
+
+    feat_col = "feature_idx" if "feature_idx" in df.columns else "feature_mz"
+    groups = list(df.groupby(feat_col))
+
+    try:
+        from ms1rescore_rs import mob_coloc_features as _rs_mob_coloc
+        _use_rust = True
+    except ImportError:
+        _use_rust = False
+
+    if _use_rust:
+        # ------------------------------------------------------------------ #
+        # Rust path: direct push_indptr access + m/z pre-filtering.         #
+        #                                                                    #
+        # The old approach (one alphatims batch read) collected ALL peaks    #
+        # for all pixels into a ~1-5B element array, then lexsorted it —    #
+        # typically 5-40 GB of intermediate data and 25+ minutes.           #
+        #                                                                    #
+        # This approach:                                                     #
+        #  1. Reads peak ranges directly from push_indptr (no filter call)  #
+        #  2. Builds a TOF-bin boolean mask for the feature windows (~1-3%) #
+        #  3. Loads and filters peaks in pixel batches (5 000 pixels each)  #
+        #  4. Keeps only the ~1-3% of peaks that fall in a window           #
+        #  5. Sorts only the filtered peaks (50-100× fewer)                 #
+        # ------------------------------------------------------------------ #
+        scan_max     = int(tims.scan_max_index)
+        frame_offset = int(tims.zeroth_frame)   # 1 if zeroth frame exists (default), else 0
+        push_indptr  = np.asarray(tims.push_indptr, dtype=np.int64)
+        tof_max_idx  = int(tims.tof_max_index)
+        tof_idx_np   = np.asarray(tims.tof_indices, dtype=np.int32)
+        intensity_np = np.asarray(tims.intensity_values, dtype=np.float32)
+        mz_arr_np    = np.asarray(tims.mz_values, dtype=np.float32)  # per-TOF-bin
+        mob_arr      = tims.mobility_values                           # per-scan 1/K0
+
+        sorted_fids = sorted(coord_map.keys())
+        n_pixels    = len(sorted_fids)
+
+        # Peak range per pixel: derived from push_indptr, no alphatims call
+        frame_positions = np.array(sorted_fids, dtype=np.int64) - 1 + frame_offset
+        push_starts_pp  = frame_positions * scan_max
+        push_ends_pp    = (frame_positions + 1) * scan_max
+        peak_starts_pp  = push_indptr[push_starts_pp]
+        peak_ends_pp    = push_indptr[push_ends_pp]
+        peak_counts_pp  = peak_ends_pp - peak_starts_pp
+
+        # Build TOF-bin filter mask: mark every bin that falls inside at least
+        # one of the 6 extraction windows for any feature.
+        ppm_factor   = extraction_ppm * 1e-6
+        relevant_tof = np.zeros(tof_max_idx, dtype=np.bool_)
+        for _, grp in groups:
+            feat_mz = float(grp["feature_mz"].iloc[0])
+            for offset in _MZ_OFFSET_VALUES:
+                qmz = feat_mz + offset
+                lo = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 - ppm_factor)), "left"))
+                hi = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 + ppm_factor)), "right"))
+                if lo < hi:
+                    relevant_tof[lo:hi] = True
+
+        n_rel = int(relevant_tof.sum())
+        logger.info(
+            f"Mobility colocalization: {n_pixels} pixels, "
+            f"{n_rel}/{tof_max_idx} TOF bins in extraction windows "
+            f"({100.0 * n_rel / max(tof_max_idx, 1):.1f}%); loading filtered peaks…"
+        )
+
+        # Process pixels in batches of _BATCH to bound peak memory per iteration
+        _BATCH = 5000
+        all_pix:   list[np.ndarray] = []
+        all_mzs_l: list[np.ndarray] = []
+        all_scn_l: list[np.ndarray] = []
+        all_int_l: list[np.ndarray] = []
+
+        for b0 in range(0, n_pixels, _BATCH):
+            b1        = min(b0 + _BATCH, n_pixels)
+            b_starts  = peak_starts_pp[b0:b1]
+            b_counts  = peak_counts_pp[b0:b1]
+            b_total   = int(b_counts.sum())
+            if b_total == 0:
+                continue
+
+            # Vectorised global raw peak indices for this batch
+            b_out_starts = np.concatenate([[np.int64(0)], np.cumsum(b_counts[:-1])])
+            b_base       = np.repeat(b_starts - b_out_starts, b_counts)
+            b_raw        = np.arange(b_total, dtype=np.int64) + b_base
+
+            # Filter to relevant m/z windows via TOF-bin index
+            b_tof  = tof_idx_np[b_raw]
+            b_mask = relevant_tof[b_tof.astype(np.int64)]
+            if not b_mask.any():
+                continue
+
+            b_raw_f = b_raw[b_mask]
+            b_pix   = np.repeat(np.arange(b0, b1, dtype=np.int32), b_counts)[b_mask]
+            b_tof_f = b_tof[b_mask].astype(np.int64)
+
+            b_mzs  = mz_arr_np[b_tof_f]
+            b_ints = intensity_np[b_raw_f]
+            b_push = np.searchsorted(push_indptr, b_raw_f, side="right") - 1
+            b_scns = (b_push % scan_max).astype(np.uint32)
+
+            all_pix.append(b_pix)
+            all_mzs_l.append(b_mzs)
+            all_scn_l.append(b_scns)
+            all_int_l.append(b_ints)
+
+        if not all_pix:
+            logger.warning("No peaks found in any extraction window — skipping mob coloc.")
+            for col in NEW_COLS:
+                df[col] = np.nan
+            return df
+
+        pix_ids  = np.concatenate(all_pix)
+        mzs_all  = np.concatenate(all_mzs_l)
+        scan_ids = np.concatenate(all_scn_l)
+        ints_all = np.concatenate(all_int_l)
+
+        total_filtered = len(mzs_all)
+        total_all      = int(peak_counts_pp.sum())
+        logger.info(
+            f"Mobility colocalization: {total_filtered:,} relevant peaks "
+            f"({100.0 * total_filtered / max(total_all, 1):.1f}% of {total_all:,} total); "
+            f"sorting…"
+        )
+
+        # Sort by (pixel_id, mz) so Rust can binary-search per-pixel m/z windows
+        order    = np.lexsort((mzs_all, pix_ids))
+        pix_ids  = pix_ids[order]
+        scan_ids = scan_ids[order]
+        mzs_all  = mzs_all[order]
+        ints_all = ints_all[order]
+
+        # CSR offsets: pixel_offsets[px] … pixel_offsets[px+1] = peak range for pixel px
+        pixel_offsets_arr = np.searchsorted(pix_ids, np.arange(n_pixels + 1), side="left")
+        pixel_offsets = pixel_offsets_arr.astype(np.uint64).tolist()
+
+        # Pixel coordinates in the same order as sorted_fids
+        pixel_xi_list = [coord_map[fid][0] for fid in sorted_fids]
+        pixel_yi_list = [coord_map[fid][1] for fid in sorted_fids]
+
+        flat_mzs   = mzs_all
+        flat_scans = scan_ids
+        flat_ints  = ints_all
+
+        # Build feature m/z windows: flat array (n_features × 6 × 2)
+        # ppm_factor already defined above
+        n_features = len(groups)
+        feature_mz_windows = np.empty(n_features * 6 * 2, dtype=np.float32)
+
+        # Build candidate CSR arrays
+        cand_ptr: list[int] = [0]
+        cand_k0_lo_list: list[float] = []
+        cand_k0_hi_list: list[float] = []
+        cand_df_indices: list = []  # df label indices in order
+
+        for fi, (_, grp) in enumerate(groups):
+            feat_mz = float(grp["feature_mz"].iloc[0])
+            win_base = fi * 12
+            for oi, offset in enumerate(_MZ_OFFSET_VALUES):
+                qmz = feat_mz + offset
+                feature_mz_windows[win_base + oi * 2]     = float(qmz * (1.0 - ppm_factor))
+                feature_mz_windows[win_base + oi * 2 + 1] = float(qmz * (1.0 + ppm_factor))
+
+            cand_indices = grp.index.tolist()
+            cand_df_indices.extend(cand_indices)
+            cand_ptr.append(cand_ptr[-1] + len(cand_indices))
+            for idx in cand_indices:
+                pred_k0 = df.at[idx, "_pred_inv_k0"]
+                if pd.isna(pred_k0):
+                    cand_k0_lo_list.append(float("nan"))
+                    cand_k0_hi_list.append(float("nan"))
+                else:
+                    cand_k0_lo_list.append(float(pred_k0) - k0_half_win)
+                    cand_k0_hi_list.append(float(pred_k0) + k0_half_win)
+
+        logger.info(
+            f"Mobility colocalization: processing {n_features} feature groups "
+            f"({len(cand_df_indices)} candidates) via Rust…"
+        )
+        raw = _rs_mob_coloc(
+            flat_mzs,
+            flat_scans,
+            flat_ints,
+            pixel_offsets,
+            pixel_xi_list,
+            pixel_yi_list,
+            mob_arr.astype(np.float64).tolist(),
+            feature_mz_windows,
+            cand_ptr,
+            cand_k0_lo_list,
+            cand_k0_hi_list,
+            max_x,
+            max_y,
+        )
+        raw_mat = np.asarray(raw, dtype=np.float64).reshape(len(cand_df_indices), 10)
+
+        for col_i, col in enumerate(NEW_COLS):
+            df[col] = pd.Series(raw_mat[:, col_i], index=cand_df_indices, dtype=np.float64)
+
+    else:
+        # ------------------------------------------------------------------ #
+        # Python fallback: per-feature read with pre-read optimisation        #
+        # ------------------------------------------------------------------ #
+        _ones = np.ones((1, max_y, max_x), dtype=np.float32)
+        _neighbor_counts = _neighbor_sum_batch(_ones)[0]
+        _N = max_y * max_x
+        _W_sum = float(_neighbor_counts.sum())
+
+        _MZ_OFFSETS_DICT = {
+            "m0": _MZ_OFFSET_VALUES[0],
+            "m1": _MZ_OFFSET_VALUES[1],
+            "m2": _MZ_OFFSET_VALUES[2],
+            "na": _MZ_OFFSET_VALUES[3],
+            "k":  _MZ_OFFSET_VALUES[4],
+            "chca": _MZ_OFFSET_VALUES[5],
+        }
+        ppm_factor = extraction_ppm * 1e-6
+        result_rows: dict = {}
+
+        logger.info(f"Mobility colocalization: processing {len(groups)} feature groups…")
+
+        for feat_key, grp in groups:
+            feat_mz = float(grp["feature_mz"].iloc[0])
+            cand_indices = grp.index.tolist()
+
+            mz_ranges = {
+                key: (
+                    (feat_mz + offset) * (1.0 - ppm_factor),
+                    (feat_mz + offset) * (1.0 + ppm_factor),
+                )
+                for key, offset in _MZ_OFFSETS_DICT.items()
+            }
+
+            pixel_data: dict[str, list] = {key: [] for key in _MZ_OFFSETS_DICT}
+            for fid, (xi, yi) in coord_map.items():
+                fd = tims[int(fid), :, :]
+                if not len(fd):
+                    continue
+                mz_vals = fd["mz_values"].values
+                scan_idx = fd["scan_indices"].values
+                int_vals = fd["intensity_values"].values
+                for key, (mz_lo, mz_hi) in mz_ranges.items():
+                    mz_mask = (mz_vals >= mz_lo) & (mz_vals <= mz_hi)
+                    if not mz_mask.any():
+                        continue
+                    pixel_data[key].append((xi, yi, scan_idx[mz_mask], int_vals[mz_mask]))
+
+            for idx in cand_indices:
+                pred_k0 = df.at[idx, "_pred_inv_k0"]
+                if pd.isna(pred_k0):
+                    result_rows[idx] = {c: np.nan for c in NEW_COLS}
+                    continue
+
+                scan_in = (mob_arr >= pred_k0 - k0_half_win) & (mob_arr <= pred_k0 + k0_half_win)
+
+                imgs: dict[str, np.ndarray] = {}
+                for key, hits in pixel_data.items():
+                    img = np.zeros((max_y, max_x), dtype=np.float32)
+                    for xi, yi, s_idx, i_vals in hits:
+                        mask = scan_in[s_idx]
+                        if mask.any():
+                            img[yi, xi] += i_vals[mask].sum()
+                    imgs[key] = img
+
+                r_m1 = _pearson_r_images(imgs["m0"], imgs["m1"])
+                r_m2 = _pearson_r_images(imgs["m0"], imgs["m2"])
+                valid_r = [v for v in (r_m1, r_m2) if not np.isnan(v)]
+                r_mean = float(np.mean(valid_r)) if valid_r else np.nan
+
+                m0 = imgs["m0"]
+                nonzero = m0[m0 > 0]
+                cv = float(nonzero.std() / nonzero.mean()) if len(nonzero) > 1 else 0.0
+                morans_val, _ = _morans_gearys_chunk(m0[np.newaxis], _neighbor_counts, _N, _W_sum)
+
+                result_rows[idx] = {
+                    "isotope_colocalization_m1_mob":   r_m1,
+                    "isotope_colocalization_m2_mob":   r_m2,
+                    "isotope_colocalization_mean_mob": r_mean,
+                    "adduct_colocalization_na_mob":    _pearson_r_images(imgs["m0"], imgs["na"]),
+                    "adduct_colocalization_k_mob":     _pearson_r_images(imgs["m0"], imgs["k"]),
+                    "adduct_colocalization_chca_mob":  _pearson_r_images(imgs["m0"], imgs["chca"]),
+                    "fraction_detected_mob":    float((m0 > 0).mean()),
+                    "intensity_cv_mob":         cv,
+                    "log_mean_intensity_mob":   float(np.log1p(m0.mean())),
+                    "spatial_morans_i_mob":     float(morans_val[0]),
+                }
+
+        result_df = pd.DataFrame.from_dict(result_rows, orient="index")
+        for col in NEW_COLS:
+            df[col] = result_df[col]
+
+    # NaN fill with column median (same policy for both paths)
+    for col in NEW_COLS:
+        valid = df[col].dropna()
+        df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
+
+    df = df.drop(columns=["_pred_inv_k0"])
+    logger.info(
+        f"Mobility colocalization: computed 10 per-candidate features for "
+        f"{len(df)} candidates across {len(groups)} features."
+    )
+    return df
+
+
 def compute_spatial_autocorrelation_full(
     df: pd.DataFrame,
     ion_images: np.ndarray,

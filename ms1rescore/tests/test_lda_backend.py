@@ -227,7 +227,7 @@ class TestFindBestFeatureLabels:
     def test_pair_path_is_taken(self, xy):
         X, is_decoy, feature_names = xy
         result = _find_best_feature_labels(
-            X, is_decoy, feature_names, train_fdr=0.01, min_pair_threshold=10
+            X, is_decoy, feature_names, init_fdr=0.01, min_seed_positives=10
         )
         assert result is not None, "Expected pair fallback to find a result"
         labels, best_feat_name, n_passing = result
@@ -240,7 +240,7 @@ class TestFindBestFeatureLabels:
     def test_pair_path_returns_enough_positives(self, xy):
         X, is_decoy, feature_names = xy
         result = _find_best_feature_labels(
-            X, is_decoy, feature_names, train_fdr=0.01, min_pair_threshold=10
+            X, is_decoy, feature_names, init_fdr=0.01, min_seed_positives=10
         )
         assert result is not None
         _, _, n_passing = result
@@ -249,7 +249,7 @@ class TestFindBestFeatureLabels:
     def test_labels_consistent_with_decoy_mask(self, xy):
         X, is_decoy, feature_names = xy
         result = _find_best_feature_labels(
-            X, is_decoy, feature_names, train_fdr=0.01, min_pair_threshold=10
+            X, is_decoy, feature_names, init_fdr=0.01, min_seed_positives=10
         )
         assert result is not None
         labels, _, _ = result
@@ -263,8 +263,8 @@ class TestFindBestFeatureLabels:
         # (single-feature result of 0 is not < 0). The function falls back
         # to returning None when no single feature works.
         result = _find_best_feature_labels(
-            X, is_decoy, feature_names, train_fdr=0.01, min_pair_threshold=0
+            X, is_decoy, feature_names, init_fdr=0.01, min_seed_positives=0
         )
         assert result is None, (
-            "Expected None when min_pair_threshold=0 and no single feature separates"
+            "Expected None when min_seed_positives=0 and no single feature separates"
         )

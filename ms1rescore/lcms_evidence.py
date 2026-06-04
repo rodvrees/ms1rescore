@@ -488,22 +488,50 @@ def extract_all_xics(
 # ---------------------------------------------------------------------------
 
 
+def _run_deeplc_finetune(
+    psm_list,
+    epochs: int,
+    lr: float,
+    patience: int,
+):
+    """Shared helper: seed, thread-limit, call finetune(), return model."""
+    import random as _random
+
+    import torch as _torch
+    from deeplc.core import finetune
+    from threadpoolctl import threadpool_limits
+
+    _torch.manual_seed(42)
+    np.random.seed(42)
+    _random.seed(42)
+    _orig_threads = _torch.get_num_threads()
+    _torch.set_num_threads(1)
+    with threadpool_limits(limits=1):
+        model = finetune(
+            psm_list,
+            train_kwargs={"epochs": epochs, "learning_rate": lr, "patience": patience},
+        )
+    _torch.set_num_threads(_orig_threads)
+    return model
+
+
 def finetune_deeplc(
     msf_path: str,
+    epochs: int = 40,
+    lr: float = 0.001,
+    patience: int = 10,
 ):
     """
-    Finetune DeepLC on high-confidence PSMs from PD .msf file.
+    Finetune DeepLC on high-confidence PSMs from a PD .msf file.
 
-    Uses only observed retention times for calibration — no target/decoy labels
-    are used in the finetuned model.
+    RetentionTime in TargetPsms is in minutes (PD convention); no conversion
+    needed. Uses only observed retention times — no target/decoy labels.
     """
     import sqlite3
 
-    from deeplc.core import finetune
     from psm_utils import PSM, PSMList, Peptidoform
 
     conn = sqlite3.connect(msf_path)
-    # Use high-confidence target PSMs with observed RT
     df = pd.read_sql_query(
         """
         SELECT DISTINCT
@@ -518,39 +546,31 @@ def finetune_deeplc(
     conn.close()
 
     if len(df) < 50:
-        logger.warning(
-            f"Only {len(df)} PSMs for DeepLC finetuning — using default model"
-        )
+        logger.warning(f"Only {len(df)} PSMs for DeepLC finetuning — using default model")
         return None
 
-    logger.info(f"Finetuning DeepLC on {len(df)} PSMs...")
+    logger.info(
+        f"Finetuning DeepLC on {len(df)} PSMs "
+        f"(epochs={epochs}, lr={lr}, patience={patience})…"
+    )
     psm_list = PSMList(
         psm_list=[
             PSM(
                 peptidoform=Peptidoform(f"{row['peptide']}/2"),
                 spectrum_id=f"cal_{i}",
-                retention_time=row["rt"],
+                retention_time=float(row["rt"]),
             )
             for i, (_, row) in enumerate(df.iterrows())
         ]
     )
-
-    import random as _random
-    import torch as _torch
-    from threadpoolctl import threadpool_limits
-    _torch.manual_seed(42)
-    np.random.seed(42)
-    _random.seed(42)
-    _orig_threads = _torch.get_num_threads()
-    _torch.set_num_threads(1)
-    with threadpool_limits(limits=1):
-        model = finetune(psm_list)
-    _torch.set_num_threads(_orig_threads)
-    return model
+    return _run_deeplc_finetune(psm_list, epochs=epochs, lr=lr, patience=patience)
 
 
 def finetune_deeplc_from_df(
     rt_df: "pd.DataFrame",
+    epochs: int = 40,
+    lr: float = 0.001,
+    patience: int = 10,
 ):
     """
     Finetune DeepLC on a DataFrame with columns ``sequence`` and ``rt_mean``
@@ -559,7 +579,6 @@ def finetune_deeplc_from_df(
     Used when an MSF file is not available (e.g. FragPipe output).
     ``rt_df`` is typically ``lcms_ids.peptides[["sequence", "rt_mean"]].dropna()``.
     """
-    from deeplc.core import finetune
     from psm_utils import PSM, PSMList, Peptidoform
 
     df = rt_df[["sequence", "rt_mean"]].dropna(subset=["rt_mean"])
@@ -570,7 +589,10 @@ def finetune_deeplc_from_df(
         )
         return None
 
-    logger.info(f"Finetuning DeepLC on {len(df)} peptides (RT in minutes)...")
+    logger.info(
+        f"Finetuning DeepLC on {len(df)} peptides "
+        f"(epochs={epochs}, lr={lr}, patience={patience})…"
+    )
     psm_list = PSMList(
         psm_list=[
             PSM(
@@ -581,19 +603,7 @@ def finetune_deeplc_from_df(
             for i, (_, row) in enumerate(df.iterrows())
         ]
     )
-
-    import random as _random
-    import torch as _torch
-    from threadpoolctl import threadpool_limits
-    _torch.manual_seed(42)
-    np.random.seed(42)
-    _random.seed(42)
-    _orig_threads = _torch.get_num_threads()
-    _torch.set_num_threads(1)
-    with threadpool_limits(limits=1):
-        model = finetune(psm_list, train_kwargs={"epochs": 40})
-    _torch.set_num_threads(_orig_threads)
-    return model
+    return _run_deeplc_finetune(psm_list, epochs=epochs, lr=lr, patience=patience)
 
 
 def get_deeplc_predictions(

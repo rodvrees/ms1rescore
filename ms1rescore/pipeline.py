@@ -431,17 +431,17 @@ def _find_best_feature_labels(
     X: np.ndarray,
     is_decoy: np.ndarray,
     feature_names: list[str],
-    train_fdr: float,
-    min_pair_threshold: int = 10,
+    init_fdr: float = 0.2,
+    min_seed_positives: int = 50,
 ) -> tuple[np.ndarray, str, int] | None:
     """
     Mokapot-style best-feature seed initialization.
 
     For each column in X and each ranking direction (ascending/descending),
-    run TDC q-value computation and count target candidates at q <= train_fdr.
+    run TDC q-value computation and count target candidates at q <= init_fdr.
     Select the (feature, direction) pair that yields the most such targets.
 
-    When the best single-feature result has fewer than ``min_pair_threshold``
+    When the best single-feature result has fewer than ``min_seed_positives``
     targets, all unique pairwise sums and differences of eligible features are
     tried. The composite score that yields the most targets is used if it beats
     the single-feature result.
@@ -457,9 +457,9 @@ def _find_best_feature_labels(
     -------
     (labels, best_feature_name, n_passing) or None when n_passing == 0.
         labels: int8 array aligned to X rows.
-            +1  — pseudo-positive: target at q <= train_fdr under best feature
+            +1  — pseudo-positive: target at q <= init_fdr under best feature
             -1  — pseudo-negative: decoy
-             0  — excluded: target at q > train_fdr
+             0  — excluded: target at q > init_fdr
     """
     is_decoy = np.asarray(is_decoy, dtype=bool)
 
@@ -491,7 +491,7 @@ def _find_best_feature_labels(
         for ascending in (True, False):
             scores = (col if ascending else -col) + tiebreak
             q = _tdc_qvalues(scores, is_decoy)
-            n_pass = int(((~is_decoy) & (q <= train_fdr)).sum())
+            n_pass = int(((~is_decoy) & (q <= init_fdr)).sum())
             if n_pass > best_n:
                 best_n = n_pass
                 best_j = j
@@ -499,7 +499,7 @@ def _find_best_feature_labels(
                 best_q = q.copy()
 
     # --- Pairwise sweep when single-feature result is weak ---
-    if best_n < min_pair_threshold:
+    if best_n < min_seed_positives:
         eligible = [
             j for j, fname in enumerate(feature_names)
             if fname not in _BEST_FEAT_SKIP and X_imp[:, j].std() > 0
@@ -524,12 +524,12 @@ def _find_best_feature_labels(
                     for ascending in (True, False):
                         scores = (composite if ascending else -composite) + tiebreak
                         q = _tdc_qvalues(scores, is_decoy)
-                        n_pass = int(((~is_decoy) & (q <= train_fdr)).sum())
+                        n_pass = int(((~is_decoy) & (q <= init_fdr)).sum())
                         if n_pass > pair_best_n:
                             pair_best_n = n_pass
                             pair_best_labels = np.where(
                                 is_decoy, np.int8(-1),
-                                np.where(q <= train_fdr, np.int8(1), np.int8(0)),
+                                np.where(q <= init_fdr, np.int8(1), np.int8(0)),
                             ).astype(np.int8)
                             sign_str = "+" if sign == +1 else "-"
                             pair_best_name = (
@@ -539,7 +539,7 @@ def _find_best_feature_labels(
         if pair_best_labels is not None:
             logger.info(
                 "  Selected pair (%s) with %d PSMs at q<=%g",
-                pair_best_name, pair_best_n, train_fdr,
+                pair_best_name, pair_best_n, init_fdr,
             )
             return pair_best_labels, pair_best_name, pair_best_n
 
@@ -549,7 +549,7 @@ def _find_best_feature_labels(
     assert best_q is not None
     labels = np.where(
         is_decoy, np.int8(-1),
-        np.where(best_q <= train_fdr, np.int8(1), np.int8(0)),
+        np.where(best_q <= init_fdr, np.int8(1), np.int8(0)),
     ).astype(np.int8)
     return labels, feature_names[best_j], best_n
 
@@ -562,10 +562,11 @@ def _rescore_lda(
     n_interaction_features: int = 0,
     r1_importances: np.ndarray | None = None,
     r1_feature_names: list[str] | None = None,
-    train_fdr: float = 0.01,
+    init_fdr: float = 0.2,
+    train_fdr: float = 0.05,
     max_iter: int = 5,
     r1_seed_percentile: float = 0.10,
-    min_pair_threshold: int = 10,
+    min_seed_positives: int = 50,
 ) -> np.ndarray:
     """
     Semi-supervised LDA on MALDI-intrinsic features.
@@ -640,18 +641,18 @@ def _rescore_lda(
 
     if seed_mask is None:
         bf_result = _find_best_feature_labels(
-            X, is_decoy, present, train_fdr, min_pair_threshold=min_pair_threshold
+            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives
         )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
             n_init_positives = _n_init
             logger.info(
                 f"  LDA: best-feature init on '{_best_feat}', "
-                f"{_n_init} targets at q≤{train_fdr:.3g}"
+                f"{_n_init} targets at q≤{init_fdr:.3g}"
             )
         else:
             logger.warning(
-                f"  LDA: best-feature init yielded 0 targets at q≤{train_fdr:.3g} "
+                f"  LDA: best-feature init yielded 0 targets at q≤{init_fdr:.3g} "
                 "— falling back to ppm-based seeding"
             )
             ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
@@ -686,6 +687,10 @@ def _rescore_lda(
 
         if len(pos_idx) == 0:
             logger.warning(f"  LDA iter {iteration + 1}: no positives — stopping early")
+            break
+
+        if len(neg_idx) == 0:
+            logger.warning(f"  LDA iter {iteration + 1}: no negatives (decoys) — cannot train LDA, stopping early")
             break
 
         train_idx = np.concatenate([pos_idx, neg_idx])
@@ -780,10 +785,11 @@ def _rescore_qda(
     intrinsic_feature_names: list[str],
     init_ppm_threshold: float,
     seed_mask: np.ndarray | None = None,
-    train_fdr: float = 0.01,
+    init_fdr: float = 0.2,
+    train_fdr: float = 0.05,
     max_iter: int = 5,
     r1_seed_percentile: float = 0.10,
-    min_pair_threshold: int = 10,
+    min_seed_positives: int = 50,
 ) -> np.ndarray:
     """
     Semi-supervised QDA on MALDI-intrinsic features.
@@ -816,18 +822,18 @@ def _rescore_qda(
 
     if seed_mask is None:
         bf_result = _find_best_feature_labels(
-            X, is_decoy, present, train_fdr, min_pair_threshold=min_pair_threshold
+            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives
         )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
             n_init_positives = _n_init
             logger.info(
                 f"  QDA: best-feature init on '{_best_feat}', "
-                f"{_n_init} targets at q≤{train_fdr:.3g}"
+                f"{_n_init} targets at q≤{init_fdr:.3g}"
             )
         else:
             logger.warning(
-                f"  QDA: best-feature init yielded 0 targets at q≤{train_fdr:.3g} "
+                f"  QDA: best-feature init yielded 0 targets at q≤{init_fdr:.3g} "
                 "— falling back to ppm-based seeding"
             )
             ppm_col = df.get("ppm_error_abs", pd.Series(np.inf, index=df.index))
@@ -862,6 +868,10 @@ def _rescore_qda(
 
         if len(pos_idx) == 0:
             logger.warning(f"  QDA iter {iteration + 1}: no positives — stopping early")
+            break
+
+        if len(neg_idx) == 0:
+            logger.warning(f"  QDA iter {iteration + 1}: no negatives (decoys) — cannot train QDA, stopping early")
             break
 
         train_idx = np.concatenate([pos_idx, neg_idx])
@@ -1203,7 +1213,8 @@ def rescore(
     maldi_envelopes: dict | None = None,
     msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
-    train_fdr: float = 0.01,
+    init_fdr: float = 0.2,
+    train_fdr: float = 0.05,
     missed_cleavages: int = 2,
     min_length: int = 7,
     max_length: int = 30,
@@ -1248,8 +1259,11 @@ def rescore(
     catboost_iterations: int = 500,
     mokapot_max_iter: int = 10,
     max_iter: int = 5,
-    min_pair_threshold: int = 10,
+    min_seed_positives: int = 50,
     im2deep_kwargs: dict | None = None,
+    deeplc_finetune_epochs: int = 40,
+    deeplc_finetune_lr: float = 0.001,
+    deeplc_finetune_patience: int = 10,
     matching_ppm: float = 20.0,
     winner_percentile: float = 0.02,
     rt_window_multiplier: float = 2.0,
@@ -1258,6 +1272,9 @@ def rescore(
     fragment_tol_da: float = 0.02,
     match_ccs: bool = False,
     ccs_window_multiplier: float = 2.0,
+    tdf_path: str | None = None,
+    mob_coloc: bool = False,
+    mob_window_multiplier: float = 2.0,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -1690,28 +1707,66 @@ def rescore(
         # --- Step 4: DeepLC predictions ---
         logger.info("Step 4: Computing DeepLC predictions...")
         unique_peptides = candidates["peptide"].unique().tolist()
+        _dlc_kw = dict(
+            epochs=deeplc_finetune_epochs,
+            lr=deeplc_finetune_lr,
+            patience=deeplc_finetune_patience,
+        )
+
+        # Build finetuning calibration set: only peptides unambiguously matched to
+        # a single MALDI feature (n_candidates == 1) AND observed in LC-MS/MS with RT.
+        # Multi-candidate features may contain incorrect assignments, so including them
+        # would add noise — same rationale as IM2Deep calibration (which also uses only
+        # n_candidates == 1 and does NOT fall back when too few are available).
+        _deeplc_cal_df: "pd.DataFrame | None" = None
+        if lcms_ids is not None and "n_candidates" in candidates.columns:
+            _single_peps = set(
+                candidates.loc[candidates["n_candidates"] == 1, "peptide"].unique()
+            )
+            _cal = (
+                lcms_ids.peptides
+                .loc[lcms_ids.peptides["sequence"].isin(_single_peps), ["sequence", "rt_mean"]]
+                .dropna(subset=["rt_mean"])
+                .reset_index(drop=True)
+            )
+            if len(_cal) >= 20:
+                _deeplc_cal_df = _cal
+                logger.info(
+                    f"  DeepLC calibration set: {len(_cal)} single-candidate peptides "
+                    f"(total unambiguous MALDI matches: {len(_single_peps)})"
+                )
+            else:
+                logger.warning(
+                    f"  Only {len(_cal)} single-candidate peptides with observed RT "
+                    f"— skipping DeepLC finetuning (using default model)"
+                )
+
         deeplc_model = None
-        if msf_path:
-            deeplc_model = finetune_deeplc(msf_path)
-        elif lcms_ids is not None:
-            # rt_mean is in minutes after unit auto-detection in _join_psm_rt_intensity.
-            deeplc_model = finetune_deeplc_from_df(lcms_ids.peptides)
+        if _deeplc_cal_df is not None:
+            deeplc_model = finetune_deeplc_from_df(_deeplc_cal_df, **_dlc_kw)
+        elif msf_path:
+            # lcms_ids unavailable: fall back to reading the MSF directly
+            deeplc_model = finetune_deeplc(msf_path, **_dlc_kw)
         deeplc_cache = get_deeplc_predictions(unique_peptides, model=deeplc_model)
 
-        # Estimate MS1 RT window from fine-tuning calibration error.
-        # Window = 2 × 95th-percentile |predicted - observed| RT for calibration peptides.
-        # This adapts to dataset-specific DeepLC calibration quality.
+        # Estimate RT window from calibration error on the same set used for finetuning.
+        # Window = rt_window_multiplier × p95(|pred_RT − obs_RT|).
         rt_window_min = 0.0
-        if deeplc_cache and lcms_ids is not None:
-            ft_df = lcms_ids.peptides[["sequence", "rt_mean"]].dropna(subset=["rt_mean"])
-            pred_rts_cal = np.array([deeplc_cache.get(seq, np.nan) for seq in ft_df["sequence"]])
-            obs_rts_cal = ft_df["rt_mean"].values.astype(float)
+        _cal_for_window = _deeplc_cal_df
+        if deeplc_cache and _cal_for_window is not None and len(_cal_for_window) > 10:
+            pred_rts_cal = np.array(
+                [deeplc_cache.get(seq, np.nan) for seq in _cal_for_window["sequence"]]
+            )
+            obs_rts_cal = _cal_for_window["rt_mean"].values.astype(float)
             valid = ~np.isnan(pred_rts_cal) & ~np.isnan(obs_rts_cal)
             if valid.sum() > 10:
-                p95_mae = float(np.percentile(np.abs(pred_rts_cal[valid] - obs_rts_cal[valid]), 95))
+                p95_mae = float(
+                    np.percentile(np.abs(pred_rts_cal[valid] - obs_rts_cal[valid]), 95)
+                )
                 rt_window_min = rt_window_multiplier * p95_mae
                 logger.info(
-                    f"  DeepLC RT window: {rt_window_multiplier} × p95 MAE = {rt_window_min:.3f} min "
+                    f"  DeepLC RT window: {rt_window_multiplier} × p95 MAE "
+                    f"= {rt_window_min:.3f} min "
                     f"({valid.sum()} calibration peptides, p95={p95_mae:.3f} min)"
                 )
 
@@ -1809,10 +1864,27 @@ def rescore(
                 "were provided or IM2Deep features were not computed. Skipping CCS filter."
             )
 
+    # --- Step 6c: per-candidate mobility-filtered colocalization (optional) ---
+    _has_mob_coloc = False
+    if mob_coloc and tdf_path is not None and "im2deep_predicted_ccs" in features_df.columns:
+        try:
+            from ms1rescore.maldi_features import compute_mobility_colocalization_features
+            logger.info("Computing per-candidate mobility colocalization features (step 6c)…")
+            features_df = compute_mobility_colocalization_features(
+                features_df,
+                tdf_path=tdf_path,
+                mob_window_multiplier=mob_window_multiplier,
+                extraction_ppm=ppm_tolerance,
+            )
+            _has_mob_coloc = True
+        except Exception as exc:
+            logger.warning(f"Per-candidate mobility colocalization failed: {exc}. Skipping.")
+
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
         has_ion_images=ion_images is not None,
         has_ccs=observed_ccs_per_feature is not None,
+        has_mob_coloc=_has_mob_coloc,
     )
     logger.debug(f"Selected feature names: {feature_names}")
 
@@ -2033,6 +2105,8 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct,
+                tdf_path=tdf_path,
+                mob_window_multiplier=mob_window_multiplier,
             )
 
         return psm_list, result_df, feature_names, features_df
@@ -2180,6 +2254,8 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct,
+                tdf_path=tdf_path,
+                mob_window_multiplier=mob_window_multiplier,
             )
 
         return psm_list, result_df, feature_names, features_df
@@ -2192,10 +2268,11 @@ def rescore(
             features_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
+            init_fdr=init_fdr,
             train_fdr=train_fdr,
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
-            min_pair_threshold=min_pair_threshold,
+            min_seed_positives=min_seed_positives,
         )
         # Output importances
         if verbose:
@@ -2258,10 +2335,11 @@ def rescore(
             n_interaction_features=n_interaction_features,
             r1_importances=_imp_r1_lda,
             r1_feature_names=_imp_names_lda,
+            init_fdr=init_fdr,
             train_fdr=train_fdr,
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
-            min_pair_threshold=min_pair_threshold,
+            min_seed_positives=min_seed_positives,
         )
         # Output importances
         if verbose:
@@ -2386,6 +2464,8 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct,
+                tdf_path=tdf_path,
+                mob_window_multiplier=mob_window_multiplier,
             )
 
         return psm_list, result_df, feature_names, features_df
@@ -2398,10 +2478,11 @@ def rescore(
             features_df,
             intrinsic_present,
             init_ppm_threshold=init_ppm_threshold,
+            init_fdr=init_fdr,
             train_fdr=train_fdr,
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
-            min_pair_threshold=min_pair_threshold,
+            min_seed_positives=min_seed_positives,
         )
         if verbose:
             with open(f"{output_dir}/17_debug_qda_scores_r1.pkl", "wb") as f:
@@ -2447,10 +2528,11 @@ def rescore(
             r2_features,
             init_ppm_threshold=init_ppm_threshold,
             seed_mask=r2_seed_mask,
+            init_fdr=init_fdr,
             train_fdr=train_fdr,
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
-            min_pair_threshold=min_pair_threshold,
+            min_seed_positives=min_seed_positives,
         )
         if verbose:
             with open(f"{output_dir}/17_debug_qda_scores_r2.pkl", "wb") as f:
@@ -2563,6 +2645,8 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct,
+                tdf_path=tdf_path,
+                mob_window_multiplier=mob_window_multiplier,
             )
 
         return psm_list, result_df, feature_names, features_df

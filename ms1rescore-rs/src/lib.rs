@@ -3,6 +3,7 @@ mod features;
 mod ion_image;
 mod isotope;
 mod maldi_isotope;
+mod mob_coloc;
 mod spectral;
 mod xic;
 
@@ -216,7 +217,7 @@ fn accumulate_profile_chunk<'py>(
     lo_indices: Vec<usize>,
     hi_indices: Vec<usize>,
 ) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<f32>>> {
-    use numpy::{IntoPyArray, PyUntypedArrayMethods};
+    use numpy::IntoPyArray;
 
     let shape = pixel_matrix.shape();
     let n_mz = shape[1];
@@ -238,6 +239,155 @@ fn accumulate_profile_chunk<'py>(
         .into())
 }
 
+/// Compute per-candidate mobility scalar features (M0 window only, no image building).
+///
+/// Much faster than mob_coloc_features: single m/z window per feature, scalar
+/// accumulators only, no Pearson r or Moran's I computation.
+///
+/// Args:
+///     flat_mzs:        Sorted m/z for all pixels (float32 numpy, CSR).
+///     flat_scans:      Scan indices aligned with flat_mzs (uint32 numpy).
+///     flat_ints:       Intensities aligned with flat_mzs (float32 numpy).
+///     pixel_offsets:   CSR start offsets, length n_pixels + 1 (uint64 list).
+///     mob_values:      1/K0 per scan index (float64 list).
+///     feat_m0_lo/hi:   M0 m/z window bounds per feature (float32 numpy, each length n_features).
+///     cand_ptr:        CSR candidate pointer per feature (uint32 list), len n_feat+1.
+///     cand_k0_lo/hi:   Per-candidate 1/K0 bounds (float64 list).
+///
+/// Returns:
+///     1-D float32 numpy array of length n_total_cands × 2.
+///     Reshape to (n_total_cands, 2) in Python:
+///       col 0 = mob_intensity_fraction, col 1 = mob_fraction_detected.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn mob_scalar_features<'py>(
+    py: Python<'py>,
+    flat_mzs: PyReadonlyArray1<'_, f32>,
+    flat_scans: PyReadonlyArray1<'_, u32>,
+    flat_ints: PyReadonlyArray1<'_, f32>,
+    pixel_offsets: Vec<u64>,
+    mob_values: Vec<f64>,
+    feat_m0_lo: PyReadonlyArray1<'_, f32>,
+    feat_m0_hi: PyReadonlyArray1<'_, f32>,
+    cand_ptr: Vec<u32>,
+    cand_k0_lo: Vec<f64>,
+    cand_k0_hi: Vec<f64>,
+) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<f32>>> {
+    use numpy::IntoPyArray;
+
+    let mzs_s = flat_mzs.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("flat_mzs not C-contiguous"))?;
+    let scans_s = flat_scans.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("flat_scans not C-contiguous"))?;
+    let ints_s = flat_ints.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("flat_ints not C-contiguous"))?;
+    let lo_s = feat_m0_lo.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("feat_m0_lo not C-contiguous"))?;
+    let hi_s = feat_m0_hi.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("feat_m0_hi not C-contiguous"))?;
+
+    let mzs_addr = mzs_s.as_ptr() as usize; let mzs_len = mzs_s.len();
+    let scans_addr = scans_s.as_ptr() as usize; let scans_len = scans_s.len();
+    let ints_addr = ints_s.as_ptr() as usize; let ints_len = ints_s.len();
+    let lo_addr = lo_s.as_ptr() as usize; let lo_len = lo_s.len();
+    let hi_addr = hi_s.as_ptr() as usize; let hi_len = hi_s.len();
+
+    let flat_out: Vec<f32> = py.allow_threads(move || {
+        let mzs = unsafe { std::slice::from_raw_parts(mzs_addr as *const f32, mzs_len) };
+        let scans = unsafe { std::slice::from_raw_parts(scans_addr as *const u32, scans_len) };
+        let ints = unsafe { std::slice::from_raw_parts(ints_addr as *const f32, ints_len) };
+        let lo = unsafe { std::slice::from_raw_parts(lo_addr as *const f32, lo_len) };
+        let hi = unsafe { std::slice::from_raw_parts(hi_addr as *const f32, hi_len) };
+
+        mob_coloc::compute_mob_scalars(
+            mzs, scans, ints,
+            &pixel_offsets, &mob_values,
+            lo, hi,
+            &cand_ptr, &cand_k0_lo, &cand_k0_hi,
+        )
+    });
+
+    Ok(numpy::ndarray::Array1::from_vec(flat_out)
+        .into_pyarray(py)
+        .into())
+}
+
+/// Compute per-candidate mobility-filtered colocalization and spatial features.
+///
+/// Processes all MALDI features in parallel (rayon).  The flat CSR arrays
+/// must be built ONCE in Python from alphatims (49 500 calls) and reused here.
+///
+/// Args:
+///     flat_mzs:            Concatenated sorted m/z arrays for all pixels (float32 numpy).
+///     flat_scans:          Scan indices aligned with flat_mzs (uint32 numpy).
+///     flat_ints:           Intensities aligned with flat_mzs (float32 numpy).
+///     pixel_offsets:       CSR start offsets, length n_pixels + 1 (uint64 list).
+///     pixel_xi:            X coordinates per pixel (uint32 list).
+///     pixel_yi:            Y coordinates per pixel (uint32 list).
+///     mob_values:          1/K0 value for each scan index (float64 list).
+///     feature_mz_windows:  Flat float32 array, shape (n_features, 6, 2): [lo, hi] per offset.
+///     cand_ptr:            CSR pointer over candidates per feature (uint32 list), len n_feat+1.
+///     cand_k0_lo:          Lower 1/K0 bound per candidate (float64 list).
+///     cand_k0_hi:          Upper 1/K0 bound per candidate (float64 list).
+///     max_x:               Image width.
+///     max_y:               Image height.
+///
+/// Returns:
+///     1-D float32 numpy array of length n_total_cands * 10.
+///     Reshape to (n_total_cands, 10) in Python.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn mob_coloc_features<'py>(
+    py: Python<'py>,
+    flat_mzs: PyReadonlyArray1<'_, f32>,
+    flat_scans: PyReadonlyArray1<'_, u32>,
+    flat_ints: PyReadonlyArray1<'_, f32>,
+    pixel_offsets: Vec<u64>,
+    pixel_xi: Vec<u32>,
+    pixel_yi: Vec<u32>,
+    mob_values: Vec<f64>,
+    feature_mz_windows: PyReadonlyArray1<'_, f32>,
+    cand_ptr: Vec<u32>,
+    cand_k0_lo: Vec<f64>,
+    cand_k0_hi: Vec<f64>,
+    max_x: usize,
+    max_y: usize,
+) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<f32>>> {
+    use numpy::{IntoPyArray, PyUntypedArrayMethods};
+
+    let mzs_s = flat_mzs.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("flat_mzs not C-contiguous"))?;
+    let scans_s = flat_scans.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("flat_scans not C-contiguous"))?;
+    let ints_s = flat_ints.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("flat_ints not C-contiguous"))?;
+    let wins_s = feature_mz_windows.as_slice().map_err(|_| pyo3::exceptions::PyValueError::new_err("feature_mz_windows not C-contiguous"))?;
+
+    // Cast to usize pointers so they cross the allow_threads (Ungil) boundary.
+    // Safety: PyReadonlyArray1 holds a GIL-protected reference; arrays are
+    // immutable while we hold the borrow; rayon threads only read.
+    let mzs_addr = mzs_s.as_ptr() as usize;
+    let mzs_len = mzs_s.len();
+    let scans_addr = scans_s.as_ptr() as usize;
+    let scans_len = scans_s.len();
+    let ints_addr = ints_s.as_ptr() as usize;
+    let ints_len = ints_s.len();
+    let wins_addr = wins_s.as_ptr() as usize;
+    let wins_len = wins_s.len();
+
+    let flat_out: Vec<f32> = py.allow_threads(move || {
+        let mzs = unsafe { std::slice::from_raw_parts(mzs_addr as *const f32, mzs_len) };
+        let scans = unsafe { std::slice::from_raw_parts(scans_addr as *const u32, scans_len) };
+        let ints = unsafe { std::slice::from_raw_parts(ints_addr as *const f32, ints_len) };
+        let wins = unsafe { std::slice::from_raw_parts(wins_addr as *const f32, wins_len) };
+
+        mob_coloc::compute_mob_coloc(
+            mzs, scans, ints,
+            &pixel_offsets, &pixel_xi, &pixel_yi,
+            &mob_values,
+            wins,
+            &cand_ptr, &cand_k0_lo, &cand_k0_hi,
+            max_x, max_y,
+        )
+    });
+
+    Ok(numpy::ndarray::Array1::from_vec(flat_out)
+        .into_pyarray(py)
+        .into())
+}
+
 #[pymodule]
 fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_xics_batch, m)?)?;
@@ -250,5 +400,6 @@ fn ms1rescore_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(count_missed_cleavages_batch, m)?)?;
     m.add_function(wrap_pyfunction!(compute_maldi_isotope_means, m)?)?;
     m.add_function(wrap_pyfunction!(accumulate_profile_chunk, m)?)?;
+    m.add_function(wrap_pyfunction!(mob_coloc_features, m)?)?;
     Ok(())
 }

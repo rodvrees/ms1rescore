@@ -1,7 +1,7 @@
 """
 Debug visualization for the MALDI-MSI rescoring pipeline.
 
-Thirteen subsystems:
+Fourteen subsystems:
   1. Ion image colocalization  — per-candidate precursor + ALL same-protein co-feature images
   2. Feature diagnostics       — per-candidate 3×3 panel figure
   3. Isotope envelopes         — per-candidate spectrum-style envelope comparison
@@ -11,10 +11,11 @@ Thirteen subsystems:
   7. IDs vs FDR curve          — target identifications as a function of FDR threshold
   8. Protein colocalization    — colocalization values split by scoring group
   9. T/D m/z distribution      — target vs decoy m/z coverage and competition status
- 10. Score PP plot             — empirical CDF of decoy scores vs target scores
- 11. Score distributions       — target/decoy score histograms at R1, R2, and reweighted
- 12. Pearson r distribution    — same-protein vs different-protein ion image Pearson r at 5% FDR
- 13. Protein spatial coherence — per-protein peptide count vs mean ion image Pearson r at 5% FDR
+ 10. Candidate competition     — target/decoy candidate counts per feature (with CCS-filter note)
+ 11. Score PP plot             — empirical CDF of decoy scores vs target scores
+ 12. Score distributions       — target/decoy score histograms at R1, R2, and reweighted
+ 13. Pearson r distribution    — same-protein vs different-protein ion image Pearson r at 5% FDR
+ 14. Protein spatial coherence — per-protein peptide count vs mean ion image Pearson r at 5% FDR
 
 Entry point: save_debug_figures()
 """
@@ -198,6 +199,180 @@ def _get(row: pd.Series, col: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Mobility-filtered image helpers (for debug_viz only)
+# ---------------------------------------------------------------------------
+
+def _load_mob_setup(tdf_path: str) -> dict:
+    """
+    Load alphatims metadata and CSR arrays needed for per-candidate image
+    extraction. Does NOT do a global batch peak read — just loads the
+    push_indptr, tof_indices, and intensity_values once, plus coordinate map.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    try:
+        import alphatims.bruker as atb
+    except ImportError as exc:
+        raise ImportError("alphatims not installed") from exc
+
+    tdf_path = Path(tdf_path)
+    tims = atb.TimsTOF(str(tdf_path))
+
+    with sqlite3.connect(str(tdf_path / "analysis.tdf")) as conn:
+        frames_meta = pd.read_sql(
+            "SELECT Frame, XIndexPos, YIndexPos FROM MaldiFrameInfo ORDER BY Frame",
+            conn,
+        ).dropna(subset=["XIndexPos", "YIndexPos"])
+
+    coord_map = {
+        int(r.Frame): (int(r.XIndexPos), int(r.YIndexPos))
+        for r in frames_meta.itertuples()
+    }
+    max_x = int(frames_meta["XIndexPos"].max()) + 1
+    max_y = int(frames_meta["YIndexPos"].max()) + 1
+
+    frame_offset = int(tims.zeroth_frame)
+    scan_max = int(tims.scan_max_index)
+    sorted_fids = sorted(coord_map.keys())
+    frame_positions = np.array(sorted_fids, dtype=np.int64) - 1 + frame_offset
+    pixel_xi = np.array([coord_map[fid][0] for fid in sorted_fids], dtype=np.int32)
+    pixel_yi = np.array([coord_map[fid][1] for fid in sorted_fids], dtype=np.int32)
+
+    # mob_arr_neg: -mobility_values → ascending, for np.searchsorted to find scan range
+    return {
+        "scan_max":        scan_max,
+        "frame_positions": frame_positions,
+        "push_indptr":     np.asarray(tims.push_indptr, dtype=np.int64),
+        "tof_indices":     np.asarray(tims.tof_indices, dtype=np.int32),
+        "intensities":     np.asarray(tims.intensity_values, dtype=np.float32),
+        "mz_values":       np.asarray(tims.mz_values, dtype=np.float32),
+        "mob_arr_neg":     -np.asarray(tims.mobility_values, dtype=np.float64),
+        "pixel_xi":        pixel_xi,
+        "pixel_yi":        pixel_yi,
+        "max_x":           max_x,
+        "max_y":           max_y,
+        "n_pixels":        len(sorted_fids),
+    }
+
+
+def _extract_mob_image(
+    mob_setup: dict,
+    feature_mz: float,
+    pred_k0: float,
+    k0_half_win: float,
+    extraction_ppm: float = 25.0,
+) -> np.ndarray:
+    """
+    Build a (max_y, max_x) ion image filtered to feature_mz ± extraction_ppm
+    AND pred_k0 ± k0_half_win, using push_indptr arithmetic.
+
+    For each pixel the scan window gives a contiguous slice of tof_indices;
+    all pixels are processed in vectorised numpy (no Python pixel loop).
+    Typical cost: ~0.5–1.5 s per image for 48 000-pixel datasets.
+    """
+    scan_max       = mob_setup["scan_max"]
+    frame_pos      = mob_setup["frame_positions"]
+    push_indptr    = mob_setup["push_indptr"]
+    tof_indices_np = mob_setup["tof_indices"]
+    intensity_np   = mob_setup["intensities"]
+    mz_arr_np      = mob_setup["mz_values"]
+    mob_arr_neg    = mob_setup["mob_arr_neg"]
+    pixel_xi       = mob_setup["pixel_xi"]
+    pixel_yi       = mob_setup["pixel_yi"]
+    max_x          = mob_setup["max_x"]
+    max_y          = mob_setup["max_y"]
+    n_pixels       = mob_setup["n_pixels"]
+
+    ppm_factor   = extraction_ppm * 1e-6
+    tof_lo       = int(np.searchsorted(mz_arr_np, float(feature_mz * (1.0 - ppm_factor)), "left"))
+    tof_hi_excl  = int(np.searchsorted(mz_arr_np, float(feature_mz * (1.0 + ppm_factor)), "right"))
+
+    # mob_arr_neg is ascending; scans where mobility ∈ [k0_lo, k0_hi]
+    scan_lo      = max(0,        int(np.searchsorted(mob_arr_neg, -(pred_k0 + k0_half_win), "left")))
+    scan_hi_excl = min(scan_max, int(np.searchsorted(mob_arr_neg, -(pred_k0 - k0_half_win), "right")))
+
+    img = np.zeros((max_y, max_x), dtype=np.float32)
+    if tof_lo >= tof_hi_excl or scan_lo >= scan_hi_excl:
+        return img
+
+    # Peak ranges per pixel within the scan window — two vectorised push_indptr lookups
+    peak_lo_pp = push_indptr[frame_pos * scan_max + scan_lo]
+    peak_hi_pp = push_indptr[frame_pos * scan_max + scan_hi_excl]
+    peak_counts = peak_hi_pp - peak_lo_pp
+
+    total_peaks = int(peak_counts.sum())
+    if total_peaks == 0:
+        return img
+
+    # Build flat raw peak indices (vectorised; within each pixel the peaks
+    # form a contiguous slice of tof_indices, so access is cache-friendly)
+    out_starts  = np.empty(n_pixels, dtype=np.int64)
+    out_starts[0] = 0
+    np.cumsum(peak_counts[:-1], out=out_starts[1:])
+    flat_raw    = np.arange(total_peaks, dtype=np.int64) + np.repeat(peak_lo_pp - out_starts, peak_counts)
+
+    # Filter by TOF-bin (m/z window) and accumulate into image
+    flat_tof    = tof_indices_np[flat_raw].astype(np.int32)
+    mz_mask     = (flat_tof >= tof_lo) & (flat_tof < tof_hi_excl)
+
+    if mz_mask.any():
+        flat_pix = np.repeat(np.arange(n_pixels, dtype=np.int32), peak_counts)[mz_mask]
+        np.add.at(img, (pixel_yi[flat_pix], pixel_xi[flat_pix]), intensity_np[flat_raw[mz_mask]])
+
+    return img
+
+
+def _compute_mob_k0_win(features_df: pd.DataFrame, mob_window_multiplier: float = 2.0) -> float:
+    """Data-driven 1/K0 half-window: mob_window_multiplier × p95(|Δ1/K0|) on single-candidate
+    calibration set, or 0.05 V·s/cm² fallback."""
+    fallback = 0.05
+    if "im2deep_predicted_ccs" not in features_df.columns:
+        return fallback
+    if "im2deep_observed_ccs" not in features_df.columns:
+        return fallback
+    try:
+        from im2deep.utils import ccs2im
+    except ImportError:
+        return fallback
+    df = features_df.copy()
+    df["_pred_k0_tmp"] = ccs2im(df["im2deep_predicted_ccs"].values, mz=df["feature_mz"].values, charge=1)
+    if "n_candidates" in df.columns:
+        single = df[df["n_candidates"] == 1].dropna(subset=["im2deep_observed_ccs", "_pred_k0_tmp"])
+    else:
+        single = df.dropna(subset=["im2deep_observed_ccs", "_pred_k0_tmp"])
+    if len(single) < 10:
+        return fallback
+    obs_k0 = ccs2im(single["im2deep_observed_ccs"].values, mz=single["feature_mz"].values, charge=1)
+    return float(mob_window_multiplier * np.percentile(np.abs(single["_pred_k0_tmp"].values - obs_k0), 95))
+
+
+def _build_mob_image_cache(
+    subset: pd.DataFrame,
+    mob_setup: dict,
+    k0_half_win: float,
+    extraction_ppm: float = 25.0,
+) -> dict:
+    """Pre-compute mobility-filtered precursor images for each row in subset.
+    Returns {df_integer_index: (max_y, max_x) float32 image}."""
+    try:
+        from im2deep.utils import ccs2im
+    except ImportError:
+        return {}
+    cache: dict[int, np.ndarray] = {}
+    for idx, row in subset.iterrows():
+        pred_ccs = _get(row, "im2deep_predicted_ccs")
+        fmz = _get(row, "feature_mz")
+        if not (np.isfinite(pred_ccs) and np.isfinite(fmz) and fmz > 0):
+            continue
+        pred_k0 = float(ccs2im(np.array([pred_ccs]), mz=np.array([fmz]), charge=1)[0])
+        if not np.isfinite(pred_k0):
+            continue
+        cache[idx] = _extract_mob_image(mob_setup, fmz, pred_k0, k0_half_win, extraction_ppm)
+    return cache
+
+
+# ---------------------------------------------------------------------------
 # Subsystem 1: Ion image colocalization
 # ---------------------------------------------------------------------------
 
@@ -251,6 +426,7 @@ def plot_ion_image_colocalization(
     out_dir: str,
     feature_qvals: dict | None = None,
     feature_peptides: dict | None = None,
+    mob_image_cache: dict | None = None,
 ) -> None:
     """
     Per-candidate figure: precursor ion image + ALL same-protein co-feature images
@@ -260,12 +436,16 @@ def plot_ion_image_colocalization(
     a different-protein peptide is the TDC winner at that feature, it is annotated
     as "(not winner: <winner>)" so mass-coincidence competitors are visible.
 
+    When mob_image_cache is provided (keyed by df integer index), the precursor
+    panel shows the per-candidate mobility-filtered image instead of the standard
+    all-IMS-summed image.
+
     Files are saved as ``{out_dir}/{rank:03d}_{peptide}_{feature_mz:.4f}.png``.
     Panels are arranged in a grid of up to 8 columns.
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    for _, row in subset.iterrows():
+    for idx, row in subset.iterrows():
         feature_mz = row.get("feature_mz")
         if feature_mz is None or not np.isfinite(float(feature_mz)):
             continue
@@ -279,7 +459,9 @@ def plot_ion_image_colocalization(
         prec_idx = _find_image_idx(feature_mz, ion_image_mzs)
         if prec_idx is None:
             continue
-        prec_img = ion_images[prec_idx]
+        _mob_img = mob_image_cache.get(idx) if mob_image_cache else None
+        prec_img = _mob_img if _mob_img is not None else ion_images[prec_idx]
+        _mob_label = " (mob-filtered)" if _mob_img is not None else ""
 
         # Collect co-feature images for the same protein, ranked by reweighted q-value.
         # The label shows the same-protein candidate peptide; if a different-protein
@@ -340,7 +522,7 @@ def plot_ion_image_colocalization(
 
         _prec_q = feature_qvals.get(feature_mz, float("nan")) if feature_qvals else float("nan")
         _prec_q_s = f"\nq={_prec_q:.3f}" if np.isfinite(_prec_q) else ""
-        _panel(axes[0], prec_img, f"Precursor\n{feature_mz:.4f}{_prec_q_s}")
+        _panel(axes[0], prec_img, f"Precursor{_mob_label}\n{feature_mz:.4f}{_prec_q_s}")
         for i, (cimg, cmz, clabel) in enumerate(zip(co_imgs, co_mzs, co_pep_labels)):
             _q = feature_qvals.get(cmz, float("nan")) if feature_qvals else float("nan")
             _q_s = f"\nq={_q:.3f}" if np.isfinite(_q) else ""
@@ -369,12 +551,13 @@ def plot_feature_diagnostics(
     ion_image_mzs: np.ndarray | None,
     maldi_envelopes: dict | None,
     out_dir: str,
+    mob_image_cache: dict | None = None,
 ) -> None:
     """
     Per-candidate 3×3 diagnostic figure.
 
     Panels:
-      [0,0] Ion image heatmap + fraction_detected / CV / Moran's I
+      [0,0] Ion image heatmap (mob-filtered when mob_image_cache provided)
       [0,1] Mass accuracy horizontal bar with ±2 / ±5 ppm shading
       [0,2] Observed vs theoretical isotope envelope
       [1,0] Peptide properties (bar chart)
@@ -388,7 +571,7 @@ def plot_feature_diagnostics(
 
     os.makedirs(out_dir, exist_ok=True)
 
-    for _, row in subset.iterrows():
+    for idx, row in subset.iterrows():
         feature_mz = row.get("feature_mz")
         if feature_mz is not None:
             feature_mz = float(feature_mz)
@@ -402,15 +585,19 @@ def plot_feature_diagnostics(
         ax = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(3)]
 
         # ------------------------------------------------------------------
-        # [0,0] Ion image
+        # [0,0] Ion image — mobility-filtered when cache hit, else all-IMS
         # ------------------------------------------------------------------
         if ion_images is not None and feature_mz is not None:
             prec_idx = _find_image_idx(feature_mz, ion_image_mzs)
         else:
             prec_idx = None
 
-        if prec_idx is not None:
-            im = ax[0][0].imshow(ion_images[prec_idx], cmap="hot", aspect="auto")
+        _mob_img = mob_image_cache.get(idx) if mob_image_cache else None
+        _disp_img = _mob_img if _mob_img is not None else (ion_images[prec_idx] if prec_idx is not None else None)
+        _img_label = "Ion image (mob)" if _mob_img is not None else "Ion image"
+
+        if _disp_img is not None:
+            im = ax[0][0].imshow(_disp_img, cmap="hot", aspect="auto")
             plt.colorbar(im, ax=ax[0][0], fraction=0.046, pad=0.04)
             frac = _get(row, "fraction_detected")
             cv = _get(row, "intensity_cv")
@@ -419,7 +606,7 @@ def plot_feature_diagnostics(
             cv_s = f"CV={cv:.2f}" if np.isfinite(cv) else ""
             mi_s = f"Moran={mi:.2f}" if np.isfinite(mi) else ""
             subtitle = "  ".join(s for s in [frac_s, cv_s, mi_s] if s)
-            ax[0][0].set_title(f"Ion image\n{subtitle}", fontsize=8)
+            ax[0][0].set_title(f"{_img_label}\n{subtitle}", fontsize=8)
         else:
             ax[0][0].text(0.5, 0.5, "No ion image", ha="center", va="center", transform=ax[0][0].transAxes)
             ax[0][0].set_title("Ion image", fontsize=8)
@@ -608,11 +795,12 @@ def plot_feature_diagnostics(
             else None
         )
 
-        if _adduct_idx is not None and prec_idx is not None:
+        if _adduct_idx is not None and _disp_img is not None:
             ax[2][1].axis("off")
             _axl = ax[2][1].inset_axes([0.02, 0.10, 0.44, 0.78])
-            _axl.imshow(ion_images[prec_idx], cmap="hot", aspect="auto")
-            _axl.set_title(f"Precursor\n{feature_mz:.4f}", fontsize=6)
+            _axl.imshow(_disp_img, cmap="hot", aspect="auto")
+            _prec_lbl = f"Precursor{'(mob)' if _mob_img is not None else ''}\n{feature_mz:.4f}"
+            _axl.set_title(_prec_lbl, fontsize=6)
             _axl.axis("off")
             _axr = ax[2][1].inset_axes([0.54, 0.10, 0.44, 0.78])
             _axr.imshow(ion_images[_adduct_idx], cmap="hot", aspect="auto")
@@ -1675,7 +1863,169 @@ def plot_target_decoy_mz_distribution(
 
 
 # ---------------------------------------------------------------------------
-# Subsystem 10: Score PP plot
+# Subsystem 10: Candidate competition per feature
+# ---------------------------------------------------------------------------
+
+
+def plot_candidate_competition(
+    features_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    out_dir: str,
+    ccs_tol_pct: float | None = None,
+) -> None:
+    """
+    Four-panel figure showing how many target and decoy candidates compete at
+    each MALDI m/z feature.
+
+    Panel [0,0] — Target candidate count distribution:
+        Histogram of how many features have 0, 1, 2, 3, 4+ target candidates.
+    Panel [0,1] — Decoy candidate count distribution:
+        Same for decoy candidates.
+    Panel [1,0] — T vs D balance scatter:
+        Each point = one (n_targets, n_decoys) combination; size ∝ number of
+        features at that combination.  Diagonal marks perfect 1:1 balance.
+    Panel [1,1] — Sorted competition landscape:
+        Each feature as a vertical pair of bars: n_targets (blue, above axis)
+        and n_decoys (orange, below axis), sorted by total candidates
+        descending.  Capped at the 200 most-contested features for clarity.
+
+    When ``ccs_tol_pct`` is not None the title notes that a CCS filter was
+    applied before calling this function.
+
+    Output: ``{out_dir}/candidate_competition.png``
+    """
+    if "feature_mz" not in features_df.columns or "is_decoy" not in features_df.columns:
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat = features_df.reset_index(drop=True)
+    is_decoy = feat["is_decoy"].fillna(False).astype(bool)
+
+    feat_col = "feature_idx" if "feature_idx" in feat.columns else "feature_mz"
+
+    # --- Per-feature target/decoy counts ---
+    n_tgt = feat[~is_decoy].groupby(feat_col).size().rename("n_targets")
+    n_dec = feat[is_decoy].groupby(feat_col).size().rename("n_decoys")
+    all_features = feat[feat_col].unique()
+    per_feat = (
+        pd.DataFrame(index=all_features)
+        .join(n_tgt, how="left")
+        .join(n_dec, how="left")
+        .fillna(0)
+        .astype(int)
+    )
+    per_feat["n_total"] = per_feat["n_targets"] + per_feat["n_decoys"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+    fig.suptitle(
+        "Candidate competition per MALDI feature"
+        + (f"  [CCS filter applied: ±{ccs_tol_pct:.1f}%]" if ccs_tol_pct is not None else ""),
+        fontsize=11,
+    )
+
+    # ------------------------------------------------------------------ #
+    # [0,0]  Target candidate count distribution                          #
+    # ------------------------------------------------------------------ #
+    ax = axes[0][0]
+    max_n = int(per_feat["n_targets"].max()) if len(per_feat) else 4
+    cap = min(max_n, 6)
+    bins_t = np.arange(0, cap + 2) - 0.5
+    vals_t = np.clip(per_feat["n_targets"].values, 0, cap)
+    ax.hist(vals_t, bins=bins_t, color="steelblue", edgecolor="white", linewidth=0.5)
+    ax.set_xticks(np.arange(0, cap + 1))
+    ax.set_xticklabels([str(i) if i < cap else f"{cap}+" for i in range(cap + 1)])
+    ax.set_xlabel("Target candidates per feature")
+    ax.set_ylabel("Number of features")
+    ax.set_title(
+        f"Target candidate distribution\n"
+        f"median={per_feat['n_targets'].median():.1f}  "
+        f"mean={per_feat['n_targets'].mean():.2f}  "
+        f"0-target features: {int((per_feat['n_targets']==0).sum())}",
+        fontsize=8,
+    )
+
+    # ------------------------------------------------------------------ #
+    # [0,1]  Decoy candidate count distribution                           #
+    # ------------------------------------------------------------------ #
+    ax = axes[0][1]
+    max_d = int(per_feat["n_decoys"].max()) if len(per_feat) else 4
+    cap_d = min(max_d, 6)
+    bins_d = np.arange(0, cap_d + 2) - 0.5
+    vals_d = np.clip(per_feat["n_decoys"].values, 0, cap_d)
+    ax.hist(vals_d, bins=bins_d, color="tomato", edgecolor="white", linewidth=0.5)
+    ax.set_xticks(np.arange(0, cap_d + 1))
+    ax.set_xticklabels([str(i) if i < cap_d else f"{cap_d}+" for i in range(cap_d + 1)])
+    ax.set_xlabel("Decoy candidates per feature")
+    ax.set_ylabel("Number of features")
+    ax.set_title(
+        f"Decoy candidate distribution\n"
+        f"median={per_feat['n_decoys'].median():.1f}  "
+        f"mean={per_feat['n_decoys'].mean():.2f}  "
+        f"0-decoy features: {int((per_feat['n_decoys']==0).sum())}",
+        fontsize=8,
+    )
+
+    # ------------------------------------------------------------------ #
+    # [1,0]  T vs D balance scatter                                       #
+    # ------------------------------------------------------------------ #
+    ax = axes[1][0]
+    td_counts = per_feat.groupby(["n_targets", "n_decoys"]).size().reset_index(name="count")
+    sc = ax.scatter(
+        td_counts["n_targets"],
+        td_counts["n_decoys"],
+        s=np.clip(td_counts["count"], 1, None) * 12,
+        c=np.log1p(td_counts["count"]),
+        cmap="Blues",
+        edgecolors="steelblue",
+        linewidths=0.6,
+        alpha=0.85,
+    )
+    plt.colorbar(sc, ax=ax, label="log(n features + 1)", fraction=0.046, pad=0.04)
+    # Ideal 1:1 diagonal
+    _lim = max(int(td_counts[["n_targets", "n_decoys"]].max().max()), 1)
+    ax.plot([0, _lim], [0, _lim], color="gray", lw=0.8, ls="--", alpha=0.6, label="1:1")
+    ax.set_xlim(left=-0.3)
+    ax.set_ylim(bottom=-0.3)
+    ax.set_xlabel("n_targets per feature")
+    ax.set_ylabel("n_decoys per feature")
+    ax.set_title("Target vs decoy balance per feature\n(bubble size ∝ n features)", fontsize=8)
+    ax.legend(fontsize=7)
+
+    # ------------------------------------------------------------------ #
+    # [1,1]  Sorted competition landscape (top-N most contested)          #
+    # ------------------------------------------------------------------ #
+    ax = axes[1][1]
+    _TOP = 150
+    sorted_pf = per_feat.sort_values("n_total", ascending=False).head(_TOP).reset_index(drop=True)
+    x = np.arange(len(sorted_pf))
+    ax.bar(x, sorted_pf["n_targets"].values, color="steelblue", label="Targets", width=1.0)
+    ax.bar(x, -sorted_pf["n_decoys"].values, color="tomato", label="Decoys", width=1.0)
+    ax.axhline(0, color="black", lw=0.6)
+    ax.axhline(1, color="steelblue", lw=0.7, ls=":", alpha=0.5)
+    ax.axhline(-1, color="tomato", lw=0.7, ls=":", alpha=0.5)
+    ax.set_xlabel(f"Feature rank (by total candidates, top {min(_TOP, len(per_feat))} shown)")
+    ax.set_ylabel("n_candidates  (targets ↑  /  decoys ↓)")
+    _n_feat = len(per_feat)
+    _td_ratio = per_feat["n_decoys"].sum() / max(per_feat["n_targets"].sum(), 1)
+    ax.set_title(
+        f"Competition landscape  ({_n_feat} features total)\n"
+        f"total T={per_feat['n_targets'].sum()}  D={per_feat['n_decoys'].sum()}  "
+        f"D:T ratio={_td_ratio:.2f}",
+        fontsize=8,
+    )
+    ax.legend(fontsize=7, loc="upper right")
+
+    plt.tight_layout()
+    fig.savefig(
+        os.path.join(out_dir, "candidate_competition.png"),
+        dpi=120, bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Subsystem 11: Score PP plot
 # ---------------------------------------------------------------------------
 
 
@@ -2533,6 +2883,8 @@ def save_debug_figures(
     gt_peptides: list[str] | None = None,
     storey_pi0_val: float | None = None,
     ccs_tol_pct: float | None = None,
+    tdf_path: str | None = None,
+    mob_window_multiplier: float = 2.0,
 ) -> None:
     """
     Generate all debug figures and save them under ``debug_dir``.
@@ -2570,6 +2922,18 @@ def save_debug_figures(
 
     subset = _sample_subset(features_df, result_df, n=n_subset, seed=seed)
     logger.info("Debug viz: sampled %d candidates from %d", len(subset), len(features_df))
+
+    # Load mobility setup once (no global peak read — just CSR metadata)
+    _mob_setup: dict | None = None
+    _mob_k0_win = 0.05
+    if tdf_path is not None and "im2deep_predicted_ccs" in features_df.columns:
+        try:
+            _mob_setup = _load_mob_setup(str(tdf_path))
+            _mob_k0_win = _compute_mob_k0_win(features_df, mob_window_multiplier)
+            logger.info("Mobility image setup ready (k0_half_win=%.4f V·s/cm²)", _mob_k0_win)
+        except Exception as exc:
+            logger.warning("Failed to load mobility setup for debug viz: %s", exc)
+            _mob_setup = None
 
     # Build feature_mz → reweighted_q_value mapping once for co-feature ranking.
     # Used by plot_ion_image_colocalization to rank co-features by match quality.
@@ -2660,11 +3024,18 @@ def save_debug_figures(
                 len(subset_for_images) - len(id_subset),
                 len(subset_for_images),
             )
+            _mob_cache_coloc: dict = {}
+            if _mob_setup is not None:
+                try:
+                    _mob_cache_coloc = _build_mob_image_cache(subset_for_images, _mob_setup, _mob_k0_win)
+                except Exception as _exc:
+                    logger.warning("Mobility image cache (colocalization) failed: %s", _exc)
             plot_ion_image_colocalization(
                 subset_for_images, features_df, ion_images, ion_image_mzs,
                 out_dir=os.path.join(debug_dir, "ion_images"),
                 feature_qvals=feature_qvals,
                 feature_peptides=feature_peptides,
+                mob_image_cache=_mob_cache_coloc or None,
             )
             logger.info("Ion image colocalization figures saved to %s/ion_images/", debug_dir)
         except Exception as exc:
@@ -2694,10 +3065,17 @@ def save_debug_figures(
         except Exception as exc:
             logger.warning("Protein spatial coherence failed: %s", exc)
 
+    _mob_cache_subset: dict = {}
+    if _mob_setup is not None:
+        try:
+            _mob_cache_subset = _build_mob_image_cache(subset, _mob_setup, _mob_k0_win)
+        except Exception as _exc:
+            logger.warning("Mobility image cache (diagnostics) failed: %s", _exc)
     try:
         plot_feature_diagnostics(
             subset, features_df, ion_images, ion_image_mzs, maldi_envelopes,
             out_dir=os.path.join(debug_dir, "features"),
+            mob_image_cache=_mob_cache_subset or None,
         )
         logger.info("Feature diagnostic figures saved to %s/features/", debug_dir)
     except Exception as exc:
@@ -2762,6 +3140,16 @@ def save_debug_figures(
         logger.info("T/D m/z distribution saved to %s/target_decoy_mz_distribution.png", debug_dir)
     except Exception as exc:
         logger.warning("T/D m/z distribution plot failed: %s", exc)
+
+    try:
+        plot_candidate_competition(
+            features_df, result_df,
+            out_dir=debug_dir,
+            ccs_tol_pct=ccs_tol_pct,
+        )
+        logger.info("Candidate competition saved to %s/candidate_competition.png", debug_dir)
+    except Exception as exc:
+        logger.warning("Candidate competition plot failed: %s", exc)
 
     try:
         plot_score_pp(
@@ -2831,10 +3219,17 @@ def save_debug_figures(
                     "GT debug viz: %d rows for %d GT peptides",
                     len(gt_subset), len(gt_peptides) - len(not_found),
                 )
+                _mob_cache_gt: dict = {}
+                if _mob_setup is not None:
+                    try:
+                        _mob_cache_gt = _build_mob_image_cache(gt_subset, _mob_setup, _mob_k0_win)
+                    except Exception as _exc:
+                        logger.warning("Mobility image cache (GT) failed: %s", _exc)
                 try:
                     plot_feature_diagnostics(
                         gt_subset, features_df, ion_images, ion_image_mzs, maldi_envelopes,
                         out_dir=os.path.join(debug_dir, "features"),
+                        mob_image_cache=_mob_cache_gt or None,
                     )
                 except Exception as exc:
                     logger.warning("GT feature diagnostic figures failed: %s", exc)
@@ -2852,6 +3247,7 @@ def save_debug_figures(
                             out_dir=os.path.join(debug_dir, "ion_images"),
                             feature_qvals=feature_qvals,
                             feature_peptides=feature_peptides,
+                            mob_image_cache=_mob_cache_gt or None,
                         )
                     except Exception as exc:
                         logger.warning("GT ion image figures failed: %s", exc)
