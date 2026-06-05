@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from MSI-PICASSO import __version__
+from msi_picasso import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -1110,7 +1110,7 @@ def main() -> None:
     import json as _json
     from argparse import Namespace as _Namespace
     from pathlib import Path as _Path
-    from MSI-PICASSO.config_parser import parse_configurations
+    from msi_picasso.config_parser import parse_configurations
 
     parser = build_parser()
     args = parser.parse_args()
@@ -1246,7 +1246,7 @@ def main() -> None:
     _maldi_imzml_path: str | None = _ms1cfg.get("maldi_imzml")
     _feature_mzs_path: str | None = _ms1cfg.get("feature_mzs")
     if _maldi_raw_path:
-        from MSI-PICASSO.maldi_extraction import extract_maldi_data
+        from msi_picasso.maldi_extraction import extract_maldi_data
 
         logger.info(
             "MALDI features detected from raw data (detect_features). "
@@ -1303,7 +1303,7 @@ def main() -> None:
             + (f", ion image shape: {ion_images.shape[1:]}" if ion_images is not None else "")
         )
     elif _maldi_imzml_path:
-        from MSI-PICASSO.maldi_imzml import (
+        from msi_picasso.maldi_imzml import (
             SCiLSConfig, extract_scils_features,
             reconstruct_ion_images_from_intervals, build_envelopes_from_intervals,
         )
@@ -1353,7 +1353,7 @@ def main() -> None:
 
         # Compute spatial features from reconstructed ion images
         if len(intervals) > 0:
-            from MSI-PICASSO.maldi_extraction import compute_spatial_features as _csf
+            from msi_picasso.maldi_extraction import compute_spatial_features as _csf
             spatial_features = _csf(ion_images, maldi_mzs, len(pixel_coords))
 
         # Build approximate isotope envelopes from interval mean intensities
@@ -1364,7 +1364,7 @@ def main() -> None:
             + (f", ion images {ion_images.shape[1:]}" if len(intervals) > 0 else "")
         )
         if mean_1_over_k0 is not None and len(mean_1_over_k0) == len(maldi_mzs):
-            from MSI-PICASSO.maldi_imzml import one_over_k0_to_ccs
+            from msi_picasso.maldi_imzml import one_over_k0_to_ccs
             _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
             logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
     else:
@@ -1391,7 +1391,7 @@ def main() -> None:
 
     # --- Resolve digest parameters ---
     if lcms_peptides_path:
-        from MSI-PICASSO.lcms_ids import parse_lcms_ids
+        from msi_picasso.lcms_ids import parse_lcms_ids
 
         logger.info("Parsing LC-MS/MS identifications for Strategy C...")
         lcms_ids = parse_lcms_ids(
@@ -1491,7 +1491,7 @@ def main() -> None:
             logger.warning("Could not read --debug-gt file %s: %s", _debug_gt_path, _exc)
 
     # --- Run pipeline ---
-    from MSI-PICASSO.pipeline import rescore
+    from msi_picasso.pipeline import rescore
 
     logger.info("Starting MSI-PICASSO pipeline...")
     _, result_df, _, _features_df = rescore(

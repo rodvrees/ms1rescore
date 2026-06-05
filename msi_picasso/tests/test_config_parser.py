@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from MSI-PICASSO.config_parser import parse_configurations
+from msi_picasso.config_parser import parse_configurations
 
 
 def test_defaults_returned_when_no_config():

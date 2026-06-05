@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from MSI-PICASSO.pipeline import _select_calibration_peptides
+from msi_picasso.pipeline import _select_calibration_peptides
 
 
 def _make_candidates(n_target=100, n_decoy=100, seed=0):

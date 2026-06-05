@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from MSI-PICASSO.pipeline import _rescore_qda
+from msi_picasso.pipeline import _rescore_qda
 
 
 def _make_features_df(
@@ -117,7 +117,7 @@ class TestQDABranchIntegration:
 
     def test_two_pass_does_not_raise(self):
         """Simulate R1 → winner selection → R2 as the pipeline does."""
-        from MSI-PICASSO.pipeline import _select_feature_winners
+        from msi_picasso.pipeline import _select_feature_winners
 
         rng = np.random.default_rng(0)
         n_features = 200

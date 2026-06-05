@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from MSI-PICASSO.pipeline import _find_best_feature_labels, _rescore_lda, _tdc_qvalues
+from msi_picasso.pipeline import _find_best_feature_labels, _rescore_lda, _tdc_qvalues
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from MSI-PICASSO.pipeline import _pep_qvalues, estimate_pep
+from msi_picasso.pipeline import _pep_qvalues, estimate_pep
 
 
 def _make_bimodal(n_target: int = 300, n_decoy: int = 150, seed: int = 42):

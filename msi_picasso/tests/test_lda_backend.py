@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from MSI-PICASSO.feature_generator import LDA_FEATURES, MALDI_INTRINSIC_FEATURES
-from MSI-PICASSO.pipeline import (
+from msi_picasso.feature_generator import LDA_FEATURES, MALDI_INTRINSIC_FEATURES
+from msi_picasso.pipeline import (
     _find_best_feature_labels,
     _rescore_lda,
     _select_feature_winners,
@@ -208,7 +208,7 @@ class TestFindBestFeatureLabels:
     def test_single_feature_gives_zero_positives(self, xy):
         X, is_decoy, feature_names = xy
         # Verify the premise: neither single feature reaches q <= 0.01.
-        from MSI-PICASSO.pipeline import _tdc_qvalues
+        from msi_picasso.pipeline import _tdc_qvalues
 
         rng = np.random.default_rng(0)
         tiebreak = rng.uniform(-1e-9, 1e-9, X.shape[0])

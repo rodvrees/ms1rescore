@@ -401,7 +401,7 @@ def plot_feature_diagnostics(
       [2,1] CHCA adduct colocalization (ion image thumbnails or Pearson r gauge)
       [2,2] Monoisotopic confidence gauge (monoisotopic_confidence)
     """
-    from MSI-PICASSO.utils import theoretical_isotope_distribution
+    from msi_picasso.utils import theoretical_isotope_distribution
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -727,7 +727,7 @@ def plot_isotope_envelope_figures(
     (style matches optimize_maldi_params.py interval shading), and the detected
     apex positions are marked with triangles.
     """
-    from MSI-PICASSO.utils import theoretical_isotope_distribution
+    from msi_picasso.utils import theoretical_isotope_distribution
 
     os.makedirs(out_dir, exist_ok=True)
 

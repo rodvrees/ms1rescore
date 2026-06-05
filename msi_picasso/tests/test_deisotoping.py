@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from MSI-PICASSO.maldi_imzml import _deisotope_intervals, _merge_duplicate_intervals
+from msi_picasso.maldi_imzml import _deisotope_intervals, _merge_duplicate_intervals
 
 NEUTRON = 1.003355
 

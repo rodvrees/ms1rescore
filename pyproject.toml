@@ -28,13 +28,14 @@ calibration = ["statsmodels>=0.14"]
 mobility = ["im2deep>=0.1"]
 
 [project.scripts]
-MSI-PICASSO = "MSI-PICASSO.cli:main"
+picasso = "msi_picasso.cli:main"
+msi-picasso = "msi_picasso.cli:main"
 
 [tool.pytest.ini_options]
-testpaths = ["MSI-PICASSO/tests"]
+testpaths = ["msi_picasso/tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 
 [tool.setuptools.package-data]
-MSI-PICASSO = ["package_data/*.json"]
+msi_picasso = ["package_data/*.json"]

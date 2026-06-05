@@ -13,7 +13,7 @@ from psm_utils.psm import PSM
 from psm_utils.psm_list import PSMList
 from psm_utils.peptidoform import Peptidoform
 
-from MSI-PICASSO.maldi_features import (
+from msi_picasso.maldi_features import (
     _pearson_r_matrix,
     compute_adduct_colocalization,
     compute_calibrated_ppm_features,

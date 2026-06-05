@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from MSI-PICASSO.lcms_evidence import LCMSData, compute_all_lcms_evidence
+from msi_picasso.lcms_evidence import LCMSData, compute_all_lcms_evidence
 
 
 PROTON = 1.007276
