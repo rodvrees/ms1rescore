@@ -54,11 +54,8 @@
 
         "decoy_method": {
           "type": ["string", "null"],
-          "enum": ["shuffle", "mz_shift", "balanced_shuffle", null]
+          "enum": ["shuffle", "balanced_shuffle", "paired_shuffle", null]
         },
-        "mz_shift_delta_min":          {"type": ["number", "null"]},
-        "mz_shift_delta_max":          {"type": ["number", "null"]},
-        "mz_shift_snap_tolerance_ppm": {"type": ["number", "null"]},
         "max_shuffle_rounds":          {"type": ["integer", "null"], "minimum": 1},
         "decoy_target_ratio":          {"type": ["number", "null"], "minimum": 0},
 
@@ -113,6 +110,10 @@
         "ccs_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
         "mob_coloc":              {"type": ["boolean", "null"]},
         "mob_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
+        "deeplc_finetune_epochs":   {"type": ["integer", "null"], "minimum": 1},
+        "deeplc_finetune_lr":       {"type": ["number",  "null"], "minimum": 0},
+        "deeplc_finetune_patience": {"type": ["integer", "null"], "minimum": 1},
+        "calibration_percentile":   {"type": ["number",  "null"], "minimum": 0, "maximum": 1},
 
         "maldi_extraction": {
           "type": ["object", "null"],

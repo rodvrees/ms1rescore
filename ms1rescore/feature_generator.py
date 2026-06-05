@@ -123,13 +123,6 @@ _LCMS_MZML_FEATURES = [
     "lcms_ms1_frac_apex_signal",
     "lcms_ms1_n_scans_with_signal",
     "lcms_ms2_rt_delta",
-]
-
-# Isotope envelope comparison features that directly evaluate MALDI signal
-# quality: cosine and ratio differences compare the MALDI M+1/M+2 pattern to
-# the LC-MS/MS M+1/M+2 pattern, validating the MALDI detection itself.
-# These go in the ranker (MALDI_INTRINSIC_FEATURES), not the prior.
-_LCMS_RANKER_FROM_EVIDENCE = [
     "isotope_envelope_cosine",
     "isotope_envelope_pearson",
     "isotope_envelope_mse",
@@ -147,10 +140,7 @@ _LCMS_ID_FEATURES = [
 # MALDI-vs-LC-MS/MS CCS comparison (optional: requires ion mobility in LC-MS/MS data).
 _LCMS_CCS_FEATURES = ["lcms_ccs_delta", "lcms_ccs_abs_pct"]
 
-LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_CCS_FEATURES
-
-# Extend the ranker feature list with envelope comparison features from evidence.
-MALDI_INTRINSIC_FEATURES += _LCMS_RANKER_FROM_EVIDENCE
+LCMS_PRIOR_FEATURES = _LCMS_MZML_FEATURES + _LCMS_CCS_FEATURES 
 
 # Spatial prior features: ion-image-level quality signals applied as a
 # multiplicative prior after scoring (analogous to LCMS_PRIOR_FEATURES).
@@ -371,11 +361,15 @@ def compute_all_features(
     # (targets and decoys receive identical treatment; no is_decoy branching).
     # Isotope envelope similarity features (isotope_envelope_*) are included here
     # when maldi_envelopes was passed to compute_all_lcms_evidence.
+    # All evidence columns that need to be in features_df:
+    #   _LCMS_MZML_FEATURES      → applied as prior (lcms_present in pipeline)
+    #   _LCMS_RANKER_FROM_EVIDENCE → also in MALDI_INTRINSIC_FEATURES (ranker)
+    _ALL_EVIDENCE_COLS = _LCMS_MZML_FEATURES
     if lcms_evidence is not None:
         ev_df = pd.DataFrame.from_dict(lcms_evidence, orient="index", dtype=float)
-        ev_df = ev_df.reindex(columns=_LCMS_MZML_FEATURES)
+        ev_df = ev_df.reindex(columns=_ALL_EVIDENCE_COLS)
         df = df.join(ev_df, how="left")
-        df[_LCMS_MZML_FEATURES] = df[_LCMS_MZML_FEATURES].fillna(0.0)
+        df[_ALL_EVIDENCE_COLS] = df[_ALL_EVIDENCE_COLS].fillna(0.0)
         # For similarity/ratio features and NaN-sentinel RT-delta features, replace
         # 0-fill with column median so candidates without signal are not penalised.
         _median_fill_feats = [
@@ -393,7 +387,7 @@ def compute_all_features(
             fill = float(valid.median()) if len(valid) > 0 else 0.0
             df[feat] = df[feat].replace(0.0, fill)
     else:
-        for feat in _LCMS_MZML_FEATURES:
+        for feat in _ALL_EVIDENCE_COLS:
             df[feat] = 0.0
 
     # --- MALDI vs LC-MS/MS CCS features (optional) ---

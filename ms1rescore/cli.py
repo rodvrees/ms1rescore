@@ -670,42 +670,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cand.add_argument(
         "--decoy-method",
-        choices=("shuffle", "mz_shift", "balanced_shuffle"),
+        choices=("shuffle", "balanced_shuffle", "paired_shuffle"),
         default=None,
         help=(
             "Decoy generation strategy. 'shuffle' (default): K/R-preserving protein "
-            "shuffle, standard target-decoy competition. 'mz_shift': observation-space "
-            "decoys — each target peptide generates a shifted m/z query "
-            "(delta_min..delta_max Da away) that is matched against MALDI features. "
-            "'balanced_shuffle': iterative K/R-preserving protein shuffle with MALDI-match "
-            "filtering — only shuffled peptides that match a MALDI feature are kept, "
-            "subsampled to target_ratio * N_target. Ensures ~1:1 T:D even when the "
-            "MALDI feature list is sparse."
-        ),
-    )
-    cand.add_argument(
-        "--mz-shift-delta-min",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="mz_shift only: minimum absolute m/z shift in Da (default 5.0).",
-    )
-    cand.add_argument(
-        "--mz-shift-delta-max",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="mz_shift only: maximum absolute m/z shift in Da (default 20.0).",
-    )
-    cand.add_argument(
-        "--mz-shift-snap-tolerance-ppm",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help=(
-            "mz_shift only: maximum ppm distance between the shifted query and the "
-            "nearest MALDI feature for the snap to be accepted (default 50.0). "
-            "Increase for sparse feature lists."
+            "shuffle, standard target-decoy competition. 'balanced_shuffle': iterative "
+            "K/R-preserving protein shuffle with MALDI-match filtering — only shuffled "
+            "peptides that match a MALDI feature are kept, length-stratified subsample "
+            "to target_ratio * N_target. Ensures ~1:1 T:D even when the MALDI feature "
+            "list is sparse. 'paired_shuffle': same shuffle pool, but decoys are "
+            "feature-occupancy-matched — drawn at the same m/z features that targets "
+            "occupy, converting target-only features into contested ones to maximise "
+            "per-feature competition; preserves the same global ~1:1 T:D ratio."
         ),
     )
     cand.add_argument(
@@ -714,9 +690,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="INT",
         help=(
-            "balanced_shuffle only: maximum number of shuffle rounds to attempt when "
-            "collecting decoy candidates (default 50). Increase if T:D ratio is low "
-            "due to sparse MALDI features."
+            "balanced_shuffle / paired_shuffle only: maximum number of shuffle rounds "
+            "to attempt when collecting decoy candidates (default 50). Increase if T:D "
+            "ratio is low (or contested-feature coverage is low) due to sparse MALDI "
+            "features."
         ),
     )
     cand.add_argument(
@@ -725,8 +702,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FLOAT",
         help=(
-            "balanced_shuffle only: target T:D candidate ratio (default 1.0). "
-            "The function collects up to int(ratio * N_target) decoy candidates."
+            "balanced_shuffle / paired_shuffle only: target T:D candidate ratio "
+            "(default 1.0). The function collects up to int(ratio * N_target) decoy "
+            "candidates."
         ),
     )
 
@@ -1158,8 +1136,7 @@ def main() -> None:
         "lda_r2_median_filter", "only_main_features", "use_protein_level_feats",
         "n_debug", "debug_seed", "verbose", "output_dir",
         "ppm_tolerance", "missed_cleavages", "min_length", "max_length",
-        "decoy_method", "mz_shift_delta_min", "mz_shift_delta_max",
-        "mz_shift_snap_tolerance_ppm", "max_shuffle_rounds", "decoy_target_ratio",
+        "decoy_method", "max_shuffle_rounds", "decoy_target_ratio",
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
         "features_preset", "features_exclude",
@@ -1169,6 +1146,7 @@ def main() -> None:
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
         "match_ccs", "ccs_window_multiplier",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
+        "calibration_percentile",
         # file paths
         "fasta", "extra_fasta", "mzml",
         "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
@@ -1559,13 +1537,11 @@ def main() -> None:
         deeplc_finetune_epochs=_ms1cfg["deeplc_finetune_epochs"],
         deeplc_finetune_lr=_ms1cfg["deeplc_finetune_lr"],
         deeplc_finetune_patience=_ms1cfg["deeplc_finetune_patience"],
+        calibration_percentile=_ms1cfg["calibration_percentile"],
         digest=args.digest,
         gt_peptides=gt_peptides,
         maldi_intensities=_mzs_intensities,
         decoy_method=_ms1cfg["decoy_method"],
-        mz_shift_delta_min=_ms1cfg["mz_shift_delta_min"],
-        mz_shift_delta_max=_ms1cfg["mz_shift_delta_max"],
-        mz_shift_snap_tolerance_ppm=_ms1cfg["mz_shift_snap_tolerance_ppm"],
         max_shuffle_rounds=_ms1cfg["max_shuffle_rounds"],
         target_ratio=_ms1cfg["decoy_target_ratio"],
         features_preset=_ms1cfg["features_preset"],

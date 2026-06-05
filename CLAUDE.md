@@ -42,7 +42,6 @@ ms1rescore/
 │       ├── test_lcms_ids.py
 │       ├── test_lda_backend.py
 │       ├── test_maldi_extraction.py
-│       ├── test_mz_shift_decoys.py
 │       └── test_pep.py
 └── ms1rescore-rs/              # Rust extension (PyO3 + rayon)
     ├── Cargo.toml
@@ -300,15 +299,7 @@ Two candidate generation strategies are supported, both producing a DataFrame wi
 2. Phase 2 (Rust or pyteomics fallback): `compute_peptide_masses()` from `ms1rescore_rs` computes mass, [M+H]+ m/z, and elemental composition (n_C, n_H, n_N, n_O, n_S).
 
 **`digest_identified_proteins(..., generate_decoys=True)` — Strategy C (LC-MS/MS-guided):**
-See the [Candidate generation strategies](#candidate-generation-strategies) section below. Pass `generate_decoys=False` to suppress decoy generation (e.g. when using `decoy_method="mz_shift"` — the pipeline filters out shuffle decoys before calling `generate_mz_shift_candidates`).
-
-**`generate_mz_shift_candidates(target_df, feature_mzs, ...)` — observation-space decoys:**
-IonQuant-style m/z-shift decoys. For each unique target peptide, a random delta in `[delta_min, delta_max]` Da is sampled and its m/z is shifted by ±delta (alternating sign). The shifted query is matched against MALDI features at `matching_ppm`; the decoy row carries the target peptide's sequence and theoretical isotope pattern but is anchored to the off-target MALDI signal. Key properties:
-- `ppm_error` on decoy rows is computed vs the shifted query m/z, not vs the original peptide m/z.
-- A collision check (binary search against all target m/z values) rejects shifts that land within `matching_ppm` of any real target; up to 10 resamples are attempted before the peptide's decoy is skipped.
-- `decoy_delta_da` column stores the signed shift; NaN for target rows.
-- LC-MS/MS evidence columns (`lcms_*`, `n_psms`) are **inherited from the source target peptide** (not wiped). The decoy is the same sequence anchored to a different MALDI feature; wiping its LC-MS/MS evidence would give decoys systematically worse priors, breaking the equal-chance assumption for TDC.
-- Returns a combined target + decoy DataFrame with the same schema as `match_to_maldi_features()` plus `decoy_delta_da`.
+See the [Candidate generation strategies](#candidate-generation-strategies) section below. Pass `generate_decoys=False` to suppress decoy generation.
 
 `match_to_maldi_features()` uses `match_mz()` from `ms1rescore_rs` (binary search) or Python fallback. Returns a candidates DataFrame with one row per (peptide, MALDI feature) pair. Protein-level features (`protein_n_features`, `n_candidates`) are computed over all candidates symmetrically.
 
@@ -591,10 +582,9 @@ P12345  →  P12345
 
 **Decoy mode parameter:** `decoy_method` (str, default `"shuffle"`) controls Step 1c:
 - `"shuffle"` — standard K/R-preserving protein shuffle (via `digest_fasta` / `digest_identified_proteins`). Decoys are sequence-space decoys with distinct elemental compositions (different `theo_isotope_cosine`).
-- `"mz_shift"` — observation-space decoys via `generate_mz_shift_candidates()`. Shuffle decoys from Step 1b are filtered out; `generate_mz_shift_candidates` is called on the target-only candidate set. Decoy rows carry the real peptide's theoretical isotope pattern but are anchored to an off-target MALDI feature ±delta Da away. Use with `mz_shift_delta_min` (default 5.0 Da) and `mz_shift_delta_max` (default 20.0 Da).
 - `"balanced_shuffle"` — iterative K/R-preserving protein shuffle with MALDI-match filtering via `generate_balanced_shuffle_candidates()`. Runs up to `max_shuffle_rounds` (default 50) rounds of protein-level shuffle, keeping only decoy peptides that match a MALDI feature within `matching_ppm`. Subsamples the collected pool to `target_ratio * N_target` (default 1.0). Unlike standard shuffle (one decoy per target regardless of MALDI match), this ensures decoys compete in the same observation space as targets and achieves ~1:1 T:D even when the MALDI feature list is sparse. LC-MS/MS evidence columns are NaN for all decoy rows (shuffle decoys have different sequences; inheriting evidence would break TDC symmetry). `source = "decoy_balanced_shuffle"` in the candidates DataFrame.
 
-CLI flags: `--decoy-method {shuffle,mz_shift,balanced_shuffle}`, `--mz-shift-delta-min FLOAT`, `--mz-shift-delta-max FLOAT`, `--max-shuffle-rounds INT`, `--decoy-target-ratio FLOAT`.
+CLI flags: `--decoy-method {shuffle,balanced_shuffle}`, `--mz-shift-delta-min FLOAT`, `--mz-shift-delta-max FLOAT`, `--max-shuffle-rounds INT`, `--decoy-target-ratio FLOAT`.
 
 1. Generate candidates (Strategy A or C) + match to MALDI features
 2. Load LC-MS/MS data

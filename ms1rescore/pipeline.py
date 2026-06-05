@@ -11,7 +11,6 @@ from ms1rescore.candidates import (
     digest_fasta,
     digest_identified_proteins,
     generate_balanced_shuffle_candidates,
-    generate_mz_shift_candidates,
     match_to_maldi_features,
 )
 from ms1rescore.feature_generator import (
@@ -1165,6 +1164,69 @@ def _pep_qvalues(pep: np.ndarray) -> np.ndarray:
     return q
 
 
+def _select_calibration_peptides(
+    candidates: pd.DataFrame,
+    percentile: float = 0.10,
+) -> np.ndarray:
+    """
+    Select the best target candidates to finetune/calibrate DeepLC and IM2Deep on.
+
+    Returns a boolean array aligned with ``candidates`` rows: True for the top
+    ``percentile`` fraction of TARGET rows ranked by spectral quality (low
+    ``ppm_error_abs`` and high ``theo_isotope_cosine``).  Decoys are never
+    eligible — a decoy has no observed RT and assigning a feature's observed CCS
+    to a decoy is a false (peptide, label) pair, so decoys cannot supply a valid
+    calibration anchor.
+
+    The ranking is computed only over targets and uses features that are blind to
+    ``is_decoy``, so the selection introduces no target/decoy asymmetry into the
+    downstream ranker.  No target/decoy competition or q-value is used here: this
+    is a quality filter, not an FDR estimate.  Unlike the previous
+    ``n_candidates == 1`` heuristic, the size of this set does not shrink when
+    decoys are paired onto target features (e.g. under ``paired_shuffle``), and it
+    selects likely-correct peptides rather than merely mass-unambiguous ones.
+    """
+    n = len(candidates)
+    keep = np.zeros(n, dtype=bool)
+    if n == 0 or percentile <= 0:
+        return keep
+
+    is_target = ~candidates["is_decoy"].to_numpy(dtype=bool)
+    if not is_target.any():
+        return keep
+
+    def _quality_z(values: np.ndarray, higher_is_better: bool) -> np.ndarray:
+        """Standardised quality contribution; NaN/constant columns contribute 0."""
+        x = np.asarray(values, dtype=float)
+        finite = np.isfinite(x)
+        if finite.sum() < 2:
+            return np.zeros_like(x)
+        mu = float(np.mean(x[finite]))
+        sd = float(np.std(x[finite]))
+        if sd < 1e-12:
+            return np.zeros_like(x)
+        z = (x - mu) / sd
+        z = np.where(np.isfinite(z), z, 0.0)
+        return z if higher_is_better else -z
+
+    tgt = candidates.loc[is_target]
+    ppm = tgt["ppm_error_abs"].to_numpy(dtype=float) if "ppm_error_abs" in tgt else np.full(len(tgt), np.nan)
+    iso = (
+        tgt["theo_isotope_cosine"].to_numpy(dtype=float)
+        if "theo_isotope_cosine" in tgt
+        else np.full(len(tgt), np.nan)
+    )
+    # Low ppm error is good; high theoretical isotope cosine is good.
+    score = _quality_z(ppm, higher_is_better=False) + _quality_z(iso, higher_is_better=True)
+
+    thr = float(np.quantile(score, 1.0 - percentile))
+    tgt_keep = score >= thr
+
+    target_pos = np.flatnonzero(is_target)
+    keep[target_pos[tgt_keep]] = True
+    return keep
+
+
 def _select_feature_winners(
     features_df: pd.DataFrame,
     scores: np.ndarray,
@@ -1245,9 +1307,6 @@ def rescore(
     gt_peptides: list[str] | None = None,
     maldi_intensities: np.ndarray | None = None,
     decoy_method: str = "shuffle",
-    mz_shift_delta_min: float = 5.0,
-    mz_shift_delta_max: float = 20.0,
-    mz_shift_snap_tolerance_ppm: float = 50.0,
     max_shuffle_rounds: int = 50,
     target_ratio: float = 1.0,
     features_preset: str = "all",
@@ -1264,6 +1323,7 @@ def rescore(
     deeplc_finetune_epochs: int = 40,
     deeplc_finetune_lr: float = 0.001,
     deeplc_finetune_patience: int = 10,
+    calibration_percentile: float = 0.10,
     matching_ppm: float = 20.0,
     winner_percentile: float = 0.02,
     rt_window_multiplier: float = 2.0,
@@ -1426,21 +1486,25 @@ def rescore(
         Used when spatial features are not pre-computed.
     decoy_method
         Decoy generation strategy: ``"shuffle"`` (K/R-preserving protein
-        shuffle), ``"mz_shift"`` (observation-space m/z-shift decoys), or
-        ``"balanced_shuffle"`` (iterative shuffle with MALDI-match filtering
-        to achieve ~1:1 target:decoy ratio).
-    mz_shift_delta_min
-        Minimum mass shift (Da) for ``decoy_method="mz_shift"``.
-    mz_shift_delta_max
-        Maximum mass shift (Da) for ``decoy_method="mz_shift"``.
-    mz_shift_snap_tolerance_ppm
-        Collision-check tolerance (ppm) for ``decoy_method="mz_shift"``:
-        shifts landing within this window of any target m/z are resampled.
+        shuffle), ``"balanced_shuffle"`` (iterative shuffle with MALDI-match
+        filtering, length-stratified subsample to ~1:1 target:decoy ratio), or
+        ``"paired_shuffle"`` (same iterative shuffle pool, but decoys are
+        selected to occupy the same MALDI features as targets — feature-paired
+        selection — to maximise per-feature target-decoy competition while
+        preserving the same global ~1:1 ratio).
     max_shuffle_rounds
-        Maximum shuffle rounds for ``decoy_method="balanced_shuffle"``.
+        Maximum shuffle rounds for ``decoy_method`` in
+        {``"balanced_shuffle"``, ``"paired_shuffle"``}.
     target_ratio
-        Target decoy:target ratio for ``decoy_method="balanced_shuffle"``
-        (default 1.0 = 1:1).
+        Target decoy:target ratio for ``decoy_method`` in
+        {``"balanced_shuffle"``, ``"paired_shuffle"``} (default 1.0 = 1:1).
+    calibration_percentile
+        Fraction (0–1, default 0.10) of TARGET candidates used to finetune /
+        calibrate DeepLC and IM2Deep. The top fraction is selected by spectral
+        quality (low ``ppm_error_abs`` and high ``theo_isotope_cosine``), blind
+        to ``is_decoy``. Replaces the old ``n_candidates == 1`` heuristic, whose
+        size collapsed when decoys were paired onto target features (e.g. under
+        ``paired_shuffle``).
     features_preset
         Feature set preset: ``"all"`` (full ``MALDI_INTRINSIC_FEATURES``) or
         ``"main"`` (``MAIN_FEATURES``, one representative per collinear group).
@@ -1596,33 +1660,18 @@ def rescore(
     if maldi_intensities is not None:
         _maldi_intensities_arr = np.asarray(maldi_intensities, dtype=np.float32)
         logger.info("  Using SCiLS per-feature intensities for log_maldi_intensity_p90")
-    if decoy_method == "mz_shift":
-        # Strip any shuffle decoys that may have been added (e.g. from extra_fasta).
-        # generate_mz_shift_candidates() works exclusively with target peptides and
-        # generates its own decoys via shifted m/z queries.
-        target_db = peptide_db[~peptide_db["is_decoy"].astype(bool)].reset_index(drop=True)
-        logger.info(
-            "Step 1c: Generating m/z-shift observation-space decoys "
-            f"(delta {mz_shift_delta_min}–{mz_shift_delta_max} Da)..."
-        )
-        candidates = generate_mz_shift_candidates(
-            target_db,
-            maldi_mzs,
-            matching_ppm=matching_ppm,
-            delta_min=mz_shift_delta_min,
-            delta_max=mz_shift_delta_max,
-            snap_tolerance_ppm=mz_shift_snap_tolerance_ppm,
-            maldi_intensities=_maldi_intensities_arr,
-            maldi_intensities_p90=maldi_intensities_p90,
-            maldi_intensities_sum=maldi_intensities_sum,
-        )
-    elif decoy_method == "balanced_shuffle":
+
+    # --- Step 1c: Candidate generation (own if/elif/else; independent of the
+    # intensity-source selection above) ---
+    if decoy_method in ("balanced_shuffle", "paired_shuffle"):
         # Pass fasta_path only when --digest is active (Strategy A or C with digest).
         # LC-only mode (digest=False, lcms_ids set): fasta_path=None triggers pseudo-protein.
         _bshuffle_fasta = fasta_path if digest else None
+        _selection_mode = "feature" if decoy_method == "paired_shuffle" else "length"
         logger.info(
-            "Step 1c: Generating balanced shuffle observation-space decoys "
-            f"(max {max_shuffle_rounds} rounds, target_ratio={target_ratio})..."
+            f"Step 1c: Generating {decoy_method} observation-space decoys "
+            f"(max {max_shuffle_rounds} rounds, target_ratio={target_ratio}, "
+            f"selection={_selection_mode})..."
         )
         candidates = generate_balanced_shuffle_candidates(
             fasta_path=_bshuffle_fasta,
@@ -1637,6 +1686,7 @@ def rescore(
             missed_cleavages=missed_cleavages,
             min_length=min_length,
             max_length=max_length,
+            selection_mode=_selection_mode,
         )
     else:
         candidates = match_to_maldi_features(
@@ -1658,6 +1708,23 @@ def rescore(
         f"  {len(candidates)} candidates ({(~candidates['is_decoy']).sum()} target, "
         f"{candidates['is_decoy'].sum()} decoy) across "
         f"{candidates['feature_mz'].nunique()} features"
+    )
+
+    # --- Select calibration peptides (DeepLC / IM2Deep finetuning anchors) ---
+    # theo_isotope_cosine is needed for the quality ranking and is computed in
+    # full at Step 6; compute it here (cheap, lru_cache'd, idempotent — Step 6
+    # overwrites with identical values) so the calibration set is available before
+    # DeepLC finetuning at Step 4.  is_calibration_peptide is carried on the
+    # candidates DataFrame and reused by the DeepLC, IM2Deep CCS, mobility, and CCS
+    # filter steps instead of the decoy-sensitive n_candidates == 1 heuristic.
+    from ms1rescore.maldi_features import compute_theoretical_isotope_features
+    candidates = compute_theoretical_isotope_features(candidates, maldi_envelopes=maldi_envelopes)
+    candidates["is_calibration_peptide"] = _select_calibration_peptides(
+        candidates, calibration_percentile
+    )
+    logger.info(
+        f"  Calibration set: {int(candidates['is_calibration_peptide'].sum())} target "
+        f"candidates (top {calibration_percentile:.0%} by low ppm + high isotope cosine)"
     )
 
     # --- Steps 2–5: LC-MS/MS data (skipped entirely when no mzML is provided) ---
@@ -1713,31 +1780,31 @@ def rescore(
             patience=deeplc_finetune_patience,
         )
 
-        # Build finetuning calibration set: only peptides unambiguously matched to
-        # a single MALDI feature (n_candidates == 1) AND observed in LC-MS/MS with RT.
-        # Multi-candidate features may contain incorrect assignments, so including them
-        # would add noise — same rationale as IM2Deep calibration (which also uses only
-        # n_candidates == 1 and does NOT fall back when too few are available).
+        # Build finetuning calibration set: the high-quality target peptides
+        # (is_calibration_peptide — top calibration_percentile by low ppm + high
+        # isotope cosine) that are also observed in LC-MS/MS with RT.  Selection is
+        # blind to is_decoy and unaffected by paired decoys, unlike the previous
+        # n_candidates == 1 heuristic.
         _deeplc_cal_df: "pd.DataFrame | None" = None
-        if lcms_ids is not None and "n_candidates" in candidates.columns:
-            _single_peps = set(
-                candidates.loc[candidates["n_candidates"] == 1, "peptide"].unique()
+        if lcms_ids is not None and "is_calibration_peptide" in candidates.columns:
+            _cal_peps = set(
+                candidates.loc[candidates["is_calibration_peptide"], "peptide"].unique()
             )
             _cal = (
                 lcms_ids.peptides
-                .loc[lcms_ids.peptides["sequence"].isin(_single_peps), ["sequence", "rt_mean"]]
+                .loc[lcms_ids.peptides["sequence"].isin(_cal_peps), ["sequence", "rt_mean"]]
                 .dropna(subset=["rt_mean"])
                 .reset_index(drop=True)
             )
             if len(_cal) >= 20:
                 _deeplc_cal_df = _cal
                 logger.info(
-                    f"  DeepLC calibration set: {len(_cal)} single-candidate peptides "
-                    f"(total unambiguous MALDI matches: {len(_single_peps)})"
+                    f"  DeepLC calibration set: {len(_cal)} high-quality target peptides "
+                    f"with observed RT (of {len(_cal_peps)} calibration candidates)"
                 )
             else:
                 logger.warning(
-                    f"  Only {len(_cal)} single-candidate peptides with observed RT "
+                    f"  Only {len(_cal)} calibration peptides with observed RT "
                     f"— skipping DeepLC finetuning (using default model)"
                 )
 
@@ -1816,23 +1883,26 @@ def rescore(
         features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
     # --- CCS-based candidate filtering (optional) ---
-    # IM2Deep finetuning (inside compute_all_features) uses single-candidate
-    # (n_candidates==1) m/z matches as calibration reference.  After finetuning,
-    # im2deep_abs_delta_ccs_pct is available for all candidates.  We derive a
-    # data-driven threshold from the p95 calibration residual on that same single-
-    # candidate set (analogous to rt_window_min = rt_window_multiplier * p95_mae).
+    # IM2Deep finetuning (inside compute_all_features) uses the calibration-peptide
+    # set as its CCS reference.  After finetuning, im2deep_abs_delta_ccs_pct is
+    # available for all candidates.  We derive a data-driven threshold from the p95
+    # calibration residual on that same set (analogous to
+    # rt_window_min = rt_window_multiplier * p95_mae).
     _ccs_tol_pct: float | None = None
     if match_ccs:
         if observed_ccs_per_feature is not None and "im2deep_abs_delta_ccs_pct" in features_df.columns:
-            _single_ccs = features_df.loc[
-                features_df["n_candidates"] == 1, "im2deep_abs_delta_ccs_pct"
-            ].dropna()
+            _cal_mask = (
+                features_df["is_calibration_peptide"]
+                if "is_calibration_peptide" in features_df.columns
+                else (features_df["n_candidates"] == 1)
+            )
+            _single_ccs = features_df.loc[_cal_mask, "im2deep_abs_delta_ccs_pct"].dropna()
             if len(_single_ccs) >= 10:
                 _p95_ccs = float(np.percentile(_single_ccs, 95))
                 _ccs_tol_pct = float(ccs_window_multiplier * _p95_ccs)
                 logger.info(
-                    f"CCS filter: p95 |delta_CCS%| on {len(_single_ccs)} single-candidate "
-                    f"matches = {_p95_ccs:.2f}%. Threshold = {ccs_window_multiplier}× = "
+                    f"CCS filter: p95 |delta_CCS%| on {len(_single_ccs)} calibration "
+                    f"peptides = {_p95_ccs:.2f}%. Threshold = {ccs_window_multiplier}× = "
                     f"{_ccs_tol_pct:.2f}%."
                 )
                 n_before = len(features_df)
@@ -1872,8 +1942,6 @@ def rescore(
             logger.info("Computing per-candidate mobility colocalization features (step 6c)…")
             features_df = compute_mobility_colocalization_features(
                 features_df,
-                tdf_path=tdf_path,
-                mob_window_multiplier=mob_window_multiplier,
                 extraction_ppm=ppm_tolerance,
             )
             _has_mob_coloc = True
@@ -2105,8 +2173,6 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct,
-                tdf_path=tdf_path,
-                mob_window_multiplier=mob_window_multiplier,
             )
 
         return psm_list, result_df, feature_names, features_df
@@ -2254,8 +2320,6 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct,
-                tdf_path=tdf_path,
-                mob_window_multiplier=mob_window_multiplier,
             )
 
         return psm_list, result_df, feature_names, features_df
@@ -2464,8 +2528,6 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct,
-                tdf_path=tdf_path,
-                mob_window_multiplier=mob_window_multiplier,
             )
 
         return psm_list, result_df, feature_names, features_df
@@ -2645,8 +2707,6 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct,
-                tdf_path=tdf_path,
-                mob_window_multiplier=mob_window_multiplier,
             )
 
         return psm_list, result_df, feature_names, features_df

@@ -663,7 +663,7 @@ def _finetune_and_predict(
     _torch.set_num_threads(_orig_threads)
     logger.info(
         f"  IM2Deep transfer learning on {n_cal} unique peptides "
-        f"({n_cal_rows} single-candidate features): model saved to {model_path}"
+        f"({n_cal_rows} calibration features): model saved to {model_path}"
     )
 
     # Re-predict all unique sequences with the finetuned model
@@ -732,15 +732,21 @@ def compute_im2deep_features(
         .values.astype(float)
     )
 
-    # Calibrate predicted CCS using single-candidate features (n_candidates == 1)
-    # as unambiguous reference points.  Three methods:
-    #   linear  — global additive shift (LinearCCSCalibration, default)
+    # Calibrate predicted CCS using the calibration-peptide set (high-quality
+    # targets: top percentile by low ppm + high isotope cosine) as reference
+    # points.  Falls back to single-candidate features (n_candidates == 1) when the
+    # is_calibration_peptide column is absent (e.g. direct callers).  Three methods:
+    #   linear  — global additive shift (LinearCCSCalibration, default; symmetric
+    #             across targets/decoys, so safe for the ranker CCS features)
     #   spline  — piecewise spline mapping (SplineCCSCalibration)
     #   finetune — transfer-learning re-training of the neural network weights
     predicted_cal = predicted.copy()
-    if "n_candidates" in df.columns:
+    if "is_calibration_peptide" in df.columns or "n_candidates" in df.columns:
         try:
-            single_mask = df["n_candidates"].values == 1
+            if "is_calibration_peptide" in df.columns:
+                single_mask = df["is_calibration_peptide"].to_numpy(dtype=bool)
+            else:
+                single_mask = df["n_candidates"].values == 1
             valid_cal = single_mask & np.isfinite(observed) & np.isfinite(predicted)
 
             if valid_cal.sum() >= 5:
@@ -783,7 +789,7 @@ def compute_im2deep_features(
                         predicted_cal = cal.transform(df_transform).astype(float)
                         logger.info(
                             f"  IM2Deep spline calibration on {n_cal} unique peptides "
-                            f"({valid_cal.sum()} single-candidate features)"
+                            f"({valid_cal.sum()} calibration features)"
                         )
                     else:  # linear (default)
                         cal = _LinearCal(per_charge=False, use_charge_state=1)
@@ -793,7 +799,7 @@ def compute_im2deep_features(
                         )
                         logger.info(
                             f"  IM2Deep linear calibration on {n_cal} unique peptides "
-                            f"({valid_cal.sum()} single-candidate features): "
+                            f"({valid_cal.sum()} calibration features): "
                             f"shift={cal.general_shift:.2f} Å²"
                         )
         except Exception as exc:
@@ -1269,10 +1275,16 @@ def compute_mobility_colocalization_features(
         df["im2deep_predicted_ccs"].values, mz=df["feature_mz"].values, charge=1
     )
 
-    # Data-driven 1/K0 window from single-candidate calibration set
+    # Data-driven 1/K0 window from the calibration-peptide set (falls back to
+    # single-candidate features when is_calibration_peptide is absent).
     k0_half_win = 0.05  # fallback
     if "im2deep_observed_ccs" in df.columns:
-        single = df[df["n_candidates"] == 1].dropna(
+        _cal_mask = (
+            df["is_calibration_peptide"]
+            if "is_calibration_peptide" in df.columns
+            else (df["n_candidates"] == 1)
+        )
+        single = df[_cal_mask].dropna(
             subset=["im2deep_observed_ccs", "_pred_inv_k0"]
         )
         if len(single) >= 10:

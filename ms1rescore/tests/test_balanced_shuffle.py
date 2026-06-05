@@ -217,3 +217,101 @@ class TestGenerateBalancedShuffleCandidates:
         assert abs(targets["peptide"].str.len().mean() - decoys["peptide"].str.len().mean()) < 1.0, (
             "Mean peptide length differs by more than 1 residue between targets and decoys"
         )
+
+
+def _contested_count(result) -> tuple[int, int, int]:
+    """Return (contested, target_only, decoy_only) feature counts."""
+    has_tgt = result.groupby("feature_idx")["is_decoy"].agg(lambda s: (~s).any())
+    has_dec = result.groupby("feature_idx")["is_decoy"].agg("any")
+    return (
+        int((has_tgt & has_dec).sum()),
+        int((has_tgt & ~has_dec).sum()),
+        int((~has_tgt & has_dec).sum()),
+    )
+
+
+class TestFeaturePairedSelection:
+    """Tests for selection_mode='feature' (paired_shuffle)."""
+
+    def _run(self, tmp_path, selection_mode, features=None, **kwargs):
+        fasta_path = _write_fasta(tmp_path)
+        if features is None:
+            features = _dense_features()
+        defaults = dict(
+            matching_ppm=20.0,
+            max_shuffle_rounds=5,
+            target_ratio=1.0,
+            random_state=42,
+            selection_mode=selection_mode,
+        )
+        defaults.update(kwargs)
+        return generate_balanced_shuffle_candidates(
+            fasta_path=fasta_path,
+            lcms_ids=None,
+            feature_mzs=features,
+            **defaults,
+        )
+
+    def test_invalid_selection_mode_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="selection_mode"):
+            self._run(tmp_path, selection_mode="bogus")
+
+    def test_feature_mode_produces_decoys(self, tmp_path):
+        result = self._run(tmp_path, "feature", max_shuffle_rounds=10)
+        assert int(result["is_decoy"].sum()) > 0
+
+    def test_feature_mode_contested_ge_length_mode(self, tmp_path):
+        """Feature-paired selection should yield at least as many contested features
+        as length-stratified selection on the same shuffle pool (same seed + rounds,
+        small enough that early-stopping does not fire and the pools match)."""
+        feat = self._run(tmp_path, "feature", max_shuffle_rounds=5)
+        length = self._run(tmp_path, "length", max_shuffle_rounds=5)
+        c_feat, _, _ = _contested_count(feat)
+        c_len, _, _ = _contested_count(length)
+        assert c_feat >= c_len, (
+            f"feature-paired contested ({c_feat}) < length-stratified ({c_len})"
+        )
+
+    def test_feature_mode_preserves_global_ratio(self, tmp_path):
+        """Top-up keeps the global T:D ratio at ~target_ratio, matching length mode."""
+        result = self._run(tmp_path, "feature", max_shuffle_rounds=30, target_ratio=1.0)
+        n_target = int((~result["is_decoy"]).sum())
+        n_decoy = int(result["is_decoy"].sum())
+        if n_target == 0 or n_decoy == 0:
+            pytest.skip("Not enough candidates for ratio test")
+        ratio = n_target / n_decoy
+        assert 0.5 <= ratio <= 2.0, f"T:D ratio {ratio:.2f} far from 1:1"
+
+    def test_feature_mode_reproducible(self, tmp_path):
+        r1 = self._run(tmp_path, "feature", max_shuffle_rounds=5, random_state=7)
+        r2 = self._run(tmp_path, "feature", max_shuffle_rounds=5, random_state=7)
+        d1 = sorted(r1[r1["is_decoy"]]["peptide"].tolist())
+        d2 = sorted(r2[r2["is_decoy"]]["peptide"].tolist())
+        assert d1 == d2
+
+    def test_feature_mode_decoy_features_are_real_matches(self, tmp_path):
+        """Every decoy row's feature_mz must be one of the input features within ppm
+        (no fabricated matches), and its feature_idx must be a valid feature index."""
+        features = _dense_features()
+        result = self._run(tmp_path, "feature", features=features, max_shuffle_rounds=10)
+        decoys = result[result["is_decoy"]]
+        if len(decoys) == 0:
+            pytest.skip("No decoys collected")
+        assert decoys["feature_idx"].between(0, len(features) - 1).all()
+        # feature_mz should match the indexed input feature.
+        assert np.allclose(
+            decoys["feature_mz"].to_numpy(),
+            features[decoys["feature_idx"].to_numpy()],
+        )
+
+    def test_feature_mode_schema_matches_match_to_maldi_features(self, tmp_path):
+        fasta_path = _write_fasta(tmp_path)
+        features = _dense_features()
+        target_db = digest_fasta(fasta_path, generate_decoys=False)
+        ref = match_to_maldi_features(features, target_db, 20.0)
+        result = self._run(tmp_path, "feature", features=features, max_shuffle_rounds=3)
+        ref_cols = set(ref.columns)
+        extra = set(result.columns) - ref_cols - {"decoy_delta_da", "source"}
+        assert not extra, f"Unexpected extra columns: {extra}"
+        missing = ref_cols - set(result.columns)
+        assert not missing, f"Missing columns: {missing}"

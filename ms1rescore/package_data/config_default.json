@@ -8,9 +8,6 @@
     "min_length": 7,
     "max_length": 30,
     "decoy_method": "balanced_shuffle",
-    "mz_shift_delta_min": 5.0,
-    "mz_shift_delta_max": 20.0,
-    "mz_shift_snap_tolerance_ppm": 50.0,
     "max_shuffle_rounds": 50,
     "decoy_target_ratio": 1.0,
     "n_interaction_features": 0,
@@ -52,6 +49,7 @@
     "deeplc_finetune_epochs": 40,
     "deeplc_finetune_lr": 0.001,
     "deeplc_finetune_patience": 10,
+    "calibration_percentile": 0.10,
     "maldi_extraction": {
       "ppm_bin": 5.0,
       "extraction_ppm": 25.0,

@@ -11,6 +11,11 @@ from ms1rescore.utils import PROTON
 
 logger = logging.getLogger(__name__)
 
+# paired_shuffle (selection_mode="feature") tuning constants.
+# FEATURE_COVERAGE_TARGET: fraction of reachable target-occupied features that
+# must have >=1 pool decoy before early stopping the shuffle rounds.
+FEATURE_COVERAGE_TARGET = 0.95
+
 
 def _shuffle_protein(seq: str, random_state: int = 42) -> str:
     """
@@ -257,189 +262,6 @@ def match_to_maldi_features(
     )
     return result
 
-
-def generate_mz_shift_candidates(
-    target_df: pd.DataFrame,
-    feature_mzs: np.ndarray,
-    matching_ppm: float = 20.0,
-    delta_min: float = 5.0,
-    delta_max: float = 20.0,
-    snap_tolerance_ppm: float = 50.0,
-    random_state: int = 42,
-    maldi_intensities: np.ndarray | None = None,
-    maldi_intensities_p90: np.ndarray | None = None,
-    maldi_intensities_sum: np.ndarray | None = None,
-) -> pd.DataFrame:
-    """
-    Generate m/z-shifted observation-space decoys and return a combined
-    target + decoy candidates DataFrame.
-
-    For each unique target peptide a random delta in [delta_min, delta_max] Da
-    is sampled; sign alternates (even index → +, odd index → −).  The shifted
-    query is snapped to the nearest MALDI feature.  If that feature is within
-    snap_tolerance_ppm of the shifted query and does not collide with any target
-    peptide m/z (within matching_ppm), it becomes the decoy feature.  Up to 10
-    resamples are attempted before the peptide's decoy is skipped.
-
-    ppm_error on decoy rows is copied from the peptide's best target match
-    (minimum ppm_error_abs in target_candidates).  This makes ppm_error
-    non-discriminative between a target and its paired decoy, ensuring that
-    score separation comes from isotope envelope, spatial, and intensity features.
-
-    decoy_delta_da stores snapped_feature_mz − peptide_mh_mz (the actual mass
-    offset to the chosen decoy feature, not the sampled delta).
-
-    Returns a DataFrame with the same schema as match_to_maldi_features()
-    plus a decoy_delta_da column (NaN for targets).
-    """
-    rng = np.random.default_rng(random_state)
-    feature_mzs = np.asarray(feature_mzs, dtype=np.float64)
-    n_features = len(feature_mzs)
-    tol_frac = matching_ppm * 1e-6
-
-    # Unique target peptides indexed 0..N-1
-    unique_pep = (
-        target_df[~target_df["is_decoy"].astype(bool)]
-        .drop_duplicates(subset="peptide")
-        .reset_index(drop=True)
-    )
-    n_unique = len(unique_pep)
-    target_mzs_sorted = np.sort(unique_pep["mh_mz"].values.astype(np.float64))
-
-    # Pre-sort feature array once for O(log n) nearest-feature lookup
-    feat_sort_idx = np.argsort(feature_mzs)
-    feat_sorted = feature_mzs[feat_sort_idx]
-
-    # Per-peptide outputs (-1 = no valid decoy feature found)
-    decoy_orig_idx = np.full(n_unique, -1, dtype=np.int64)
-    decoy_feat_mz  = np.full(n_unique, np.nan)
-    decoy_actual_delta = np.full(n_unique, np.nan)
-
-    for i in range(n_unique):
-        orig = float(unique_pep.at[i, "mh_mz"])
-        sign = 1.0 if i % 2 == 0 else -1.0
-        for _attempt in range(10):
-            delta = float(rng.uniform(delta_min, delta_max))
-            shifted = orig + sign * delta
-            if shifted <= 0:
-                sign = 1.0
-                continue
-
-            # Find the nearest feature to the shifted query
-            pos = int(np.searchsorted(feat_sorted, shifted))
-            best_pos, best_dist = -1, np.inf
-            for cand in (pos - 1, pos):
-                if 0 <= cand < n_features:
-                    d = abs(feat_sorted[cand] - shifted)
-                    if d < best_dist:
-                        best_dist, best_pos = d, cand
-            if best_pos < 0:
-                continue
-
-            # Snap tolerance check
-            if best_dist / shifted * 1e6 > snap_tolerance_ppm:
-                sign = -sign
-                continue
-
-            nearest_mz = feat_sorted[best_pos]
-
-            # Collision check: snapped feature must not be within matching_ppm
-            # of any target peptide m/z (covers self-match implicitly)
-            lo = np.searchsorted(target_mzs_sorted, nearest_mz * (1.0 - tol_frac), side="left")
-            hi = np.searchsorted(target_mzs_sorted, nearest_mz * (1.0 + tol_frac), side="right")
-            if lo < hi:
-                sign = -sign
-                continue
-
-            decoy_orig_idx[i] = int(feat_sort_idx[best_pos])
-            decoy_feat_mz[i] = nearest_mz
-            decoy_actual_delta[i] = nearest_mz - orig
-            break
-        else:
-            logger.warning(
-                "mz_shift: no valid decoy found for '%s' (mh_mz=%.4f) after 10 attempts",
-                unique_pep.at[i, "peptide"], orig,
-            )
-
-    valid_mask = decoy_orig_idx >= 0
-    n_valid = int(valid_mask.sum())
-    logger.info("mz_shift: %d/%d target peptides have valid decoy features", n_valid, n_unique)
-
-    # --- Match targets against MALDI features (normal path) ---
-    target_candidates = match_to_maldi_features(
-        feature_mzs, target_df, matching_ppm,
-        maldi_intensities=maldi_intensities,
-        maldi_intensities_p90=maldi_intensities_p90,
-        maldi_intensities_sum=maldi_intensities_sum,
-    )
-    target_candidates["decoy_delta_da"] = np.nan
-    if "source" not in target_candidates.columns:
-        target_candidates["source"] = "target"
-
-    if n_valid == 0:
-        logger.warning("mz_shift: no valid decoy features found — returning target-only candidates")
-        return target_candidates
-
-    # Build ppm_error lookup per peptide: use the target match with the smallest
-    # ppm_error_abs so the decoy inherits the same non-discriminative ppm value.
-    if "ppm_error" in target_candidates.columns and "peptide" in target_candidates.columns:
-        _tc = target_candidates[["peptide", "ppm_error", "ppm_error_abs"]].copy()
-        _best_idx = _tc.groupby("peptide")["ppm_error_abs"].idxmin()
-        pep_ppm_map: pd.Series = (
-            _tc.loc[_best_idx, ["peptide", "ppm_error"]]
-            .set_index("peptide")["ppm_error"]
-        )
-    else:
-        pep_ppm_map = pd.Series(dtype=float)
-
-    valid_pep_rows = unique_pep[valid_mask].reset_index(drop=True)
-    valid_orig_idx = decoy_orig_idx[valid_mask]
-    valid_feat_mz  = decoy_feat_mz[valid_mask]
-    valid_delta    = decoy_actual_delta[valid_mask]
-
-    # --- Build decoy rows ---
-    # LC-MS/MS evidence columns are intentionally preserved from the source target
-    # peptide.  The decoy is the same sequence at a different MALDI feature;
-    # wiping them would give decoys systematically worse priors, breaking TDC symmetry.
-    decoy_df = valid_pep_rows.copy()
-    decoy_df["is_decoy"] = True
-    decoy_df["source"] = "decoy_mz_shift"
-    decoy_df["feature_mz"]  = valid_feat_mz
-    decoy_df["feature_idx"] = valid_orig_idx.astype(int)
-    # ppm_error copied from the target match — not computed from the decoy feature,
-    # because that would be ~δ/mz * 1e6 (thousands of ppm) and leak the label.
-    decoy_df["ppm_error"]     = decoy_df["peptide"].map(pep_ppm_map).fillna(0.0)
-    decoy_df["ppm_error_abs"] = decoy_df["ppm_error"].abs()
-    # actual offset from peptide mass to chosen decoy feature (diagnostic only)
-    decoy_df["decoy_delta_da"] = valid_delta
-
-    fi_vals = valid_orig_idx.astype(int)
-    if maldi_intensities_p90 is not None:
-        decoy_df["feature_intensity_p90"] = maldi_intensities_p90[fi_vals]
-    if maldi_intensities_sum is not None:
-        decoy_df["feature_intensity_sum"] = maldi_intensities_sum[fi_vals]
-    if maldi_intensities is not None:
-        decoy_df["feature_intensity"] = maldi_intensities[fi_vals]
-
-    kendrick = decoy_df["feature_mz"].values * (14.0 / 14.01565)
-    decoy_df["kendrick_mass_defect"] = kendrick - np.round(kendrick)
-
-    # --- Combine and recompute per-feature statistics ---
-    result = pd.concat([target_candidates, decoy_df], ignore_index=True)
-    result["is_decoy"] = result["is_decoy"].astype(bool)
-    result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")
-    prot_feat_count = result.groupby("protein")["feature_mz"].nunique()
-    result["protein_n_features"] = result["protein"].map(prot_feat_count).fillna(0).astype(int)
-
-    logger.info(
-        "mz_shift: %d features → %d target + %d decoy candidates",
-        result["feature_mz"].nunique(),
-        int((~result["is_decoy"]).sum()),
-        int(result["is_decoy"].sum()),
-    )
-    return result
-
-
 def generate_balanced_shuffle_candidates(
     fasta_path: str | None,
     lcms_ids,
@@ -455,6 +277,7 @@ def generate_balanced_shuffle_candidates(
     min_length: int = 7,
     max_length: int = 50,
     enzyme: str = "trypsin",
+    selection_mode: str = "length",
 ) -> pd.DataFrame:
     """
     Generate balanced shuffle decoys with MALDI-match filtering.
@@ -469,9 +292,29 @@ def generate_balanced_shuffle_candidates(
     decoys have different sequences from their parent targets, so inheriting
     evidence would break TDC symmetry.
 
+    ``selection_mode`` controls how the collected pool is subsampled:
+
+    - ``"length"`` (default, ``balanced_shuffle``): length-stratified subsample
+      to a global ``target_ratio * N_target`` count. Decoy per-feature occupancy
+      is independent of target occupancy, so many MALDI features end up with only
+      targets ("target-only") or only decoys ("decoy-only").
+    - ``"feature"`` (``paired_shuffle``): feature-occupancy-matched selection.
+      Decoys are first paired to the same MALDI features the targets occupy
+      (maximising head-to-head competition and making decoy m/z density track
+      target m/z density), then the pool is topped up to the same global
+      ``target_ratio * N_target`` count from the remaining decoys. The global
+      target:decoy ratio (and thus the FDR null mass) is identical to
+      ``"length"`` mode; only the per-feature allocation differs. Selection is
+      keyed purely on ``feature_idx`` (a mass property), never on scores or
+      decoy correctness, so TDC validity is preserved.
+
     Returns a DataFrame with the same schema as match_to_maldi_features()
     plus decoy_delta_da (NaN for all rows) and source columns.
     """
+    if selection_mode not in ("length", "feature"):
+        raise ValueError(
+            f"selection_mode must be 'length' or 'feature', got {selection_mode!r}"
+        )
     feature_mzs = np.asarray(feature_mzs, dtype=np.float64)
     enzyme_rule = parser.expasy_rules.get(enzyme, enzyme)
 
@@ -547,33 +390,54 @@ def generate_balanced_shuffle_candidates(
         }
 
     # --- Step 4: Iterative shuffle rounds ---
-    # Early stopping is length-aware: continue until every target length bin that
-    # can produce MALDI-matching decoys has at least target_ratio * tgt_count entries
-    # in the pool, AND the total pool already has enough to subsample.  Lengths for
-    # which the pool never produces any decoys are excluded from the coverage check
-    # (they cannot be satisfied regardless of round count).
+    # Early stopping depends on selection_mode:
+    #  - "length": continue until every target length bin that can produce
+    #    MALDI-matching decoys has at least target_ratio * tgt_count entries in the
+    #    pool, AND the total pool already has enough to subsample.
+    #  - "feature": continue until a fraction (FEATURE_COVERAGE_TARGET) of the
+    #    target-occupied features have at least one pool decoy at their m/z, AND
+    #    the total pool already has enough to subsample.
+    # In both modes, bins/features for which the pool never produces a decoy are
+    # implicitly excluded (they cannot be satisfied regardless of round count); the
+    # max_shuffle_rounds cap is the hard backstop.
     tgt_len_counts = target_candidates["peptide"].str.len().value_counts()
     pool_len_counts: dict[int, int] = {}
+    target_feat_ids = set(target_candidates["feature_idx"].unique())
+    covered_feats: set[int] = set()
     decoy_pool_parts: list[pd.DataFrame] = []
     n_pool = 0
 
     for r in range(max_shuffle_rounds):
-        # Length-aware early stop: every length bin that has ever produced pool
-        # entries must now have at least n_need entries.
         if n_pool >= n_decoys_needed:
-            all_covered = all(
-                pool_len_counts.get(llen, 0)
-                >= int(round(target_ratio * tgt_len_counts.get(llen, 0)))
-                for llen in tgt_len_counts.index
-                if pool_len_counts.get(llen, 0) > 0
-            )
-            if all_covered:
-                logger.info(
-                    "balanced_shuffle: all reachable length bins covered after %d rounds "
-                    "(pool %d)",
-                    r, n_pool,
+            if selection_mode == "feature":
+                # Feature-coverage-aware early stop.
+                if target_feat_ids:
+                    coverage = len(covered_feats & target_feat_ids) / len(target_feat_ids)
+                else:
+                    coverage = 1.0
+                if coverage >= FEATURE_COVERAGE_TARGET:
+                    logger.info(
+                        "paired_shuffle: %.1f%% of target features covered after %d "
+                        "rounds (pool %d)",
+                        100 * coverage, r, n_pool,
+                    )
+                    break
+            else:
+                # Length-aware early stop: every length bin that has ever produced
+                # pool entries must now have at least n_need entries.
+                all_covered = all(
+                    pool_len_counts.get(llen, 0)
+                    >= int(round(target_ratio * tgt_len_counts.get(llen, 0)))
+                    for llen in tgt_len_counts.index
+                    if pool_len_counts.get(llen, 0) > 0
                 )
-                break
+                if all_covered:
+                    logger.info(
+                        "balanced_shuffle: all reachable length bins covered after %d "
+                        "rounds (pool %d)",
+                        r, n_pool,
+                    )
+                    break
 
         round_rows = []
         for acc, seq in sorted(protein_seqs.items()):
@@ -633,8 +497,11 @@ def generate_balanced_shuffle_candidates(
         if len(round_matched) == 0:
             continue
 
-        for llen, cnt in round_matched["peptide"].str.len().value_counts().items():
-            pool_len_counts[llen] = pool_len_counts.get(llen, 0) + cnt
+        if selection_mode == "feature":
+            covered_feats.update(round_matched["feature_idx"].unique())
+        else:
+            for llen, cnt in round_matched["peptide"].str.len().value_counts().items():
+                pool_len_counts[llen] = pool_len_counts.get(llen, 0) + cnt
 
         decoy_pool_parts.append(round_matched)
         n_pool += len(round_matched)
@@ -652,45 +519,106 @@ def generate_balanced_shuffle_candidates(
 
     decoy_pool = pd.concat(decoy_pool_parts, ignore_index=True)
 
-    # --- Step 5: Length-stratified subsample ---
-    # For each target length bin take exactly min(pool_available, n_need) decoys.
-    # No fill from other lengths: adding decoys of the wrong length to compensate
-    # for truly unreachable lengths would introduce a length bias worse than the
-    # slight T:D count deficit.
-    dec_lengths = decoy_pool["peptide"].str.len()
+    # --- Step 5: Subsample the collected pool ---
     rng = np.random.default_rng(random_state)
 
-    keep_indices: list[int] = []
-    unfilled: list[tuple[int, int, int]] = []  # (length, needed, available)
-    for length, tgt_count in sorted(tgt_len_counts.items()):
-        dec_at_len = decoy_pool.index[dec_lengths == length].tolist()
-        n_need = int(round(target_ratio * tgt_count))
-        if n_need == 0:
-            continue
-        if not dec_at_len:
-            unfilled.append((length, n_need, 0))
-            continue
-        if len(dec_at_len) <= n_need:
-            if len(dec_at_len) < n_need:
-                unfilled.append((length, n_need, len(dec_at_len)))
-            keep_indices.extend(dec_at_len)
-        else:
-            keep_indices.extend(
-                rng.choice(dec_at_len, size=n_need, replace=False).tolist()
+    if selection_mode == "length":
+        # Length-stratified subsample. For each target length bin take exactly
+        # min(pool_available, n_need) decoys.  No fill from other lengths: adding
+        # decoys of the wrong length to compensate for truly unreachable lengths
+        # would introduce a length bias worse than the slight T:D count deficit.
+        dec_lengths = decoy_pool["peptide"].str.len()
+        keep_indices: list[int] = []
+        unfilled: list[tuple[int, int, int]] = []  # (length, needed, available)
+        for length, tgt_count in sorted(tgt_len_counts.items()):
+            dec_at_len = decoy_pool.index[dec_lengths == length].tolist()
+            n_need = int(round(target_ratio * tgt_count))
+            if n_need == 0:
+                continue
+            if not dec_at_len:
+                unfilled.append((length, n_need, 0))
+                continue
+            if len(dec_at_len) <= n_need:
+                if len(dec_at_len) < n_need:
+                    unfilled.append((length, n_need, len(dec_at_len)))
+                keep_indices.extend(dec_at_len)
+            else:
+                keep_indices.extend(
+                    rng.choice(dec_at_len, size=n_need, replace=False).tolist()
+                )
+
+        if unfilled:
+            logger.warning(
+                "balanced_shuffle: insufficient decoys at lengths %s "
+                "(format: length:needed/available) — consider increasing "
+                "--max-shuffle-rounds",
+                ", ".join(f"{l}:{n}/{a}" for l, n, a in unfilled),
             )
 
-    if unfilled:
-        logger.warning(
-            "balanced_shuffle: insufficient decoys at lengths %s "
-            "(format: length:needed/available) — consider increasing --max-shuffle-rounds",
-            ", ".join(f"{l}:{n}/{a}" for l, n, a in unfilled),
+        decoy_pool = decoy_pool.loc[np.sort(keep_indices)].reset_index(drop=True)
+        logger.info(
+            "balanced_shuffle: subsampled decoy pool %d → %d (length-stratified, no fill)",
+            n_pool, len(decoy_pool),
         )
+    else:
+        # Feature-occupancy-matched selection (paired_shuffle).
+        # (1) Pair: for each target-occupied feature, take up to
+        #     round(target_ratio * n_targets_at_feature) pool decoys that match the
+        #     SAME feature_idx, so target-only features become contested wherever a
+        #     decoy exists at that m/z.
+        # (2) Top up: draw the remaining shortfall from the rest of the pool
+        #     (decoy-only features + surplus contested decoys) to reach the same
+        #     global count as length mode, int(target_ratio * n_target).  This keeps
+        #     the FDR null mass identical to balanced_shuffle while maximising the
+        #     contested fraction first.
+        # Selection is keyed only on feature_idx (a mass property); it never reads
+        # scores or decoy correctness, so TDC validity is preserved.
+        tgt_feat_counts = target_candidates.groupby("feature_idx").size()
+        pool_by_feat = decoy_pool.groupby("feature_idx").indices  # {feat_idx: ndarray}
 
-    decoy_pool = decoy_pool.loc[np.sort(keep_indices)].reset_index(drop=True)
-    logger.info(
-        "balanced_shuffle: subsampled decoy pool %d → %d (length-stratified, no fill)",
-        n_pool, len(decoy_pool),
-    )
+        keep_set: set[int] = set()
+        n_residual_target_only = 0
+        for feat_id, n_tgt in tgt_feat_counts.items():
+            pool_rows = pool_by_feat.get(feat_id)
+            if pool_rows is None or len(pool_rows) == 0:
+                n_residual_target_only += 1  # no pool decoy at this m/z (unfillable)
+                continue
+            n_take = min(int(round(target_ratio * n_tgt)), len(pool_rows))
+            if n_take >= len(pool_rows):
+                chosen = np.asarray(pool_rows)
+            else:
+                chosen = rng.choice(pool_rows, size=n_take, replace=False)
+            keep_set.update(int(i) for i in chosen)
+
+        n_contested_decoys = len(keep_set)
+
+        # Top up to the global count from the remaining pool rows.
+        shortfall = n_decoys_needed - len(keep_set)
+        if shortfall > 0:
+            remaining = np.array(
+                [i for i in range(len(decoy_pool)) if i not in keep_set], dtype=int
+            )
+            if len(remaining) > 0:
+                n_extra = min(shortfall, len(remaining))
+                extra = rng.choice(remaining, size=n_extra, replace=False)
+                keep_set.update(int(i) for i in extra)
+
+        if n_residual_target_only:
+            logger.warning(
+                "paired_shuffle: %d target-occupied features have no pool decoy at "
+                "their m/z (residual target-only; increase --max-shuffle-rounds to "
+                "reduce)",
+                n_residual_target_only,
+            )
+
+        keep_indices = sorted(keep_set)
+        decoy_pool = decoy_pool.iloc[keep_indices].reset_index(drop=True)
+        logger.info(
+            "paired_shuffle: subsampled decoy pool %d → %d "
+            "(feature-paired=%d, topped up=%d, target=%d)",
+            n_pool, len(decoy_pool), n_contested_decoys,
+            len(decoy_pool) - n_contested_decoys, n_decoys_needed,
+        )
 
     # --- Step 6: Mark decoys and wipe LC-MS/MS evidence ---
     decoy_pool["is_decoy"] = True
@@ -718,6 +646,24 @@ def generate_balanced_shuffle_candidates(
         int((~result["is_decoy"]).sum()),
         int(result["is_decoy"].sum()),
     )
+
+    # Feature-occupancy diagnostic (emitted in both modes for direct comparison).
+    feat_has_tgt = result.groupby("feature_idx")["is_decoy"].agg(lambda s: (~s).any())
+    feat_has_dec = result.groupby("feature_idx")["is_decoy"].agg("any")
+    n_contested = int((feat_has_tgt & feat_has_dec).sum())
+    n_tgt_only = int((feat_has_tgt & ~feat_has_dec).sum())
+    n_dec_only = int((~feat_has_tgt & feat_has_dec).sum())
+    n_feat_total = int(result["feature_idx"].nunique())
+    if n_feat_total:
+        logger.info(
+            "%s feature occupancy: %d contested (%.1f%%), %d target-only (%.1f%%), "
+            "%d decoy-only (%.1f%%) of %d features",
+            "paired_shuffle" if selection_mode == "feature" else "balanced_shuffle",
+            n_contested, 100 * n_contested / n_feat_total,
+            n_tgt_only, 100 * n_tgt_only / n_feat_total,
+            n_dec_only, 100 * n_dec_only / n_feat_total,
+            n_feat_total,
+        )
     return result
 
 
