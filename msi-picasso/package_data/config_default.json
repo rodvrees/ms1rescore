@@ -1,5 +1,5 @@
 {
-  "ms1rescore": {
+  "MSI-PICASSO": {
     "model": "lda",
     "ppm_tolerance": 20.0,
     "init_fdr": 0.2,

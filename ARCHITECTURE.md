@@ -1,8 +1,8 @@
-# ms1rescore — Architecture
+# MSI-PICASSO — Architecture
 
 ## Overview
 
-ms1rescore rescores MALDI-MSI MS1 features against a protein FASTA using symmetric target-decoy competition. LC-MS/MS mzML files provide optional prior evidence that reweights (but does not train) the final scores. The pipeline has two candidate generation strategies (A and C) and two rescoring backends (SVM and CatBoost).
+MSI-PICASSO rescores MALDI-MSI MS1 features against a protein FASTA using symmetric target-decoy competition. LC-MS/MS mzML files provide optional prior evidence that reweights (but does not train) the final scores. The pipeline has two candidate generation strategies (A and C) and two rescoring backends (SVM and CatBoost).
 
 ---
 
@@ -280,7 +280,7 @@ reweighted_q_value = TDC(reweighted_score)
 ## Module map
 
 ```
-ms1rescore/
+MSI-PICASSO/
 ├── cli.py                  Entry point; argument parsing; dispatches MALDI
 │                           extraction and calls pipeline.rescore()
 │
@@ -336,7 +336,7 @@ ms1rescore/
 │
 ├── utils.py                Shared maths (isotope, mass conversions, ppm)
 │
-└── ms1rescore-rs/          Rust extension (PyO3 + rayon)
+└── MSI-PICASSO-rs/          Rust extension (PyO3 + rayon)
     ├── digest.rs           compute_peptide_masses, match_mz
     ├── xic.rs              extract_xics_batch (parallel)
     ├── isotope.rs          extract_ms1_envelopes_batch

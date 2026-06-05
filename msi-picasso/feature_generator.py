@@ -1,5 +1,5 @@
 """
-MS1Rescore feature generator: orchestrates all feature categories.
+MSI-PICASSO feature generator: orchestrates all feature categories.
 
 Converts a candidate DataFrame (from match_to_maldi_features) into a PSMList
 with all rescoring features populated.
@@ -13,7 +13,7 @@ from psm_utils.psm import PSM
 from psm_utils.psm_list import PSMList
 from psm_utils.peptidoform import Peptidoform
 
-from ms1rescore.maldi_features import (
+from MSI-PICASSO.maldi_features import (
     _pearson_r_matrix,
     compute_adduct_colocalization,
     compute_calibrated_ppm_features,

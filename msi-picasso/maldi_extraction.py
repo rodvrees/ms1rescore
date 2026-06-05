@@ -963,7 +963,7 @@ def extract_maldi_data(
     except ImportError as exc:
         raise ImportError(
             "imzy is required for raw MALDI data extraction. "
-            "Install with: pip install ms1rescore[maldi]"
+            "Install with: pip install MSI-PICASSO[maldi]"
         ) from exc
 
     logger.info(f"Opening MALDI dataset: {d_path}")
@@ -983,7 +983,7 @@ def extract_maldi_data(
             "Step 1/3: Profile data detected — building mean spectrum for "
             "SCiLS-style interval detection..."
         )
-        from ms1rescore.maldi_imzml import (
+        from MSI-PICASSO.maldi_imzml import (
             SCiLSConfig, _detect_intervals,
             _recalibrate_intervals, _merge_duplicate_intervals,
             _deisotope_intervals, _filter_mass_defect,

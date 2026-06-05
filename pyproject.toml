@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ms1rescore"
+name = "MSI-PICASSO"
 version = "0.1.0"
 description = "Symmetric target-decoy rescoring for MALDI-MSI MS1 data"
 requires-python = ">=3.11"
@@ -28,13 +28,13 @@ calibration = ["statsmodels>=0.14"]
 mobility = ["im2deep>=0.1"]
 
 [project.scripts]
-ms1rescore = "ms1rescore.cli:main"
+MSI-PICASSO = "MSI-PICASSO.cli:main"
 
 [tool.pytest.ini_options]
-testpaths = ["ms1rescore/tests"]
+testpaths = ["MSI-PICASSO/tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 
 [tool.setuptools.package-data]
-ms1rescore = ["package_data/*.json"]
+MSI-PICASSO = ["package_data/*.json"]

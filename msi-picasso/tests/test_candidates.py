@@ -3,8 +3,8 @@ import pandas as pd
 import pytest
 from pyteomics import mass
 
-from ms1rescore.candidates import digest_identified_proteins, _shuffle_protein
-from ms1rescore.lcms_ids import LCMSIds, _PEP_COLS
+from MSI-PICASSO.candidates import digest_identified_proteins, _shuffle_protein
+from MSI-PICASSO.lcms_ids import LCMSIds, _PEP_COLS
 
 
 # ---------------------------------------------------------------------------

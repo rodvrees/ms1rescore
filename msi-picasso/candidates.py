@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from pyteomics import fasta, mass, parser
 
-from ms1rescore.utils import PROTON
+from MSI-PICASSO.utils import PROTON
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +373,7 @@ def generate_balanced_shuffle_candidates(
         confirmed_seqs = sorted(set(lcms_ids.peptides["sequence"].values))
         protein_seqs = {"__pseudo__": "".join(confirmed_seqs)}
     elif lcms_ids is not None:
-        from ms1rescore.lcms_ids import filter_fasta_to_proteins
+        from MSI-PICASSO.lcms_ids import filter_fasta_to_proteins
         protein_seqs = filter_fasta_to_proteins(fasta_path, lcms_ids.proteins)
         if not protein_seqs:
             logger.warning(
@@ -729,7 +729,7 @@ def digest_identified_proteins(
                   "n_C", "n_H", "n_N", "n_O", "n_S", "source"]
 
     if fasta_path is not None:
-        from ms1rescore.lcms_ids import filter_fasta_to_proteins
+        from MSI-PICASSO.lcms_ids import filter_fasta_to_proteins
 
         # --- Step 1: Filter FASTA to identified proteins ---
         protein_seqs = filter_fasta_to_proteins(fasta_path, lcms_ids.proteins)

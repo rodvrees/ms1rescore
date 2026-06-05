@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from ms1rescore.utils import theoretical_isotope_distribution
+from MSI-PICASSO.utils import theoretical_isotope_distribution
 
 
 # ---------------------------------------------------------------------------

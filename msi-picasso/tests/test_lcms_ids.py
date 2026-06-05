@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 from unittest.mock import MagicMock, patch
 
-from ms1rescore.lcms_ids import LCMSIds, _PEP_COLS, parse_lcms_ids
+from MSI-PICASSO.lcms_ids import LCMSIds, _PEP_COLS, parse_lcms_ids
 
 
 # ---------------------------------------------------------------------------

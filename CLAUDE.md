@@ -1,8 +1,8 @@
-# ms1rescore — CLAUDE.md
+# MSI-PICASSO — CLAUDE.md
 
 ## Purpose
 
-`ms1rescore` is a symmetric target-decoy rescoring package for MALDI-MSI MS1 data. It takes MALDI feature m/z values, a protein FASTA, and optional LC-MS/MS mzML files, then produces FDR-controlled peptide identifications via LDA-based semi-supervised rescoring (default) or SVM/CatBoost alternatives.
+`MSI-PICASSO` is a symmetric target-decoy rescoring package for MALDI-MSI MS1 data. It takes MALDI feature m/z values, a protein FASTA, and optional LC-MS/MS mzML files, then produces FDR-controlled peptide identifications via LDA-based semi-supervised rescoring (default) or SVM/CatBoost alternatives.
 
 **Why it was built this way:** The prior approach (ms2rescore "Approach B") used ProteomeDiscoverer (PD) output for candidates and features. This introduced label leakage — `lcms_xcorr` (a PD search engine score) had AUC 0.993 and was a near-perfect surrogate for the PD target/decoy label, making rescoring trivial but invalid. This package replaces that with:
 - Candidates from in-silico tryptic digest of forward + reversed FASTA (no PD)
@@ -14,10 +14,10 @@
 ## Repository layout
 
 ```
-ms1rescore/
+MSI-PICASSO/
 ├── pyproject.toml              # Package metadata and dependencies
 ├── CLAUDE.md                   # This file
-├── ms1rescore/                 # Python package
+├── MSI-PICASSO/                 # Python package
 │   ├── __init__.py             # __version__ = "0.1.0"
 │   ├── utils.py                # Shared math utilities
 │   ├── candidates.py           # FASTA digest + MALDI m/z matching
@@ -29,7 +29,7 @@ ms1rescore/
 │   ├── feature_generator.py    # Orchestration + PSMList construction
 │   ├── pipeline.py             # End-to-end pipeline function; rescoring backends; priors
 │   ├── probabilistic_scorer.py # Generative pre-scorer (used by SVM/CatBoost as step-7b feature source)
-│   ├── cli.py                  # argparse CLI entry point (`ms1rescore` command)
+│   ├── cli.py                  # argparse CLI entry point (`MSI-PICASSO` command)
 │   ├── debug_viz.py            # Debug figure generation (saved when --verbose)
 │   └── tests/                  # Unit tests (pytest; testpaths configured in pyproject.toml)
 │       ├── fixtures/           # Static test fixtures (e.g. test_maldi.mgf)
@@ -43,7 +43,7 @@ ms1rescore/
 │       ├── test_lda_backend.py
 │       ├── test_maldi_extraction.py
 │       └── test_pep.py
-└── ms1rescore-rs/              # Rust extension (PyO3 + rayon)
+└── MSI-PICASSO-rs/              # Rust extension (PyO3 + rayon)
     ├── Cargo.toml
     └── src/
         ├── lib.rs              # PyO3 module definition
@@ -56,10 +56,10 @@ ms1rescore/
         └── maldi_isotope.rs    # MALDI M+1/M+2 mean intensity via CSR streaming pass
 ```
 
-Run the test suite from the `ms1rescore/` directory:
+Run the test suite from the `MSI-PICASSO/` directory:
 
 ```bash
-cd ms1rescore && pytest   # testpaths = ["ms1rescore/tests"] in pyproject.toml
+cd MSI-PICASSO && pytest   # testpaths = ["MSI-PICASSO/tests"] in pyproject.toml
 ```
 
 ---
@@ -72,7 +72,7 @@ Every function that computes features must be blind to `is_decoy`. The symmetry 
 
 ### 2. Decoy generation via K/R-preserving protein-level shuffle
 
-`_shuffle_protein(seq, random_state=42)` in [candidates.py](ms1rescore/candidates.py) keeps K and R residues at their original positions and randomly shuffles all other residues (using a seeded RNG for reproducibility), then digests the shuffled sequence with the same trypsin rules as the target.
+`_shuffle_protein(seq, random_state=42)` in [candidates.py](MSI-PICASSO/candidates.py) keeps K and R residues at their original positions and randomly shuffles all other residues (using a seeded RNG for reproducibility), then digests the shuffled sequence with the same trypsin rules as the target.
 
 **Why K/R-preserving shuffle instead of K/R-preserving reversal:** Reversal with K/R fixed produces decoy peptides that are often isobaric with targets — the elemental composition of the non-K/R residues is unchanged (same multiset, just reversed). This makes isotope envelope features (`theo_isotope_cosine`, `theo_isotope_chi2`, `theo_isotope_kl`, `isotope_envelope_*`) non-discriminative. Shuffling (rather than reversing) the non-K/R residues changes which residues appear in each tryptic fragment, breaking elemental composition conservation at the peptide level.
 
@@ -96,7 +96,7 @@ LC-MS/MS MS1 features are computed using the DeepLC predicted retention time as 
 
 Converts raw Bruker `.d`/TSF data into the NPZ format consumed by the rest of the pipeline via `imzy`. CLI flag: `--maldi-raw`.
 
-Install: `pip install ms1rescore[maldi]` (installs `imzy`).
+Install: `pip install MSI-PICASSO[maldi]` (installs `imzy`).
 
 #### `extract_maldi_data(d_path, ppm_bin, extraction_ppm, matching_ppm, min_fraction, feature_mzs, images_path, image_batch_size, output_npz, output_spatial_tsv, output_dir, verbose)`
 
@@ -135,7 +135,7 @@ Kept for diagnostic/legacy use only. Do not use for rescoring — it pre-selects
 
 SCiLS Lab-style interval-based m/z feature extraction for imzML data. CLI flag: `--maldi-imzml`.
 
-Install: `pip install ms1rescore[maldi]` (installs `pyimzml`).
+Install: `pip install MSI-PICASSO[maldi]` (installs `pyimzml`).
 
 #### Algorithm
 
@@ -206,7 +206,7 @@ SCiLSConfig(
 The paper describes: SCiLS RMS normalization → mMass baseline correction → peak picking at 4% relative threshold → deisotoping → recalibration with trypsin autolysis peaks (842.51, 870.54, 1045.56 Da) → Senko mass defect filter → spatial filter (fraction of pixels).
 
 ```bash
-ms1rescore \
+MSI-PICASSO \
   -f data/PXD056528/uniprot_human_reviewed.fasta \
   -l data/PXD056528/231212_AG_11.mzML \
   -l data/PXD056528/231212_AG_12.mzML \
@@ -439,7 +439,7 @@ Three named feature group lists are exported from this module — see "Feature g
 `feature_generator.py` exports three lists that are importable directly:
 
 ```python
-from ms1rescore.feature_generator import (
+from MSI-PICASSO.feature_generator import (
     MALDI_INTRINSIC_FEATURES, PROTEIN_LEVEL_FEATURES, LCMS_PRIOR_FEATURES
 )
 ```
@@ -691,7 +691,7 @@ reweighted_score = round2_score
 
 ---
 
-## Rust extension (`ms1rescore-rs`)
+## Rust extension (`MSI-PICASSO-rs`)
 
 Built with PyO3 + rayon. Exposed functions:
 
@@ -723,14 +723,14 @@ pI values from Rust are bit-for-bit identical to the Python bisection implementa
 ### Building the Rust extension
 
 ```bash
-cd ms1rescore/ms1rescore-rs
+cd MSI-PICASSO/MSI-PICASSO-rs
 VIRTUAL_ENV=/home/robbe/.pyenv/versions/3.11.11/envs/MSIscore \
   /home/robbe/.pyenv/versions/3.11.11/envs/MSIscore/bin/maturin develop --release
 ```
 
 **Important:** `maturin develop` must target the same Python environment as the Jupyter kernel. The MSIscore venv lives at `/home/robbe/.pyenv/versions/3.11.11/envs/MSIscore` (the symlink `/home/robbe/.pyenv/versions/MSIscore` also works for `VIRTUAL_ENV`, but call the venv's own `maturin` binary explicitly to avoid picking up the wrong interpreter). Without `VIRTUAL_ENV` and the correct binary, maturin installs into the base pyenv Python, not the venv.
 
-The Rust `target/` directory can be 1-2 GB. Delete it with `rm -rf ms1rescore/ms1rescore-rs/target/` if disk space is low (it is rebuilt on the next `maturin develop`).
+The Rust `target/` directory can be 1-2 GB. Delete it with `rm -rf MSI-PICASSO/MSI-PICASSO-rs/target/` if disk space is low (it is rebuilt on the next `maturin develop`).
 
 ---
 
@@ -744,11 +744,11 @@ The Rust `target/` directory can be 1-2 GB. Delete it with `rm -rf ms1rescore/ms
 
 Install the package in editable mode:
 ```bash
-pip install -e ms1rescore/
+pip install -e MSI-PICASSO/
 # With CatBoost support:
-pip install -e "ms1rescore/[catboost]"
+pip install -e "MSI-PICASSO/[catboost]"
 # With Bruker timsTOF .d support:
-pip install -e "ms1rescore/[timstof]"
+pip install -e "MSI-PICASSO/[timstof]"
 ```
 
 ---
@@ -783,9 +783,9 @@ With the human FASTA (~20K proteins) and 1,398 MALDI features at 20 ppm:
 
 ## Configuration
 
-ms1rescore uses `cascade_config` for hierarchical configuration. Priority (lowest to highest):
+MSI-PICASSO uses `cascade_config` for hierarchical configuration. Priority (lowest to highest):
 
-1. `ms1rescore/package_data/config_default.json` — all defaults
+1. `MSI-PICASSO/package_data/config_default.json` — all defaults
 2. User `--config-file` (JSON or TOML)
 3. CLI arguments (explicit only; `None` values never override lower-priority sources)
 
@@ -804,7 +804,7 @@ The merged config is written to `<output_dir>/.full_config.json` at the start of
 Instead of editing `feature_generator.py`, specify in a TOML config file:
 
 ```toml
-[ms1rescore]
+[MSI-PICASSO]
 features_preset = "all"          # "all" | "main"
 features_exclude = ["peptide_length", "adduct_colocalization_chca"]
 ```
@@ -813,24 +813,24 @@ features_exclude = ["peptide_length", "adduct_colocalization_chca"]
 
 ### MALDI extraction parameters
 
-Raw extraction parameters (`ppm_bin`, smoothing, deisotoping, etc.) live under `[ms1rescore.maldi_extraction]` in TOML or `"maldi_extraction": {...}` in JSON. The default assumption is pre-extracted features (NPZ or m/z list); these parameters are only active when `--maldi-raw` or `--maldi-imzml` is used.
+Raw extraction parameters (`ppm_bin`, smoothing, deisotoping, etc.) live under `[MSI-PICASSO.maldi_extraction]` in TOML or `"maldi_extraction": {...}` in JSON. The default assumption is pre-extracted features (NPZ or m/z list); these parameters are only active when `--maldi-raw` or `--maldi-imzml` is used.
 
 Example config file:
 
 ```toml
-[ms1rescore]
+[MSI-PICASSO]
 model = "lda"
 decoy_method = "balanced_shuffle"
 features_exclude = ["peptide_length"]
 
-[ms1rescore.maldi_extraction]
+[MSI-PICASSO.maldi_extraction]
 matching_ppm = 15.0
 deisotope = true
 deisotope_min_score = 12.0
 ```
 
 ```bash
-ms1rescore --config-file my_config.toml --maldi-raw data/MALDI.d --fasta human.fasta
+MSI-PICASSO --config-file my_config.toml --maldi-raw data/MALDI.d --fasta human.fasta
 ```
 
 ---
@@ -840,7 +840,7 @@ ms1rescore --config-file my_config.toml --maldi-raw data/MALDI.d --fasta human.f
 Current default command used for development and benchmarking:
 
 ```bash
-ms1rescore \
+MSI-PICASSO \
   -f /home/robbe/MALDI_MSI_score/data/uniprot_human_reviewed.fasta \
   -l /home/robbe/MALDI_MSI_score/data/amyloidosis/Lme112_S1-A2_1_9673.d \
   --maldi-raw /home/robbe/MALDI_MSI_score/data/amyloidosis/Amy_TMA_MS1.d \

@@ -1,4 +1,4 @@
-"""Cascade configuration for ms1rescore.
+"""Cascade configuration for MSI-PICASSO.
 
 Priority (lowest to highest):
   1. package_data/config_default.json  — all defaults
@@ -50,7 +50,7 @@ def parse_configurations(configurations=None) -> dict:
     Returns
     -------
     dict
-        Merged config with top-level key ``"ms1rescore"``.
+        Merged config with top-level key ``"MSI-PICASSO"``.
     """
     cascade_conf = CascadeConfig(
         validation_schema=json.loads(_SCHEMA.read_text()),
@@ -74,7 +74,7 @@ def parse_configurations(configurations=None) -> dict:
                     "Use .json or .toml."
                 )
         elif isinstance(config, Namespace):
-            cascade_conf.add_namespace(config, subkey="ms1rescore")
+            cascade_conf.add_namespace(config, subkey="MSI-PICASSO")
         else:
             raise TypeError(
                 f"Unsupported config source type: {type(config).__name__}. "

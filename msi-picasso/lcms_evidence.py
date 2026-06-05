@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="alphatims")
 import numpy as np
 import pandas as pd
 
-from ms1rescore.utils import (
+from MSI-PICASSO.utils import (
     NEUTRON,
     PROTON,
     composition_from_sequence,
@@ -825,7 +825,7 @@ def compute_all_lcms_evidence(
 
     # Pre-compute MS2 scan indices per feature m/z (shared across all candidates)
     logger.info(f"  Pre-computing MS2 matches for {len(unique_mzs)} features...")
-    from ms1rescore.utils import mz_to_mass
+    from MSI-PICASSO.utils import mz_to_mass
     feature_ms2_scans: dict[float, list[int]] = {}
     for mz in unique_mzs:
         neutral_mass = mz_to_mass(mz, charge=1)

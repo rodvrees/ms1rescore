@@ -1,4 +1,4 @@
-"""Command-line interface for ms1rescore."""
+"""Command-line interface for MSI-PICASSO."""
 
 import argparse
 import logging
@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ms1rescore import __version__
+from MSI-PICASSO import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +233,7 @@ def _write_results(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ms1rescore",
+        prog="MSI-PICASSO",
         description=(
             "Symmetric target-decoy rescoring for MALDI-MSI MS1 data. "
             "Matches MALDI features to an in-silico tryptic digest and "
@@ -244,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--version", action="version", version=f"ms1rescore {__version__}"
+        "--version", action="version", version=f"MSI-PICASSO {__version__}"
     )
 
     parser.add_argument(
@@ -720,7 +720,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(QuadraticDiscriminantAnalysis, reg_param=0.1); same structure as LDA. "
             "'svm': mokapot PercolatorModel trained on MALDI-intrinsic features. "
             "'catboost': semi-supervised CatBoostRanker with pseudo-label iteration "
-            "(requires pip install ms1rescore[catboost])."
+            "(requires pip install MSI-PICASSO[catboost])."
         ),
     )
     rescore_grp.add_argument(
@@ -1110,7 +1110,7 @@ def main() -> None:
     import json as _json
     from argparse import Namespace as _Namespace
     from pathlib import Path as _Path
-    from ms1rescore.config_parser import parse_configurations
+    from MSI-PICASSO.config_parser import parse_configurations
 
     parser = build_parser()
     args = parser.parse_args()
@@ -1161,7 +1161,7 @@ def main() -> None:
         for k in _TOP_LEVEL_ATTRS
     })
     _config_sources.append(_top_ns)
-    _ms1cfg = parse_configurations(_config_sources)["ms1rescore"]
+    _ms1cfg = parse_configurations(_config_sources)["MSI-PICASSO"]
 
     # Extraction params: config defaults overridden by non-None CLI args.
     _extraction = dict(_ms1cfg.get("maldi_extraction", {}))
@@ -1193,7 +1193,7 @@ def main() -> None:
     # Write full merged config to output dir for reproducibility
     os.makedirs(output_dir, exist_ok=True)
     _Path(output_dir, ".full_config.json").write_text(
-        _json.dumps({"ms1rescore": _ms1cfg}, indent=2, default=str)
+        _json.dumps({"MSI-PICASSO": _ms1cfg}, indent=2, default=str)
     )
 
     logging.basicConfig(
@@ -1246,7 +1246,7 @@ def main() -> None:
     _maldi_imzml_path: str | None = _ms1cfg.get("maldi_imzml")
     _feature_mzs_path: str | None = _ms1cfg.get("feature_mzs")
     if _maldi_raw_path:
-        from ms1rescore.maldi_extraction import extract_maldi_data
+        from MSI-PICASSO.maldi_extraction import extract_maldi_data
 
         logger.info(
             "MALDI features detected from raw data (detect_features). "
@@ -1303,7 +1303,7 @@ def main() -> None:
             + (f", ion image shape: {ion_images.shape[1:]}" if ion_images is not None else "")
         )
     elif _maldi_imzml_path:
-        from ms1rescore.maldi_imzml import (
+        from MSI-PICASSO.maldi_imzml import (
             SCiLSConfig, extract_scils_features,
             reconstruct_ion_images_from_intervals, build_envelopes_from_intervals,
         )
@@ -1353,7 +1353,7 @@ def main() -> None:
 
         # Compute spatial features from reconstructed ion images
         if len(intervals) > 0:
-            from ms1rescore.maldi_extraction import compute_spatial_features as _csf
+            from MSI-PICASSO.maldi_extraction import compute_spatial_features as _csf
             spatial_features = _csf(ion_images, maldi_mzs, len(pixel_coords))
 
         # Build approximate isotope envelopes from interval mean intensities
@@ -1364,7 +1364,7 @@ def main() -> None:
             + (f", ion images {ion_images.shape[1:]}" if len(intervals) > 0 else "")
         )
         if mean_1_over_k0 is not None and len(mean_1_over_k0) == len(maldi_mzs):
-            from ms1rescore.maldi_imzml import one_over_k0_to_ccs
+            from MSI-PICASSO.maldi_imzml import one_over_k0_to_ccs
             _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
             logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
     else:
@@ -1391,7 +1391,7 @@ def main() -> None:
 
     # --- Resolve digest parameters ---
     if lcms_peptides_path:
-        from ms1rescore.lcms_ids import parse_lcms_ids
+        from MSI-PICASSO.lcms_ids import parse_lcms_ids
 
         logger.info("Parsing LC-MS/MS identifications for Strategy C...")
         lcms_ids = parse_lcms_ids(
@@ -1491,9 +1491,9 @@ def main() -> None:
             logger.warning("Could not read --debug-gt file %s: %s", _debug_gt_path, _exc)
 
     # --- Run pipeline ---
-    from ms1rescore.pipeline import rescore
+    from MSI-PICASSO.pipeline import rescore
 
-    logger.info("Starting ms1rescore pipeline...")
+    logger.info("Starting MSI-PICASSO pipeline...")
     _, result_df, _, _features_df = rescore(
         fasta_path=_ms1cfg.get("fasta"),
         maldi_mzs=maldi_mzs,

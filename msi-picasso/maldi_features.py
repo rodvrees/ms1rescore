@@ -10,7 +10,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from ms1rescore.utils import (
+from MSI-PICASSO.utils import (
     AVERAGINE_C, AVERAGINE_H, AVERAGINE_N, AVERAGINE_O,
     NEUTRON, theoretical_isotope_distribution,
 )

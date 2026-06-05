@@ -1,6 +1,6 @@
-# ms1rescore — feature correctness audit
+# MSI-PICASSO — feature correctness audit
 
-Audit date: 2026-05-18 (bugs `kendrick_mass_defect`, `log_mean_intensity`, `spatial_entropy`, `charge_proxy` fixed 2026-05-18). Backend exercised: LDA + balanced_shuffle. Reference run: `results/balanced_shuffle/` (3,452 candidates; 951 target / 2,501 decoy). Visualisations in [`audit_plots/`](../audit_plots/). All file references are relative to `ms1rescore/ms1rescore/`.
+Audit date: 2026-05-18 (bugs `kendrick_mass_defect`, `log_mean_intensity`, `spatial_entropy`, `charge_proxy` fixed 2026-05-18). Backend exercised: LDA + balanced_shuffle. Reference run: `results/balanced_shuffle/` (3,452 candidates; 951 target / 2,501 decoy). Visualisations in [`audit_plots/`](../audit_plots/). All file references are relative to `MSI-PICASSO/MSI-PICASSO/`.
 
 ## Executive summary
 

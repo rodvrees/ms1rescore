@@ -7,13 +7,13 @@ import pickle
 import numpy as np
 import pandas as pd
 
-from ms1rescore.candidates import (
+from MSI-PICASSO.candidates import (
     digest_fasta,
     digest_identified_proteins,
     generate_balanced_shuffle_candidates,
     match_to_maldi_features,
 )
-from ms1rescore.feature_generator import (
+from MSI-PICASSO.feature_generator import (
     FEATURE_NAN_FILL,
     LCMS_PRIOR_FEATURES,
     MAIN_FEATURES,
@@ -25,7 +25,7 @@ from ms1rescore.feature_generator import (
     get_feature_names,
     populate_psm_features,
 )
-from ms1rescore.lcms_evidence import (
+from MSI-PICASSO.lcms_evidence import (
     compute_all_lcms_evidence,
     finetune_deeplc,
     finetune_deeplc_from_df,
@@ -1550,7 +1550,7 @@ def rescore(
     # With digest=True: also digest the provided FASTA for additional candidates.
     lcms_ids = None  # set below if lcms_peptides_path is provided
     if lcms_peptides_path is not None:
-        from ms1rescore.lcms_ids import parse_lcms_ids
+        from MSI-PICASSO.lcms_ids import parse_lcms_ids
 
         logger.info("Step 1: Parsing LC-MS/MS identifications...")
         lcms_ids = parse_lcms_ids(
@@ -1717,7 +1717,7 @@ def rescore(
     # DeepLC finetuning at Step 4.  is_calibration_peptide is carried on the
     # candidates DataFrame and reused by the DeepLC, IM2Deep CCS, mobility, and CCS
     # filter steps instead of the decoy-sensitive n_candidates == 1 heuristic.
-    from ms1rescore.maldi_features import compute_theoretical_isotope_features
+    from MSI-PICASSO.maldi_features import compute_theoretical_isotope_features
     candidates = compute_theoretical_isotope_features(candidates, maldi_envelopes=maldi_envelopes)
     candidates["is_calibration_peptide"] = _select_calibration_peptides(
         candidates, calibration_percentile
@@ -1741,8 +1741,8 @@ def rescore(
 
         # --- Step 3: MS2PIP predictions ---
         logger.info("Step 3: Finding MS2 matches and running MS2PIP...")
-        from ms1rescore.lcms_evidence import _find_matching_ms2_scans
-        from ms1rescore.utils import mz_to_mass
+        from MSI-PICASSO.lcms_evidence import _find_matching_ms2_scans
+        from MSI-PICASSO.utils import mz_to_mass
 
         feature_ms2_charges = {}
         for mz in candidates["feature_mz"].unique():
@@ -1938,7 +1938,7 @@ def rescore(
     _has_mob_coloc = False
     if mob_coloc and tdf_path is not None and "im2deep_predicted_ccs" in features_df.columns:
         try:
-            from ms1rescore.maldi_features import compute_mobility_colocalization_features
+            from MSI-PICASSO.maldi_features import compute_mobility_colocalization_features
             logger.info("Computing per-candidate mobility colocalization features (step 6c)…")
             features_df = compute_mobility_colocalization_features(
                 features_df,
@@ -2162,7 +2162,7 @@ def rescore(
             )
 
         if debug_dir is not None:
-            from ms1rescore.debug_viz import save_debug_figures
+            from MSI-PICASSO.debug_viz import save_debug_figures
             save_debug_figures(
                 features_df, result_df,
                 ion_images=ion_images, ion_image_mzs=ion_image_mzs,
@@ -2309,7 +2309,7 @@ def rescore(
             )
 
         if debug_dir is not None:
-            from ms1rescore.debug_viz import save_debug_figures
+            from MSI-PICASSO.debug_viz import save_debug_figures
             save_debug_figures(
                 features_df, result_df,
                 ion_images=ion_images, ion_image_mzs=ion_image_mzs,
@@ -2512,7 +2512,7 @@ def rescore(
             )
 
         if debug_dir is not None:
-            from ms1rescore.debug_viz import save_debug_figures
+            from MSI-PICASSO.debug_viz import save_debug_figures
             save_debug_figures(
                 features_df, result_df,
                 ion_images=ion_images, ion_image_mzs=ion_image_mzs,
@@ -2694,7 +2694,7 @@ def rescore(
             )
 
         if debug_dir is not None:
-            from ms1rescore.debug_viz import save_debug_figures
+            from MSI-PICASSO.debug_viz import save_debug_figures
             save_debug_figures(
                 features_df, result_df,
                 ion_images=ion_images, ion_image_mzs=ion_image_mzs,

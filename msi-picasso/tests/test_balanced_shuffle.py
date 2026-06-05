@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from ms1rescore.candidates import (
+from MSI-PICASSO.candidates import (
     digest_fasta,
     generate_balanced_shuffle_candidates,
     match_to_maldi_features,

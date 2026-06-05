@@ -86,7 +86,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ms1rescore-rs"
+name = "MSI-PICASSO-rs"
 version = "0.1.0"
 dependencies = [
  "numpy",
