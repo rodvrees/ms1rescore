@@ -20,9 +20,9 @@ def test_defaults_returned_when_no_config():
 
 def test_toml_overrides_defaults(tmp_path):
     toml = tmp_path / "cfg.toml"
-    toml.write_text('[MSI-PICASSO]\nmodel = "catboost"\nfeatures_exclude = ["peptide_length"]\n')
+    toml.write_text('[MSI-PICASSO]\nmodel = "qda"\nfeatures_exclude = ["peptide_length"]\n')
     config = parse_configurations([str(toml)])["MSI-PICASSO"]
-    assert config["model"] == "catboost"
+    assert config["model"] == "qda"
     assert config["features_exclude"] == ["peptide_length"]
     assert config["decoy_method"] == "balanced_shuffle"
 
@@ -37,11 +37,11 @@ def test_json_overrides_defaults(tmp_path):
 
 def test_cli_namespace_overrides_file(tmp_path):
     toml = tmp_path / "cfg.toml"
-    toml.write_text('[MSI-PICASSO]\nmodel = "catboost"\n')
+    toml.write_text('[MSI-PICASSO]\nmodel = "qda"\n')
     ns = Namespace(model="lda", train_fdr=None)
     config = parse_configurations([str(toml), ns])["MSI-PICASSO"]
     assert config["model"] == "lda"
-    assert config["train_fdr"] == pytest.approx(0.01)
+    assert config["train_fdr"] == pytest.approx(0.05)
 
 
 def test_none_does_not_override(tmp_path):
@@ -63,6 +63,31 @@ def test_features_exclude_unknown_names_allowed():
     ns = Namespace(features_exclude=["nonexistent_feature"])
     config = parse_configurations([ns])["MSI-PICASSO"]
     assert "nonexistent_feature" in config["features_exclude"]
+
+
+def test_explicit_falsy_zero_is_honored():
+    """A legitimate explicit 0 (param with minimum 0) must survive the cascade,
+    not be silently dropped to the default (cascade_config falsy-drop bug)."""
+    # n_interaction_features default is 0 already; use a non-default falsy case:
+    # set it explicitly and confirm it round-trips.
+    config = parse_configurations([Namespace(n_interaction_features=0)])["MSI-PICASSO"]
+    assert config["n_interaction_features"] == 0
+
+
+def test_explicit_matching_ppm_zero_honored():
+    """matching_ppm=0 means exact matching / no collision tolerance — a valid choice
+    (esp. in raw-query). It must be honored, not silently masked by the default 20.0."""
+    config = parse_configurations([Namespace(matching_ppm=0.0)])["MSI-PICASSO"]
+    assert config["matching_ppm"] == 0.0
+    # a valid positive value is also honored
+    config = parse_configurations([Namespace(matching_ppm=8.0)])["MSI-PICASSO"]
+    assert config["matching_ppm"] == 8.0
+
+
+def test_negative_matching_ppm_rejected():
+    """A negative matching_ppm is invalid (schema minimum 0) and must raise."""
+    with pytest.raises(Exception):
+        parse_configurations([Namespace(matching_ppm=-1.0)])
 
 
 def test_maldi_extraction_section_preserved(tmp_path):

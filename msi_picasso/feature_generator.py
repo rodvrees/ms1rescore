@@ -15,6 +15,9 @@ from psm_utils.peptidoform import Peptidoform
 
 from msi_picasso.maldi_features import (
     _pearson_r_matrix,
+    compute_tissue_mask,
+    compute_nmf_colocalization_features,
+    compute_patch_colocalization_features,
     compute_adduct_colocalization,
     compute_calibrated_ppm_features,
     compute_candidate_ambiguity_features,
@@ -76,6 +79,11 @@ MALDI_INTRINSIC_FEATURES = [
     # --- ion mobility (B-group) — optional, requires im2deep + observed CCS ---
     "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
     "im2deep_ccs_zscore", "im2deep_ccs_rank",
+    # m/z-detrended (conformational) CCS residuals — for mz_shuffle these REPLACE
+    # the raw CCS features above (pipeline excludes the raw ones); for other decoy
+    # methods they supplement them.
+    "im2deep_delta_ccs_resid", "im2deep_abs_delta_ccs_pct_resid",
+    "im2deep_ccs_zscore_resid", "im2deep_ccs_rank_resid",
     # --- isotopologue co-localization (E1) — optional, requires ion_images ---
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
     "isotope_image_colocalization_mean",
@@ -99,6 +107,28 @@ PROTEIN_LEVEL_FEATURES = [
     # protein co-localization (from compute_colocalization_features; requires ion_images)
     "protein_colocalization", "protein_colocalization_max",
     "protein_colocalization_median", "protein_colocalization_n_partners",
+    # indicator: 1.0 when within-protein colocalization is defined (>=1 partner),
+    # 0.0 otherwise.  Lets the ranker separate "not colocalizable" (small protein,
+    # coloc median-imputed) from "colocalizes poorly" (see compute_colocalization_features).
+    "has_coloc",
+    # intensity-weighted and rank-weighted (top-k) within-protein colocalization
+    "protein_colocalization_weighted", "protein_colocalization_weighted_max",
+    "protein_colocalization_top2", "protein_colocalization_top3", "protein_colocalization_top5",
+    # patch-level (local) colocalization (opt-in via --patch-coloc; requires ion_images)
+    "protein_patch_colocalization_mean", "protein_patch_colocalization_max",
+    "protein_patch_colocalization_frac_above",
+]
+
+# NMF substructure-sharing colocalization (opt-in via --nmf-coloc, requires
+# ion_images). Within-protein cosine similarity of NMF spatial-component
+# loadings — asks whether same-protein peptides occupy the same tissue
+# substructure, a sharper question than global ion-image Pearson r. Protein-
+# level, so valid only because decoys occupy a separate protein namespace.
+# Appended to the ranker pool at runtime in pipeline.py when the flag is set.
+NMF_COLOCALIZATION_FEATURES = [
+    "protein_nmf_colocalization",
+    "protein_nmf_colocalization_max",
+    "protein_nmf_colocalization_median",
 ]
 
 # LC-MS/MS prior features: NOT passed to the ranker/SVM — doing so would cause
@@ -154,6 +184,26 @@ SPATIAL_PRIOR_FEATURES = [
     # per-candidate mobility-filtered spatial quality (optional, requires tdf_path + im2deep)
     "fraction_detected_mob", "intensity_cv_mob",
     "log_mean_intensity_mob", "spatial_morans_i_mob",
+]
+
+# Spatial ranker features: opt-in (--use-spatial-ranker-features), permitted ONLY
+# with decoy methods whose decoys land on real MALDI features (entrapment, mz_shift).
+# With shuffle/balanced_shuffle/paired_shuffle there is no consistent spatial anchor
+# for decoys, so including these features produces an asymmetric null (guarded in
+# pipeline.py).  The protein_colocalization_* members overlap PROTEIN_LEVEL_FEATURES;
+# pipeline.py deduplicates when both opt-in flags are active.
+SPATIAL_RANKER_FEATURES = [
+    # Feature-level spatial quality
+    "spatial_autocorrelation",
+    "spatial_morans_i",
+    "spatial_gearys_c",
+    "fraction_detected",
+    "intensity_cv",
+    # Protein-level colocalization
+    "protein_colocalization",
+    "protein_colocalization_max",
+    "protein_colocalization_median",
+    "protein_colocalization_n_partners",
 ]
 
 # Alias kept separate so LDA-specific feature selection can diverge later.
@@ -221,11 +271,14 @@ _SPATIAL_FEATS = frozenset([
 _COLOC_FEATS = frozenset([
     "protein_colocalization", "protein_colocalization_max",
     "protein_colocalization_median", "protein_colocalization_n_partners",
+    "has_coloc",
 ])
 _PIXEL_FEATS = frozenset(["ppm_error_calibrated_z"])
 _CCS_FEATS = frozenset([
     "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
     "im2deep_ccs_zscore", "im2deep_ccs_rank",
+    "im2deep_delta_ccs_resid", "im2deep_abs_delta_ccs_pct_resid",
+    "im2deep_ccs_zscore_resid", "im2deep_ccs_rank_resid",
 ])
 _ISOTOPOLOGUE_COLOC_FEATS = frozenset([
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
@@ -313,6 +366,12 @@ def compute_all_features(
     observed_ccs_per_feature: dict | None = None,
     im2deep_calibration: str = "linear",
     im2deep_kwargs: dict | None = None,
+    coloc_tic_quantile: float = 0.0,
+    nmf_coloc: bool = False,
+    nmf_n_components: int = 12,
+    patch_coloc: bool = False,
+    patch_size: int = 10,
+    patch_coloc_threshold: float = 0.5,
 ) -> pd.DataFrame:
     """
     Compute all features on the candidate DataFrame.
@@ -428,13 +487,33 @@ def compute_all_features(
     # --- Ion-image-based features (optional) ---
     if ion_images is not None and ion_image_mzs is not None:
         logger.debug("Computing ion-image-based features (co-localization, full spatial autocorrelation, etc.) using ion_images and ion_image_mzs")
+        # On-tissue pixel mask (TIC proxy): raw MALDI ion images share a dominant
+        # on/off-tissue component that inflates every pairwise r toward the tissue
+        # outline. Restricting the correlation to on-tissue pixels removes it so
+        # colocalization reflects co-distribution within the tissue (see
+        # compute_tissue_mask). TIC == 0 padding is always dropped.
+        pixel_mask = compute_tissue_mask(ion_images, tic_quantile=coloc_tic_quantile)
+        logger.info(
+            f"Colocalization on-tissue mask: {int(pixel_mask.sum())}/{pixel_mask.size} "
+            f"pixels kept (tic_quantile={coloc_tic_quantile})"
+        )
         # Compute the full Pearson correlation matrix once (single BLAS call) and
         # share it across all three colocalization functions to avoid 3× redundant work.
-        corr_cache = _pearson_r_matrix(ion_images, ion_image_mzs)
+        corr_cache = _pearson_r_matrix(ion_images, ion_image_mzs, pixel_mask=pixel_mask)
         df = compute_colocalization_features(df, ion_images, ion_image_mzs, _corr_cache=corr_cache)
-        df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images)  # E1
-        df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images)        # E2
+        df = compute_isotopologue_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images, pixel_mask=pixel_mask)  # E1
+        df = compute_adduct_colocalization(df, ion_images, ion_image_mzs, _corr_cache=corr_cache, extra_ion_images=extra_ion_images, pixel_mask=pixel_mask)        # E2
         df = compute_spatial_autocorrelation_full(df, ion_images, ion_image_mzs)                         # E5/E6
+        if nmf_coloc:
+            df = compute_nmf_colocalization_features(
+                df, ion_images, ion_image_mzs, pixel_mask=pixel_mask,
+                n_components=nmf_n_components,
+            )
+        if patch_coloc:
+            df = compute_patch_colocalization_features(
+                df, ion_images, ion_image_mzs, pixel_mask=pixel_mask,
+                patch_size=patch_size, threshold=patch_coloc_threshold,
+            )
 
     return df
 

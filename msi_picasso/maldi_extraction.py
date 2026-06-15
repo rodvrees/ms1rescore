@@ -889,6 +889,7 @@ def extract_maldi_data(
     picking_height: float = 0.75,
     local_prominence_window_da: float = 0.0,
     feature_mzs: np.ndarray | None = None,
+    drop_zero_signal: bool = True,
     images_path: str | None = None,
     image_batch_size: int = 100,
     output_npz: str | None = None,
@@ -940,6 +941,12 @@ def extract_maldi_data(
         Intended for reuse of a cached feature set from a previous run, not
         for LC-MS/MS guided feature selection.  Must be a sorted 1D float64
         array.
+    drop_zero_signal
+        When ``True`` (default), features whose ion image has no detected
+        pixels are removed after extraction.  Set ``False`` in raw-query mode
+        (``query_raw_maldi``): there, every candidate m/z must be retained even
+        when it lands in empty m/z space, so that decoys with zero MALDI signal
+        produce genuine zero-signal ion images rather than vanishing.
     images_path
         If given, write ion images to this path as a float32 memmap instead
         of allocating in RAM.  Enables extraction of datasets that would
@@ -1144,7 +1151,7 @@ def extract_maldi_data(
     # This is especially important when feature_mzs come from LC-MS/MS IDs,
     # where some peptide masses may have no corresponding MALDI signal.
     detected_mask = spatial_df["n_pixels_detected"].to_numpy() > 0
-    if not detected_mask.all():
+    if drop_zero_signal and not detected_mask.all():
         n_removed = int((~detected_mask).sum())
         logger.info(
             f"  Dropping {n_removed} features with zero MALDI signal "
