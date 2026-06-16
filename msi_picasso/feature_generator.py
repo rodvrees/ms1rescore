@@ -127,8 +127,6 @@ PROTEIN_LEVEL_FEATURES = [
 # Appended to the ranker pool at runtime in pipeline.py when the flag is set.
 NMF_COLOCALIZATION_FEATURES = [
     "protein_nmf_colocalization",
-    "protein_nmf_colocalization_max",
-    "protein_nmf_colocalization_median",
 ]
 
 # LC-MS/MS prior features: NOT passed to the ranker/SVM — doing so would cause

@@ -2250,9 +2250,28 @@ def rescore(
         patch_size=patch_size,
         patch_coloc_threshold=patch_coloc_threshold,
     )
+    # Resolve the set of features explicitly excluded from the ranker: the
+    # user-supplied features_exclude plus, for mz_shuffle, the raw CCS + mobility-
+    # gated colocalization features that leak the m/z baseline (see the ranker
+    # feature-pool assembly below for the rationale). Computed here so the
+    # 13_debug_features.tsv table reflects exactly the same exclusions the ranker
+    # applies, and reused (not recomputed) when assembling the pool.
+    _exclude_set = set(features_exclude or [])
+    if decoy_method == "mz_shuffle":
+        _ccs_mz_leak_feats = set(_MZ_SHUFFLE_CCS_LEAK_FEATURES)
+        if _ccs_mz_leak_feats - _exclude_set:
+            logger.info(
+                "  decoy_method='mz_shuffle': excluding raw CCS + mobility-gated "
+                "colocalization features from the ranker (they leak the m/z baseline); "
+                "keeping only the m/z-detrended *_resid CCS features."
+            )
+        _exclude_set |= _ccs_mz_leak_feats
+    if _exclude_set:
+        logger.info(f"  Excluding {len(_exclude_set)} features: {sorted(_exclude_set)}")
+
     if verbose:
         logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
-        _debug_cols = [c for c in features_df.columns if c not in set(features_exclude or [])]
+        _debug_cols = [c for c in features_df.columns if c not in _exclude_set]
         features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
     # --- CCS-based candidate filtering (optional) ---
@@ -2350,26 +2369,9 @@ def rescore(
         use_spatial_ranker_features, decoy_method
     )
 
-    _exclude_set = set(features_exclude or [])
-    # For mz_shuffle, any feature that uses the candidate's PREDICTED CCS/mobility to
-    # gate or compare against the observed feature leaks the m/z baseline (decoys are
-    # relocated far in mass; CCS/1-K0 ∝ m/z). Exclude those from the ranker, keeping
-    # only the m/z-detrended *_resid CCS features. This covers (a) the raw CCS scalar
-    # features and (b) the mobility-gated colocalization features (each candidate
-    # filters the shared ion image with its own predicted-1/K0 window — a decoy's
-    # window misses the heavy feature's peak → trivial mass-baseline separation).
-    # Other decoy methods keep all of these.
-    if decoy_method == "mz_shuffle":
-        _ccs_mz_leak_feats = set(_MZ_SHUFFLE_CCS_LEAK_FEATURES)
-        if _ccs_mz_leak_feats - _exclude_set:
-            logger.info(
-                "  decoy_method='mz_shuffle': excluding raw CCS + mobility-gated "
-                "colocalization features from the ranker (they leak the m/z baseline); "
-                "keeping only the m/z-detrended *_resid CCS features."
-            )
-        _exclude_set |= _ccs_mz_leak_feats
-    if _exclude_set:
-        logger.info(f"  Excluding {len(_exclude_set)} features: {sorted(_exclude_set)}")
+    # _exclude_set (features_exclude + the mz_shuffle CCS/mobility leak features) was
+    # resolved earlier, before the 13_debug_features.tsv write, so the debug table and
+    # the ranker apply identical exclusions. See that block for the mz_shuffle rationale.
     # Assemble the intrinsic feature pool: base + optional protein-level + optional
     # spatial-ranker.  protein_colocalization_* appear in both PROTEIN_LEVEL_FEATURES
     # and SPATIAL_RANKER_FEATURES; the order-preserving dedup below prevents
