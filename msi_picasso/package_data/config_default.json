@@ -22,8 +22,6 @@
     "pseudo_label_fdr": 0.10,
     "r1_seed_percentile": 0.10,
     "r2_seed_percentile": 0.20,
-    "catboost_iterations": 500,
-    "mokapot_max_iter": 10,
     "max_iter": 5,
     "min_seed_positives": 50,
     "protein_fdr": 0.01,

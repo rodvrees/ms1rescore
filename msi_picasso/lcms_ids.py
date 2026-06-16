@@ -65,9 +65,7 @@ def _strip_percolator_peptide(pep_str: str) -> str:
     pep_str = pep_str.strip()
     if "." in pep_str:
         parts = pep_str.split(".")
-        if len(parts) >= 3:
-            return parts[1]
-        if len(parts) == 2:
+        if len(parts) >= 2:
             return parts[1]
     return pep_str
 

@@ -1002,50 +1002,6 @@ def _rescore_qda(
     return scores, pep_proba, importances, present
 
 
-# def _feature_level_tdc(
-#     features_df: pd.DataFrame,
-#     scores: np.ndarray,
-#     feature_col: str = "feature_mz",
-# ) -> tuple[np.ndarray, np.ndarray]:
-#     """Per-feature TDC q-values.
-
-#     For each MALDI feature the winner is the highest-scoring candidate
-#     regardless of target/decoy status. TDC is applied over features ranked
-#     by their winning score. Q-values are propagated to all candidates at
-#     each feature (non-winners inherit their feature's q-value so the full
-#     candidate table remains annotated).
-
-#     Returns
-#     -------
-#     q_values : np.ndarray, shape (n_candidates,)
-#     is_tdc_winner : np.ndarray[bool], shape (n_candidates,)
-#     """
-#     df = pd.DataFrame({"_score": scores, "_feat": features_df[feature_col].values})
-#     df["_is_decoy"] = features_df["is_decoy"].values.astype(bool)
-
-#     winner_pos = df.groupby("_feat")["_score"].idxmax()
-#     winner_scores = df.loc[winner_pos, "_score"].values
-#     winner_is_decoy = df.loc[winner_pos, "_is_decoy"].values
-
-#     order = np.argsort(-winner_scores)
-#     n_target_cum = np.cumsum(~winner_is_decoy[order]).astype(float)
-#     n_decoy_cum = np.cumsum(winner_is_decoy[order]).astype(float)
-#     with np.errstate(invalid="ignore", divide="ignore"):
-#         fdr = np.where(n_target_cum > 0, n_decoy_cum / n_target_cum, 1.0)
-#     qval_sorted = np.minimum.accumulate(fdr[::-1])[::-1].clip(max=1.0)
-#     feat_qvals = np.empty_like(qval_sorted)
-#     feat_qvals[order] = qval_sorted
-
-#     # q-values are only meaningful for the per-feature winner; NaN for all others
-#     q_values = np.full(len(df), np.nan)
-#     q_values[winner_pos.values] = feat_qvals
-
-#     is_tdc_winner = np.zeros(len(df), dtype=bool)
-#     is_tdc_winner[winner_pos.values] = True
-
-#     return q_values, is_tdc_winner
-
-
 def _tdc_qvalues(scores: np.ndarray, is_decoy: np.ndarray, pi0: float = 1.0) -> np.ndarray:
     """
     Compute per-candidate target-decoy q-values (Storey/Käll TDC).
@@ -1380,8 +1336,6 @@ def rescore(
     pseudo_label_fdr: float = 0.10,
     r1_seed_percentile: float = 0.10,
     r2_seed_percentile: float = 0.20,
-    catboost_iterations: int = 500,
-    mokapot_max_iter: int = 10,
     max_iter: int = 5,
     min_seed_positives: int = 50,
     im2deep_kwargs: dict | None = None,
@@ -1632,10 +1586,6 @@ def rescore(
         Seeds are selected as the top ``r2_seed_percentile`` fraction by R1
         score, i.e. scores >= ``np.percentile(target_scores, 100*(1-r2_seed_percentile))``.
         Default 0.20 (top 20%).
-    catboost_iterations
-        Number of boosting iterations for ``model="catboost"``.
-    mokapot_max_iter
-        Maximum mokapot training iterations for ``model="svm"``.
 
     Returns
     -------

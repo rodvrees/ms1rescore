@@ -1342,31 +1342,6 @@ def compute_im2deep_features(
             n_raw, _fmt(raw_c), _fmt(res_c),
         )
 
-    # # Mahalanobis distance in (ppm_error_abs, delta_ccs) space per feature
-    # mahal = np.full(len(df), np.nan)
-    # df_reset = df.reset_index(drop=False)
-    # for _, grp in df_reset.groupby("feature_mz"):
-    #     if len(grp) < 3:
-    #         continue
-    #     X = grp[["ppm_error_abs", "_im2deep_delta"]].values.astype(float)
-    #     valid_mask = ~np.isnan(X).any(axis=1)
-    #     X_valid = X[valid_mask]
-    #     if X_valid.shape[0] < 3:
-    #         continue
-    #     try:
-    #         cov = np.cov(X_valid.T)
-    #         if np.linalg.matrix_rank(cov) < 2:
-    #             continue
-    #         cov_inv = np.linalg.inv(cov)
-    #         mean = X_valid.mean(axis=0)
-    #         for row_pos, orig_idx in enumerate(grp.index):
-    #             if valid_mask[row_pos]:
-    #                 diff = X[row_pos] - mean
-    #                 mahal[orig_idx] = float(np.sqrt(diff @ cov_inv @ diff))
-    #     except np.linalg.LinAlgError:
-    #         continue
-
-    # df["im2deep_mahalanobis"] = mahal
     df.drop(
         columns=["_im2deep_delta", "_im2deep_abspct", "_resid_delta", "_resid_abspct"],
         inplace=True, errors="ignore",
