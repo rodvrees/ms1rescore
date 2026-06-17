@@ -57,6 +57,7 @@
     "patch_coloc": false,
     "patch_size": 10,
     "patch_coloc_threshold": 0.5,
+    "drop_zero_signal": false,
     "deeplc_finetune_epochs": 40,
     "deeplc_finetune_lr": 0.001,
     "deeplc_finetune_patience": 10,

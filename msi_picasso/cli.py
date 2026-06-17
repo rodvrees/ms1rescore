@@ -1147,6 +1147,19 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FLOAT",
         help="r threshold for the patch frac_above feature (--patch-coloc). Default 0.5.",
     )
+    rescore_grp.add_argument(
+        "--drop-zero-signal",
+        action="store_true",
+        default=None,
+        help=(
+            "Remove candidates whose MALDI feature has zero total signal "
+            "(feature_intensity_sum == 0) before scoring. Under raw-query mode these "
+            "candidates have no MALDI evidence and their co-located target/decoy pairs "
+            "differ only on peptide_length, which leaks the mz_shuffle derangement. "
+            "Symmetric: both target and decoy at a zero-signal feature are dropped. "
+            "Disabled by default."
+        ),
+    )
 
     # --- Strategy C: LC-MS/MS-guided candidates ---
     strat_c = parser.add_argument_group(
@@ -1179,12 +1192,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     strat_c.add_argument(
         "--lcms-id-format",
-        choices=("percolator", "mzidentml", "psm_utils", "msf"),
+        choices=("percolator", "mzidentml", "psm_utils", "msf", "ms2rescore"),
         default=None,
         help=(
             "Format of the LC-MS/MS identification files. "
             "Use 'msf' to read directly from a ProteomeDiscoverer .msf file "
-            "(the same file passed to --msf can be reused)."
+            "(the same file passed to --msf can be reused). "
+            "Use 'ms2rescore' to read ms2rescore .psms.tsv output directly."
         ),
     )
     strat_c.add_argument(
@@ -1291,6 +1305,7 @@ def main() -> None:
         "verbose", "storey_pi0", "lda_r2_median_filter",
         "only_main_features", "use_protein_level_feats", "match_ccs",
         "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc",
+        "drop_zero_signal",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
@@ -1313,6 +1328,7 @@ def main() -> None:
         "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_window_multiplier",
         "coloc_tic_quantile", "nmf_coloc", "nmf_n_components",
         "patch_coloc", "patch_size", "patch_coloc_threshold",
+        "drop_zero_signal",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         "calibration_percentile", "maldi_query_raw",
         # file paths
@@ -1760,6 +1776,7 @@ def main() -> None:
         patch_coloc=bool(_ms1cfg.get("patch_coloc", False)),
         patch_size=_ms1cfg["patch_size"],
         patch_coloc_threshold=_ms1cfg["patch_coloc_threshold"],
+        drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
     )
 
     # --- Write results ---

@@ -490,7 +490,6 @@ def compute_colocalization_features(
 
 _PATCH_COLOC_COLS = [
     "protein_patch_colocalization_mean",
-    "protein_patch_colocalization_max",
     "protein_patch_colocalization_frac_above",
 ]
 
@@ -1479,6 +1478,24 @@ def _pearson_r_pairwise(
     return np.where(denom > 1e-10, num / denom, np.nan).astype(np.float32)
 
 
+def _m0_valid_mask(ion_images, ion_image_mzs, pixel_mask=None):
+    """Boolean (N,) mask of M0 images with non-constant signal over the
+    (optionally pixel-masked) pixels. Shared by the direct-image colocalization
+    paths."""
+    flat_m0 = ion_images.reshape(len(np.asarray(ion_image_mzs, dtype=np.float64)), -1)
+    if pixel_mask is not None:
+        flat_m0 = flat_m0[:, np.asarray(pixel_mask, dtype=bool)]
+    return flat_m0.std(axis=1) > 1e-10
+
+
+def _assign_coloc_column(df, col, mapping):
+    """Map ``feature_mz`` → Pearson r and fill missing values with the column
+    median (0.0 when no finite value exists). Shared colocalization tail."""
+    df[col] = df["feature_mz"].map(mapping)
+    valid = df[col].dropna()
+    df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
+
+
 def compute_isotopologue_colocalization(
     df: pd.DataFrame,
     ion_images: np.ndarray,
@@ -1516,11 +1533,7 @@ def compute_isotopologue_colocalization(
 
     if m1_images is not None and m2_images is not None:
         # Direct per-feature Pearson r: no partner lookup needed.
-        mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
-        flat_m0 = ion_images.reshape(len(mz_arr), -1)
-        if pixel_mask is not None:
-            flat_m0 = flat_m0[:, np.asarray(pixel_mask, dtype=bool)]
-        valid_mask = flat_m0.std(axis=1) > 1e-10
+        valid_mask = _m0_valid_mask(ion_images, ion_image_mzs, pixel_mask)
         r_m1_arr = _pearson_r_pairwise(ion_images[valid_mask], m1_images[valid_mask], pixel_mask=pixel_mask)
         r_m2_arr = _pearson_r_pairwise(ion_images[valid_mask], m2_images[valid_mask], pixel_mask=pixel_mask)
         n_m1_found = int(np.isfinite(r_m1_arr).sum())
@@ -1554,9 +1567,7 @@ def compute_isotopologue_colocalization(
         ("isotope_image_colocalization_m2",   r_m2_map),
         ("isotope_image_colocalization_mean", r_mean_map),
     ]:
-        df[col] = df["feature_mz"].map(mapping)
-        valid = df[col].dropna()
-        df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
+        _assign_coloc_column(df, col, mapping)
 
     return df
 
@@ -1599,11 +1610,7 @@ def compute_adduct_colocalization(
 
     if extra_ion_images and any(k in extra_ion_images for k in _ADDUCT_DELTAS):
         # Direct per-feature Pearson r using pre-extracted adduct images.
-        mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
-        flat_m0 = ion_images.reshape(len(mz_arr), -1)
-        if pixel_mask is not None:
-            flat_m0 = flat_m0[:, np.asarray(pixel_mask, dtype=bool)]
-        valid_mask = flat_m0.std(axis=1) > 1e-10
+        valid_mask = _m0_valid_mask(ion_images, ion_image_mzs, pixel_mask)
         m0_valid = ion_images[valid_mask]
         for adduct_name in _ADDUCT_DELTAS:
             adduct_imgs = extra_ion_images.get(adduct_name)
@@ -1612,10 +1619,7 @@ def compute_adduct_colocalization(
             else:
                 r_arr = np.full(n_valid, np.nan, dtype=np.float32)
             mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
-            col = f"adduct_colocalization_{adduct_name}"
-            df[col] = df["feature_mz"].map(mapping)
-            valid_col = df[col].dropna()
-            df[col] = df[col].fillna(float(valid_col.median()) if len(valid_col) > 0 else 0.0)
+            _assign_coloc_column(df, f"adduct_colocalization_{adduct_name}", mapping)
         logger.info(
             f"Adduct colocalization (E2): direct images used for "
             f"{[k for k in _ADDUCT_DELTAS if extra_ion_images.get(k) is not None]}"
@@ -1631,10 +1635,7 @@ def compute_adduct_colocalization(
                 np.nan,
             )
             mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
-            col = f"adduct_colocalization_{adduct_name}"
-            df[col] = df["feature_mz"].map(mapping)
-            valid_col = df[col].dropna()
-            df[col] = df[col].fillna(float(valid_col.median()) if len(valid_col) > 0 else 0.0)
+            _assign_coloc_column(df, f"adduct_colocalization_{adduct_name}", mapping)
         n_found = sum(
             int((_find_partner_indices(valid_mz_arr, valid_mz_arr + d, ppm_tolerance) >= 0).sum())
             for d in _ADDUCT_DELTAS.values()

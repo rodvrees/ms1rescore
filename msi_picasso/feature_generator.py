@@ -115,7 +115,7 @@ PROTEIN_LEVEL_FEATURES = [
     "protein_colocalization_weighted", "protein_colocalization_weighted_max",
     "protein_colocalization_top2", "protein_colocalization_top3", "protein_colocalization_top5",
     # patch-level (local) colocalization (opt-in via --patch-coloc; requires ion_images)
-    "protein_patch_colocalization_mean", "protein_patch_colocalization_max",
+    "protein_patch_colocalization_mean",
     "protein_patch_colocalization_frac_above",
 ]
 

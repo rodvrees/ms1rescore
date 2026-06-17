@@ -117,8 +117,9 @@ def parse_lcms_ids(
     peptide_fdr
         Peptide FDR threshold (default 0.01).
     format
-        Input format: ``"percolator"``, ``"mzidentml"``, ``"psm_utils"``, or
-        ``"msf"`` (ProteomeDiscoverer ``.msf`` SQLite database).
+        Input format: ``"percolator"``, ``"mzidentml"``, ``"psm_utils"``,
+        ``"msf"`` (ProteomeDiscoverer ``.msf`` SQLite database), or
+        ``"ms2rescore"`` (ms2rescore ``.psms.tsv`` output).
     psm_utils_reader
         Only used when ``format="psm_utils"``. Either a psm_utils filetype
         key (e.g. ``"maxquant"``, ``"tsv"``) or a reader class name (e.g.
@@ -145,10 +146,12 @@ def parse_lcms_ids(
         )
     elif format == "msf":
         return _parse_msf(peptides_path, protein_fdr, peptide_fdr)
+    elif format == "ms2rescore":
+        return _parse_psm_utils(peptides_path, protein_fdr, peptide_fdr, psm_utils_reader="tsv")
     else:
         raise ValueError(
             f"Unknown format {format!r}. "
-            f"Choose 'percolator', 'mzidentml', 'psm_utils', or 'msf'."
+            f"Choose 'percolator', 'mzidentml', 'psm_utils', 'msf', or 'ms2rescore'."
         )
 
 
@@ -441,6 +444,8 @@ def _parse_psm_utils(
     for psm in psm_list:
         try:
             if psm.peptidoform is None:
+                continue
+            if psm.is_decoy:
                 continue
             sequence = psm.peptidoform.sequence
             prot_first = (

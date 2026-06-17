@@ -856,6 +856,78 @@ With the human FASTA (~20K proteins) and 1,398 MALDI features at 20 ppm:
 
 ---
 
+## Known result biases
+
+Each entry names the bias, which decoy method(s) and pipeline mode it affects, why it arises, and what the current mitigation is.
+
+---
+
+### 1. `peptide_length` leaks the mass-sorted derangement in the zero-signal subpopulation (`mz_shuffle` + `--maldi-query-raw`)
+
+**Affects:** `decoy_method="mz_shuffle"` in raw-query mode when `drop_zero_signal=False`.
+
+**Why it arises.** The mz_shuffle derangement is a mass-sorted cyclic rotation: each target peptide is relocated onto the feature of a peptide ~n/4–3n/4 positions away in mass-sorted order. Consequently, the decoy peptide co-located on a given feature has a systematically *different* mass (and therefore a different `peptide_length`) from the target peptide. For features that have genuine MALDI signal (`feature_intensity_sum > 0`), MALDI-dependent features (`log_maldi_intensity*`, `ppm_error`, isotope, CCS, etc.) provide the discrimination signal and overwhelm `peptide_length`. For **zero-signal features** — m/z bins with no detected peak across all pixels — all MALDI-dependent features collapse to 0 or their imputed median, leaving only sequence-derived features (`peptide_length`, amino acid composition) to separate targets from decoys. Because `peptide_length` ∝ mass and the derangement enforces a large mass gap, `peptide_length` achieves AUC ≈ 0.91 in the zero-signal subpopulation. This skews the FDR: the semi-supervised ranker trains on these easy zero-signal decoys and assigns artificially high scores to short (or long) target peptides regardless of MALDI evidence.
+
+**Mitigation.** `drop_zero_signal=True` (CLI `--drop-zero-signal`, default in raw-query mode) removes all candidates where `feature_intensity_sum == 0` before scoring. The mask is `is_decoy`-blind: under mz_shuffle co-located target and decoy share the identical ion image, so both are dropped together, preserving the 1:1 T:D ratio. This is the right fix; retaining zero-signal rows only adds noise because no MALDI evidence supports them.
+
+**Symptom.** If zero-signal rows are retained, the ranked-list shows an inflated tail of short peptides (low mass → negative mass-sorted offset → `peptide_length` of decoy > target) passing FDR, with no supporting MALDI ion image.
+
+**Note.** `peptide_length` (and all `_BEST_FEAT_SKIP` features) are already excluded from the round-1 seed initialization sweep (`_find_best_feature_labels`) for the same underlying reason: composition features can produce spurious pseudo-positives when targets and decoys have different sequence distributions.
+
+---
+
+### 2. Raw Pearson colocalization inflated by tissue morphology (all decoy methods)
+
+**Affects:** all modes when `compute_colocalization_features` or `compute_nmf_colocalization_features` is used without TIC masking, and even with TIC masking on this dataset.
+
+**Why it arises.** Any MALDI ion image is ~0 in the unmeasured off-tissue padding and broadly tracks the tissue footprint on-tissue. The shared on/off-tissue structure dominates the raw Pearson r between any two ion images: mean within-protein r ~0.76–0.84, with mz_shuffle decoys at 0.778 — *higher* than all targets (0.736). TIC masking (`--coloc-tic-quantile`) restricts computation to on-tissue pixels and halves the absolute values (masked targets 0.279, decoys 0.301), but does not reverse the decoy ≥ target ordering. The underlying reason is that the mz_shuffle null is symmetric by design: relocated decoys land on real confirmed ion images, and every real image shares the same few tissue substructures, so any protein-level aggregation is equally coherent for targets and decoys. NMF substructure cosine shows the same pattern (targets 0.715, decoys 0.790).
+
+**Mitigation.** Keep protein colocalization out of the default ranker feature set. TIC-masking code (`compute_tissue_mask` in `maldi_features.py`) is retained because it is strictly more correct than raw Pearson r and would matter on a dataset with genuine protein-specific spatial structure. The non-discriminativeness is specific to this amyloidosis data; do not assume it generalizes to all datasets.
+
+---
+
+### 3. `ppm_error` non-discriminative for `mz_shift` decoys in feature-list mode (by design)
+
+**Affects:** `decoy_method="mz_shift"` in feature-list mode (no `--maldi-query-raw`).
+
+**Why it arises.** In feature-list mode, the `ppm_error` for an mz_shift decoy is copied from the target peptide's best match ppm — the delta between the peptide's theoretical [M+H]+ and the feature it was matched to — rather than computed against the decoy's shifted (off-target) feature m/z. This makes `ppm_error` identical for a target and its mz_shift decoy, contributing zero discrimination signal.
+
+**Why this is intentional.** Computing `ppm_error` against the decoy's snapped-to feature m/z (which could be many Da away) would artificially penalise decoys for a large ppm offset that does not correspond to any real ambiguity a false positive would have. Real false positives match within the ppm window by definition; the decoy's shifted anchor is not a mass-match, so penalising it on that delta would make the null anti-conservative.
+
+**In raw-query mode** this limitation is removed: `_recompute_ppm_from_centroids` computes `ppm_error` from the observed peak centroid in each candidate's own extraction window, identically for targets and decoys. An mz_shift decoy shifted into empty m/z space receives the worst-case ppm (`extraction_ppm`) rather than a median-imputed value, so zero-signal decoys are penalised rather than treated as average-quality (see `pipeline.py:_recompute_ppm_from_centroids`).
+
+---
+
+### 4. CCS / `im2deep_*` features leak the m/z baseline for `mz_shuffle` decoys
+
+**Affects:** `decoy_method="mz_shuffle"` when IM2Deep CCS features are active.
+
+**Why it arises.** CCS is approximately proportional to m/z (Mason-Schamp relation; larger peptides drift slower). Under mz_shuffle, a decoy peptide is placed on a feature that belongs to a peptide of systematically different mass (the derangement enforces a large mass gap). The observed CCS at that feature reflects the feature peptide's mass, while the predicted CCS from IM2Deep reflects the decoy peptide's mass. The raw delta (`im2deep_delta_ccs`, `im2deep_abs_delta_ccs_pct`, `im2deep_ccs_zscore`, `im2deep_ccs_rank`) therefore encodes the mass gap, not a conformational mismatch — creating a trivial discriminator that does not exist for real isobaric false positives. Mobility-gated colocalization features (`isotope_colocalization_*_mob`, `adduct_colocalization_*_mob`) are also affected because they filter the shared co-located ion image through each candidate's own predicted 1/K0 window; the decoy's window misses the real feature's peak.
+
+**Mitigation.** For `mz_shuffle`, the pipeline automatically excludes `_MZ_SHUFFLE_CCS_LEAK_FEATURES` (raw CCS scalars and mobility-gated colocalization) from the ranker and uses only the m/z-detrended residual features (`*_resid`). The residuals subtract the expected CCS difference due to the m/z gap (fitted as a power-law `CCS = A · mz^B` on calibration peptides), leaving only the conformational mismatch — which is exchangeable with a real isobaric false positive. A diagnostic log line reports `|corr(raw Δ, decoy_delta_da)|` vs `|corr(residual Δ, decoy_delta_da)|`; the residual should be near 0.
+
+---
+
+### 5. `protein_coverage` pinned at 1.0 for decoys (historical, now fixed)
+
+**Affected versions:** before the symmetric numerator + true-digest denominator fix.
+
+**Why it arose.** The original `protein_coverage = protein_n_features / protein_tryptic_count` leaked the target/decoy label: each decoy peptide is placed on exactly one feature by construction (`mz_shift`/`mz_shuffle`), so `protein_n_features` equalled the candidate count for every decoy protein, and since `protein_tryptic_count` was the candidate-pool count (not the full digest), coverage was pinned to exactly 1.0. Targets matching several near-isobaric features could exceed 1.0. The LDA therefore trivially separated targets from decoys on this feature.
+
+**Current state.** Fixed: the numerator counts distinct observed *peptides* (symmetric, because target and DECOY_ protein share the same peptide set) and the denominator is the true full-tryptic-digest count per protein (from `peptide_db`, applied in `pipeline.py` just before Step 6). Coverage ∈ (0, 1], symmetric, and non-degenerate across proteins.
+
+---
+
+### 6. mz_shuffle target multiplicity creating a ~2:1 T:D imbalance (historical, now fixed)
+
+**Affected versions:** before the target-dedup fix in `generate_mz_shuffle_candidates`.
+
+**Why it arose.** A target peptide whose [M+H]+ m/z falls within `matching_ppm` of several MALDI features contributed one target row per feature, but the derangement assigned it only one decoy (one relocated feature). A 1,398-feature run produced a 5901:2895 imbalance (~2:1). The excess target rows had no co-located decoy, so the per-feature winner competition was effectively uncontested for those targets, inflating identifications without a valid null.
+
+**Current state.** Fixed: targets are deduplicated to one representative row per unique peptide (lowest `|ppm_error|`) before the derangement is built and the combined frame is returned. No unique peptide identification is lost; only redundant near-isobaric secondary matches are dropped.
+
+---
+
 ## Configuration
 
 MSI-PICASSO uses `cascade_config` for hierarchical configuration. Priority (lowest to highest):

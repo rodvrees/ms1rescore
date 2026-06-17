@@ -158,6 +158,61 @@ def _recompute_ppm_from_centroids(
     return ppm
 
 
+# Protein colocalization features are Pearson r aggregates (higher = more target-like
+# protein co-distribution). A candidate whose MALDI feature has *no signal* (constant
+# ion image) has an undefined correlation -> NaN, which the scoring imputer would fill
+# with the column median, i.e. an *average* coloc value, silently rewarding a
+# zero-evidence candidate. Mirror the ppm worst-case fill in _recompute_ppm_from_centroids:
+# set those NaNs to the worst in-distribution value (the pooled finite minimum) so a
+# no-signal candidate is penalised on coloc rather than imputed up to average.
+_PROTEIN_COLOC_WORST_PREFIXES = (
+    "protein_colocalization",
+    "protein_patch_colocalization",
+    "protein_nmf_colocalization",
+)
+
+
+def _fill_nosignal_coloc_worst_case(features_df: pd.DataFrame) -> pd.DataFrame:
+    """Worst-case fill of protein-colocalization NaNs for zero-signal candidates only.
+
+    Symmetry: the no-signal mask is read from ``feature_intensity_sum`` (the ion image
+    alone, an ``is_decoy``-blind quantity that a co-located target/decoy pair share under
+    mz_shuffle), and the fill constant is the pooled finite minimum over all candidates,
+    so both the mask and the value are label-blind and no target/decoy asymmetry is
+    introduced. Only no-signal rows are touched; NaNs from a single-feature protein (no
+    within-protein partner) are left for the downstream median imputer, since those are
+    "coloc undefined", not "no evidence".
+    """
+    if "feature_intensity_sum" not in features_df.columns:
+        return features_df
+    no_signal = ~(features_df["feature_intensity_sum"] > 0)  # True for 0, NaN, negative
+    if not no_signal.any():
+        return features_df
+    cols = [
+        c
+        for c in features_df.columns
+        if c.startswith(_PROTEIN_COLOC_WORST_PREFIXES) and not c.endswith("_n_partners")
+    ]
+    n_filled = 0
+    for c in cols:
+        finite = features_df[c][np.isfinite(features_df[c])]
+        if finite.empty:
+            continue
+        worst = float(finite.min())
+        fill_mask = no_signal & ~np.isfinite(features_df[c])
+        n = int(fill_mask.sum())
+        if n:
+            features_df.loc[fill_mask, c] = worst
+            n_filled += n
+    if cols:
+        logger.info(
+            f"  No-signal coloc fill: set {n_filled} NaN entries across {len(cols)} "
+            f"protein-colocalization columns to the worst-case (pooled min) for "
+            f"{int(no_signal.sum())} zero-signal candidates (symmetric, is_decoy-blind)."
+        )
+    return features_df
+
+
 def compute_lcms_prior(
     candidates_df: pd.DataFrame,
     present_lcms_features: list[str],
@@ -350,6 +405,15 @@ _BEST_FEAT_SKIP: frozenset[str] = frozenset({
 })
 
 
+def _encode_labels(is_decoy, positive_mask):
+    """Three-valued semi-supervised labels: -1 for decoys, +1 for positive
+    targets (``positive_mask`` True), 0 for unlabelled targets. int8."""
+    return np.where(
+        is_decoy, np.int8(-1),
+        np.where(positive_mask, np.int8(1), np.int8(0)),
+    ).astype(np.int8)
+
+
 def _find_best_feature_labels(
     X: np.ndarray,
     is_decoy: np.ndarray,
@@ -450,10 +514,7 @@ def _find_best_feature_labels(
                         n_pass = int(((~is_decoy) & (q <= init_fdr)).sum())
                         if n_pass > pair_best_n:
                             pair_best_n = n_pass
-                            pair_best_labels = np.where(
-                                is_decoy, np.int8(-1),
-                                np.where(q <= init_fdr, np.int8(1), np.int8(0)),
-                            ).astype(np.int8)
+                            pair_best_labels = _encode_labels(is_decoy, q <= init_fdr)
                             sign_str = "+" if sign == +1 else "-"
                             pair_best_name = (
                                 f"{feature_names[gi]} {sign_str} {feature_names[gj]}"
@@ -470,10 +531,7 @@ def _find_best_feature_labels(
         return None
 
     assert best_q is not None
-    labels = np.where(
-        is_decoy, np.int8(-1),
-        np.where(best_q <= init_fdr, np.int8(1), np.int8(0)),
-    ).astype(np.int8)
+    labels = _encode_labels(is_decoy, best_q <= init_fdr)
     return labels, feature_names[best_j], best_n
 
 
@@ -667,14 +725,10 @@ def _rescore_linear(
                 init_mask = (
                     is_target & (ppm_col < ppm_col[is_target].quantile(r1_seed_percentile))
                 ).values
-            labels = np.where(
-                is_decoy, np.int8(-1), np.where(init_mask, np.int8(1), np.int8(0))
-            ).astype(np.int8)
+            labels = _encode_labels(is_decoy, init_mask)
     else:
         seed_arr = seed_mask.values if hasattr(seed_mask, "values") else np.asarray(seed_mask)
-        labels = np.where(
-            is_decoy, np.int8(-1), np.where(seed_arr, np.int8(1), np.int8(0))
-        ).astype(np.int8)
+        labels = _encode_labels(is_decoy, seed_arr)
 
     n_seed = int((labels == 1).sum())
     logger.info(f"  {_tag}: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
@@ -725,10 +779,7 @@ def _rescore_linear(
             scores, pipe = _cv_semisup_scores(X_fit, labels, fold_ids, _make_pipe)
 
         q_values = _tdc_qvalues(scores, is_decoy)
-        new_labels = np.where(
-            is_decoy, np.int8(-1),
-            np.where(q_values <= train_fdr, np.int8(1), np.int8(0)),
-        ).astype(np.int8)
+        new_labels = _encode_labels(is_decoy, q_values <= train_fdr)
         n_new = int((new_labels == 1).sum())
 
         logger.info(
@@ -892,14 +943,10 @@ def _rescore_qda(
                 init_mask = (
                     is_target & (ppm_col < ppm_col[is_target].quantile(r1_seed_percentile))
                 ).values
-            labels = np.where(
-                is_decoy, np.int8(-1), np.where(init_mask, np.int8(1), np.int8(0))
-            ).astype(np.int8)
+            labels = _encode_labels(is_decoy, init_mask)
     else:
         seed_arr = seed_mask.values if hasattr(seed_mask, "values") else np.asarray(seed_mask)
-        labels = np.where(
-            is_decoy, np.int8(-1), np.where(seed_arr, np.int8(1), np.int8(0))
-        ).astype(np.int8)
+        labels = _encode_labels(is_decoy, seed_arr)
 
     n_seed = int((labels == 1).sum())
     logger.info(f"  QDA: seed positives = {n_seed}, decoys = {is_decoy.sum()}")
@@ -941,10 +988,7 @@ def _rescore_qda(
             scores, pipe = _cv_semisup_scores(X, labels, fold_ids, _make_pipe)
 
         q_values = _tdc_qvalues(scores, is_decoy)
-        new_labels = np.where(
-            is_decoy, np.int8(-1),
-            np.where(q_values <= train_fdr, np.int8(1), np.int8(0)),
-        ).astype(np.int8)
+        new_labels = _encode_labels(is_decoy, q_values <= train_fdr)
         n_new = int((new_labels == 1).sum())
 
         logger.info(
@@ -1360,6 +1404,7 @@ def rescore(
     patch_coloc: bool = False,
     patch_size: int = 10,
     patch_coloc_threshold: float = 0.5,
+    drop_zero_signal: bool = False,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -2200,6 +2245,32 @@ def rescore(
         patch_size=patch_size,
         patch_coloc_threshold=patch_coloc_threshold,
     )
+    # Worst-case fill of protein-colocalization NaNs for zero-signal candidates, so a
+    # feature with no MALDI signal is penalised rather than median-imputed to an average
+    # coloc value (see _fill_nosignal_coloc_worst_case for the symmetry argument).
+    features_df = _fill_nosignal_coloc_worst_case(features_df)
+    # --- Optional zero-signal candidate removal (drop_zero_signal) ---
+    # Under raw-query mode every candidate gets a genuine extraction attempt; a zero
+    # feature_intensity_sum means no signal was detected at that m/z across all pixels.
+    # Such candidates carry no MALDI evidence and, under mz_shuffle, their co-located
+    # target/decoy pair diverge only on peptide_length (AUC 0.91 in the zero-signal
+    # subpopulation), which leaks the mass-sorted derangement into the FDR.  Dropping
+    # them is symmetric: the mask is is_decoy-blind (feature_intensity_sum is shared
+    # between co-located target+decoy under mz_shuffle, and drawn from the same ion
+    # image for all other decoy methods), so target and decoy counts drop in lock-step.
+    if drop_zero_signal and "feature_intensity_sum" in features_df.columns:
+        _no_signal = ~(features_df["feature_intensity_sum"] > 0)
+        n_drop = int(_no_signal.sum())
+        if n_drop:
+            _n_t = int(_no_signal[~features_df["is_decoy"]].sum())
+            _n_d = int(_no_signal[features_df["is_decoy"]].sum())
+            features_df = features_df[~_no_signal].reset_index(drop=True)
+            logger.info(
+                f"  drop_zero_signal: removed {n_drop} zero-signal candidates "
+                f"({_n_t} targets + {_n_d} decoys)."
+            )
+        else:
+            logger.info("  drop_zero_signal: no zero-signal candidates found.")
     # Resolve the set of features explicitly excluded from the ranker: the
     # user-supplied features_exclude plus, for mz_shuffle, the raw CCS + mobility-
     # gated colocalization features that leak the m/z baseline (see the ranker

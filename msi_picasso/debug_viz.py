@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _save_and_close(fig, path, dpi=120):
+    """Save a figure with the standard tight bounding box and close it."""
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _sample_subset(
     features_df: pd.DataFrame,
     result_df: pd.DataFrame,
@@ -391,8 +397,7 @@ def plot_ion_image_colocalization(
             plt.tight_layout()
             _prot_tag = _safe_fname(str(protein)) if protein else _safe_fname(peptide)
             fname = f"{td}_{rank:03d}_{_prot_tag}.png"
-            fig.savefig(os.path.join(out_dir, fname), dpi=100, bbox_inches="tight")
-            plt.close(fig)
+            _save_and_close(fig, os.path.join(out_dir, fname), dpi=100)
             n_saved += 1
         except Exception as _row_exc:
             logger.debug(
@@ -835,8 +840,7 @@ def plot_feature_diagnostics(
         fig.suptitle(_candidate_title(row), fontsize=9, y=1.01)
         plt.tight_layout()
         fname = f"{prefix}_{td}_{rank:03d}_{_safe_fname(peptide)}_{feature_mz:.4f}.png" if feature_mz is not None else f"{prefix}_{td}_{rank:03d}_{_safe_fname(peptide)}.png"
-        fig.savefig(os.path.join(out_dir, fname), dpi=100, bbox_inches="tight")
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, fname), dpi=100)
 
 
 # ---------------------------------------------------------------------------
@@ -986,8 +990,7 @@ def plot_isotope_envelope_figures(
             if feature_mz is not None
             else f"{prefix}_{td}_{rank:03d}_{_safe_fname(peptide)}.png"
         )
-        fig.savefig(os.path.join(out_dir, fname), dpi=100, bbox_inches="tight")
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, fname), dpi=100)
 
 
 # ---------------------------------------------------------------------------
@@ -1115,11 +1118,7 @@ def plot_feature_importance(
             )
 
         plt.tight_layout()
-        fig.savefig(
-            os.path.join(out_dir, f"{model_name}_{suffix}_feature_importance.png"),
-            dpi=100, bbox_inches="tight",
-        )
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, f"{model_name}_{suffix}_feature_importance.png"), dpi=100)
 
     _one(importances_r1, names_r1, "round1",
          struct_coefs=structure_coefs_r1, struct_names=structure_names_r1)
@@ -1284,11 +1283,7 @@ def plot_feature_distributions(
 
         ax_bot.set_xlabel(feat_col, fontsize=8)
         plt.tight_layout()
-        fig.savefig(
-            os.path.join(out_dir, f"{_safe_fname(feat_col, maxlen=80)}.png"),
-            dpi=100, bbox_inches="tight",
-        )
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, f"{_safe_fname(feat_col, maxlen=80)}.png"), dpi=100)
 
 
 # ---------------------------------------------------------------------------
@@ -1443,8 +1438,7 @@ def plot_ccs_scatter(
     ax.set_title(title, fontsize=9)
     ax.legend(fontsize=7, markerscale=1.5)
     plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, filename), dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, filename))
 
 
 # ---------------------------------------------------------------------------
@@ -1526,11 +1520,7 @@ def plot_ids_vs_fdr(
     ax.legend(fontsize=9)
     ax.grid(True, lw=0.4, alpha=0.4)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "ids_vs_fdr.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "ids_vs_fdr.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -1679,11 +1669,7 @@ def plot_protein_colocalization_by_group(
         fontsize=10, y=1.02,
     )
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "protein_colocalization_by_group.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "protein_colocalization_by_group.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -1832,11 +1818,7 @@ def plot_target_decoy_mz_distribution(
 
     fig.suptitle("Target vs Decoy m/z Distributions", fontsize=11)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "target_decoy_mz_distribution.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "target_decoy_mz_distribution.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -1994,11 +1976,7 @@ def plot_candidate_competition(
     ax.legend(fontsize=7, loc="upper right")
 
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "candidate_competition.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "candidate_competition.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2174,11 +2152,7 @@ def plot_score_pp(
 
     fig.suptitle("Score PP plot: target vs decoy empirical CDFs", fontsize=11)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "score_pp_plot.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "score_pp_plot.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2319,11 +2293,7 @@ def plot_score_distributions(
 
     fig.suptitle("Score distributions — target vs decoy", fontsize=11)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "score_distributions.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "score_distributions.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2399,8 +2369,7 @@ def _save_gt_not_found_figures(peptides: list[str], subdirs: list[str]) -> None:
             ax.axis("off")
             fig.suptitle(f"GT: {pep}", fontsize=10)
             fname = f"GT_T_000_{_safe_fname(pep)}.png"
-            fig.savefig(os.path.join(sub, fname), dpi=80, bbox_inches="tight")
-            plt.close(fig)
+            _save_and_close(fig, os.path.join(sub, fname), dpi=80)
 
 
 # ---------------------------------------------------------------------------
@@ -2554,8 +2523,7 @@ def plot_pep_mixture(
         f"PEP — {model_name} {_winner_lbl} (n={len(scores_f)}) [{title_suffix}]"
     )
     plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "pep_mixture.png"), dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "pep_mixture.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2684,11 +2652,7 @@ def plot_ion_image_pearson_distribution(
     )
     ax.legend(fontsize=9)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "ion_image_pearson_distribution.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "ion_image_pearson_distribution.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2831,11 +2795,7 @@ def plot_protein_spatial_coherence(
     ax.set_xlim(left=0.0)
     ax.legend(fontsize=8)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "protein_spatial_coherence.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "protein_spatial_coherence.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -3121,8 +3081,7 @@ def debug_pfm_explanations(
             if np.isfinite(feature_mz)
             else f"{rank:03d}_{_safe_fname(peptide)}_{kind}.png"
         )
-        fig.savefig(os.path.join(out_dir, fname), dpi=110, bbox_inches="tight")
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, fname), dpi=110)
 
         srow = {
             "peptide": peptide,

@@ -18,6 +18,75 @@ logger = logging.getLogger(__name__)
 FEATURE_COVERAGE_TARGET = 0.95
 
 
+def _assign_mass_columns(df, sequences=None, log=False):
+    """Compute mass + elemental composition and assign the 7 columns onto ``df``
+    in place (``mass``, ``mh_mz``, ``n_C``, ``n_H``, ``n_N``, ``n_O``, ``n_S``).
+
+    Uses the Rust ``compute_peptide_masses`` backend if importable, else the
+    pyteomics fallback. Behaviour is identical to the blocks previously inlined
+    in ``digest_fasta`` / ``load_entrapment_candidates`` /
+    ``generate_balanced_shuffle_candidates`` / ``digest_identified_proteins``.
+    When ``log`` is True the same two info lines are emitted as before.
+    """
+    if sequences is None:
+        sequences = df["peptide"].tolist()
+    try:
+        from ms1rescore_rs import compute_peptide_masses
+
+        masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(sequences)
+        cols = {"mass": masses, "mh_mz": mh_mzs, "n_C": n_cs, "n_H": n_hs,
+                "n_N": n_ns, "n_O": n_os, "n_S": n_ss}
+        if log:
+            logger.info("  (used Rust backend for mass computation)")
+    except ImportError:
+        if log:
+            logger.info("  (using pyteomics for mass computation)")
+        masses_list = []
+        for seq in sequences:
+            try:
+                comp = mass.Composition(sequence=seq)
+                pep_mass = mass.calculate_mass(composition=comp)
+                masses_list.append({
+                    "mass": pep_mass, "mh_mz": pep_mass + PROTON,
+                    "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
+                    "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
+                    "n_S": comp.get("S", 0),
+                })
+            except Exception:
+                masses_list.append({
+                    "mass": 0, "mh_mz": 0, "n_C": 0, "n_H": 0,
+                    "n_N": 0, "n_O": 0, "n_S": 0,
+                })
+        mass_df = pd.DataFrame(masses_list)
+        cols = {col: mass_df[col].values for col in mass_df.columns}
+    for col, vals in cols.items():
+        df[col] = vals
+
+
+def _add_protein_count_features(result, target_candidates):
+    """Add ``n_candidates``, ``protein_n_features`` and (when available)
+    ``protein_tryptic_count`` to a combined target+decoy frame, in place.
+
+    ``protein_tryptic_count`` is the full-digest peptide count per protein;
+    decoys carry a ``DECOY_``-prefixed protein, so the prefix is stripped to
+    inherit the source protein's count (keeps ``protein_coverage`` symmetric
+    between a protein and its decoy). Shared by the mz_shift / mz_shuffle paths.
+    """
+    result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")
+    prot_feat_count = result.groupby("protein")["feature_mz"].nunique()
+    result["protein_n_features"] = result["protein"].map(prot_feat_count).fillna(0).astype(int)
+    if "protein_tryptic_count" in target_candidates.columns:
+        prot_tryptic = (
+            target_candidates.drop_duplicates(subset=["protein"])
+            .set_index("protein")["protein_tryptic_count"]
+            .to_dict()
+        )
+        _base_prot = result["protein"].astype(str).str.replace(r"^DECOY_", "", regex=True)
+        result["protein_tryptic_count"] = (
+            _base_prot.map(prot_tryptic).fillna(0).astype(int)
+        )
+
+
 def _shuffle_protein(seq: str, random_state: int = 42) -> str:
     """
     Shuffle non-K/R residues of a protein sequence randomly while keeping
@@ -100,40 +169,7 @@ def digest_fasta(
         logger.debug("  Removed %d decoy sequences identical to a target peptide", n_removed)
 
     # Phase 2: Compute masses + elemental composition (Rust if available, else pyteomics)
-    sequences = df["peptide"].tolist()
-    try:
-        from ms1rescore_rs import compute_peptide_masses
-
-        masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(sequences)
-        df["mass"] = masses
-        df["mh_mz"] = mh_mzs
-        df["n_C"] = n_cs
-        df["n_H"] = n_hs
-        df["n_N"] = n_ns
-        df["n_O"] = n_os
-        df["n_S"] = n_ss
-        logger.info("  (used Rust backend for mass computation)")
-    except ImportError:
-        logger.info("  (using pyteomics for mass computation)")
-        masses_list = []
-        for seq in sequences:
-            try:
-                comp = mass.Composition(sequence=seq)
-                pep_mass = mass.calculate_mass(composition=comp)
-                masses_list.append({
-                    "mass": pep_mass, "mh_mz": pep_mass + PROTON,
-                    "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
-                    "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
-                    "n_S": comp.get("S", 0),
-                })
-            except Exception:
-                masses_list.append({
-                    "mass": 0, "mh_mz": 0, "n_C": 0, "n_H": 0,
-                    "n_N": 0, "n_O": 0, "n_S": 0,
-                })
-        mass_df = pd.DataFrame(masses_list)
-        for col in mass_df.columns:
-            df[col] = mass_df[col].values
+    _assign_mass_columns(df, log=True)
 
     # Remove peptides with unknown amino acids (mass=0)
     df = df[df["mass"] > 0].reset_index(drop=True)
@@ -491,22 +527,7 @@ def generate_mz_shift_candidates(
     # --- Combine and recompute per-feature / per-protein statistics ---
     result = pd.concat([target_candidates, decoy_df], ignore_index=True)
     result["is_decoy"] = result["is_decoy"].astype(bool)
-    result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")
-    prot_feat_count = result.groupby("protein")["feature_mz"].nunique()
-    result["protein_n_features"] = result["protein"].map(prot_feat_count).fillna(0).astype(int)
-    # protein_tryptic_count is the full-digest peptide count per protein; decoys carry
-    # a DECOY_-prefixed protein, so strip the prefix to inherit the source protein's
-    # count (keeps protein_coverage symmetric between a protein and its decoy).
-    if "protein_tryptic_count" in target_candidates.columns:
-        prot_tryptic = (
-            target_candidates.drop_duplicates(subset=["protein"])
-            .set_index("protein")["protein_tryptic_count"]
-            .to_dict()
-        )
-        _base_prot = result["protein"].astype(str).str.replace(r"^DECOY_", "", regex=True)
-        result["protein_tryptic_count"] = (
-            _base_prot.map(prot_tryptic).fillna(0).astype(int)
-        )
+    _add_protein_count_features(result, target_candidates)
 
     logger.info(
         "mz_shift: %d features → %d target + %d decoy candidates",
@@ -638,19 +659,7 @@ def generate_mz_shuffle_candidates(
     # lowest-|ppm| match is kept).
     result = pd.concat([best, decoy_df], ignore_index=True)
     result["is_decoy"] = result["is_decoy"].astype(bool)
-    result["n_candidates"] = result.groupby("feature_mz")["feature_mz"].transform("count")
-    prot_feat_count = result.groupby("protein")["feature_mz"].nunique()
-    result["protein_n_features"] = result["protein"].map(prot_feat_count).fillna(0).astype(int)
-    if "protein_tryptic_count" in target_candidates.columns:
-        prot_tryptic = (
-            target_candidates.drop_duplicates(subset=["protein"])
-            .set_index("protein")["protein_tryptic_count"]
-            .to_dict()
-        )
-        _base_prot = result["protein"].astype(str).str.replace(r"^DECOY_", "", regex=True)
-        result["protein_tryptic_count"] = (
-            _base_prot.map(prot_tryptic).fillna(0).astype(int)
-        )
+    _add_protein_count_features(result, target_candidates)
 
     logger.info(
         "mz_shuffle: %d features → %d target + %d decoy candidates "
@@ -727,38 +736,7 @@ def load_entrapment_candidates(
         return pd.DataFrame()
 
     # Phase 2: masses + elemental composition (Rust if available, else pyteomics).
-    sequences = ent_db["peptide"].tolist()
-    try:
-        from ms1rescore_rs import compute_peptide_masses
-
-        masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(sequences)
-        ent_db["mass"] = masses
-        ent_db["mh_mz"] = mh_mzs
-        ent_db["n_C"] = n_cs
-        ent_db["n_H"] = n_hs
-        ent_db["n_N"] = n_ns
-        ent_db["n_O"] = n_os
-        ent_db["n_S"] = n_ss
-    except ImportError:
-        masses_list = []
-        for seq in sequences:
-            try:
-                comp = mass.Composition(sequence=seq)
-                pep_mass = mass.calculate_mass(composition=comp)
-                masses_list.append({
-                    "mass": pep_mass, "mh_mz": pep_mass + PROTON,
-                    "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
-                    "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
-                    "n_S": comp.get("S", 0),
-                })
-            except Exception:
-                masses_list.append({
-                    "mass": 0, "mh_mz": 0, "n_C": 0, "n_H": 0,
-                    "n_N": 0, "n_O": 0, "n_S": 0,
-                })
-        mass_df = pd.DataFrame(masses_list)
-        for col in mass_df.columns:
-            ent_db[col] = mass_df[col].values
+    _assign_mass_columns(ent_db)
 
     ent_db = ent_db[ent_db["mass"] > 0].reset_index(drop=True)
     n_total = len(ent_db)
@@ -1018,37 +996,7 @@ def generate_balanced_shuffle_candidates(
         round_df = pd.DataFrame(round_rows, columns=["peptide", "protein", "is_decoy"])
         round_df = round_df.drop_duplicates(subset="peptide")
 
-        seqs_list = round_df["peptide"].tolist()
-        try:
-            from ms1rescore_rs import compute_peptide_masses
-            masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(seqs_list)
-            round_df["mass"] = masses
-            round_df["mh_mz"] = mh_mzs
-            round_df["n_C"] = n_cs
-            round_df["n_H"] = n_hs
-            round_df["n_N"] = n_ns
-            round_df["n_O"] = n_os
-            round_df["n_S"] = n_ss
-        except ImportError:
-            masses_list = []
-            for seq in seqs_list:
-                try:
-                    comp = mass.Composition(sequence=seq)
-                    pm = mass.calculate_mass(composition=comp)
-                    masses_list.append({
-                        "mass": pm, "mh_mz": pm + PROTON,
-                        "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
-                        "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
-                        "n_S": comp.get("S", 0),
-                    })
-                except Exception:
-                    masses_list.append({
-                        "mass": 0, "mh_mz": 0, "n_C": 0,
-                        "n_H": 0, "n_N": 0, "n_O": 0, "n_S": 0,
-                    })
-            mass_df = pd.DataFrame(masses_list)
-            for col in mass_df.columns:
-                round_df[col] = mass_df[col].values
+        _assign_mass_columns(round_df)
 
         round_df = round_df[round_df["mass"] > 0].reset_index(drop=True)
         if len(round_df) == 0:
@@ -1341,40 +1289,7 @@ def digest_identified_proteins(
     # --- Step 3: Compute masses (Rust if available, else pyteomics) ---
     sequences = df["peptide"].tolist()
     if sequences:
-        try:
-            from ms1rescore_rs import compute_peptide_masses
-
-            masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(sequences)
-            df["mass"] = masses
-            df["mh_mz"] = mh_mzs
-            df["n_C"] = n_cs
-            df["n_H"] = n_hs
-            df["n_N"] = n_ns
-            df["n_O"] = n_os
-            df["n_S"] = n_ss
-            logger.info("  (used Rust backend for mass computation)")
-        except ImportError:
-            logger.info("  (using pyteomics for mass computation)")
-            masses_list = []
-            for seq in sequences:
-                try:
-                    comp = mass.Composition(sequence=seq)
-                    pep_mass = mass.calculate_mass(composition=comp)
-                    masses_list.append({
-                        "mass": pep_mass, "mh_mz": pep_mass + PROTON,
-                        "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
-                        "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
-                        "n_S": comp.get("S", 0),
-                    })
-                except Exception:
-                    masses_list.append({
-                        "mass": 0, "mh_mz": 0, "n_C": 0, "n_H": 0,
-                        "n_N": 0, "n_O": 0, "n_S": 0,
-                    })
-            mass_df = pd.DataFrame(masses_list)
-            for col in mass_df.columns:
-                df[col] = mass_df[col].values
-
+        _assign_mass_columns(df, sequences=sequences, log=True)
         df = df[df["mass"] > 0].reset_index(drop=True)
 
     # --- Step 4: Label source (only rows from protein digest; novel rows set in Step 5) ---
@@ -1456,37 +1371,7 @@ def digest_identified_proteins(
 
             # Compute masses for novel sequences
             novel_seqs_list = novel_df["peptide"].tolist()
-            try:
-                from ms1rescore_rs import compute_peptide_masses
-
-                masses, mh_mzs, n_cs, n_hs, n_ns, n_os, n_ss = compute_peptide_masses(novel_seqs_list)
-                novel_df["mass"] = masses
-                novel_df["mh_mz"] = mh_mzs
-                novel_df["n_C"] = n_cs
-                novel_df["n_H"] = n_hs
-                novel_df["n_N"] = n_ns
-                novel_df["n_O"] = n_os
-                novel_df["n_S"] = n_ss
-            except ImportError:
-                novel_masses = []
-                for seq in novel_seqs_list:
-                    try:
-                        comp = mass.Composition(sequence=seq)
-                        pm = mass.calculate_mass(composition=comp)
-                        novel_masses.append({
-                            "mass": pm, "mh_mz": pm + PROTON,
-                            "n_C": comp.get("C", 0), "n_H": comp.get("H", 0),
-                            "n_N": comp.get("N", 0), "n_O": comp.get("O", 0),
-                            "n_S": comp.get("S", 0),
-                        })
-                    except Exception:
-                        novel_masses.append({
-                            "mass": 0, "mh_mz": 0, "n_C": 0, "n_H": 0,
-                            "n_N": 0, "n_O": 0, "n_S": 0,
-                        })
-                novel_mass_df = pd.DataFrame(novel_masses)
-                for col in novel_mass_df.columns:
-                    novel_df[col] = novel_mass_df[col].values
+            _assign_mass_columns(novel_df, sequences=novel_seqs_list)
 
             novel_df = novel_df[novel_df["mass"] > 0].reset_index(drop=True)
             novel_df["is_decoy"] = novel_df["is_decoy"].astype(bool)
