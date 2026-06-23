@@ -88,6 +88,23 @@ def _detect_imzml_mode(parser) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_pixel(ints, config):
+    """Per-pixel RMS- (priority) or TIC-normalize a float64 intensity array.
+
+    Returns the array unchanged when the chosen norm is zero or neither flag is
+    set. Shared by the mean-spectrum builders.
+    """
+    if config.normalize_rms:
+        rms = float(np.sqrt(np.mean(ints ** 2)))
+        if rms > 0.0:
+            ints = ints / rms
+    elif config.normalize_tic:
+        tic = float(ints.sum())
+        if tic > 0.0:
+            ints = ints / tic
+    return ints
+
+
 def _build_mean_spectrum(
     parser, config: SCiLSConfig
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -143,14 +160,7 @@ def _build_mean_spectrum(
         ints = np.asarray(ints, dtype=np.float64)
         if len(mzs) == 0:
             continue
-        if config.normalize_rms:
-            rms = float(np.sqrt(np.mean(ints ** 2)))
-            if rms > 0.0:
-                ints = ints / rms
-        elif config.normalize_tic:
-            tic = float(ints.sum())
-            if tic > 0.0:
-                ints = ints / tic
+        ints = _normalize_pixel(ints, config)
         indices = np.round((mzs - mz_min) / res).astype(np.intp)
         valid = (indices >= 0) & (indices < n_bins)
         np.add.at(grid_sum, indices[valid], ints[valid])
@@ -167,14 +177,7 @@ def _build_mean_spectrum_aligned(
     for i in range(n_pixels):
         _, ints = parser.getspectrum(i)
         ints = np.asarray(ints, dtype=np.float64)
-        if config.normalize_rms:
-            rms = float(np.sqrt(np.mean(ints ** 2)))
-            if rms > 0.0:
-                ints = ints / rms
-        elif config.normalize_tic:
-            tic = float(ints.sum())
-            if tic > 0.0:
-                ints = ints / tic
+        ints = _normalize_pixel(ints, config)
         acc += ints
     return mzs0, (acc / n_pixels).astype(np.float32)
 

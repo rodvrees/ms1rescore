@@ -15,8 +15,10 @@
 
         "model": {
           "type": ["string", "null"],
-          "enum": ["lda", "qda", "svm", "catboost", null]
+          "enum": ["lda", "qda", "svm", null]
         },
+        "svm_c":                  {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "single_round":           {"type": ["boolean", "null"]},
         "init_fdr":               {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "train_fdr":              {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "n_interaction_features": {"type": ["integer", "null"], "minimum": 0},
@@ -24,6 +26,7 @@
         "lda_r2_median_filter":   {"type": ["boolean", "null"]},
         "only_main_features":     {"type": ["boolean", "null"]},
         "use_protein_level_feats":{"type": ["boolean", "null"]},
+        "use_spatial_ranker_features":{"type": ["boolean", "null"]},
         "n_debug":                {"type": ["integer", "null"], "minimum": 0},
         "debug_seed":             {"type": ["integer", "null"]},
 
@@ -40,8 +43,6 @@
         "pseudo_label_fdr":       {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "r1_seed_percentile":     {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "r2_seed_percentile":     {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-        "catboost_iterations":    {"type": ["integer", "null"], "minimum": 1},
-        "mokapot_max_iter":       {"type": ["integer", "null"], "minimum": 1},
         "max_iter":               {"type": ["integer", "null"], "minimum": 1},
         "min_seed_positives":     {"type": ["integer", "null"], "minimum": 0},
         "init_ppm_threshold":     {"type": ["number", "null"], "minimum": 0},
@@ -54,8 +55,11 @@
 
         "decoy_method": {
           "type": ["string", "null"],
-          "enum": ["shuffle", "balanced_shuffle", "paired_shuffle", null]
+          "enum": ["shuffle", "mz_shift", "mz_shuffle", "entrapment", "balanced_shuffle", "paired_shuffle", null]
         },
+        "mz_shift_delta_min":          {"type": ["number", "null"], "minimum": 0},
+        "mz_shift_delta_max":          {"type": ["number", "null"], "minimum": 0},
+        "mz_shift_snap_tolerance_ppm": {"type": ["number", "null"], "minimum": 0},
         "max_shuffle_rounds":          {"type": ["integer", "null"], "minimum": 1},
         "decoy_target_ratio":          {"type": ["number", "null"], "minimum": 0},
 
@@ -69,6 +73,7 @@
 
         "fasta":            {"type": ["string", "null"]},
         "extra_fasta":      {"type": ["string", "null"]},
+        "entrapment_fasta": {"type": ["string", "null"]},
         "mzml":             {"type": ["array", "null"], "items": {"type": "string"}},
         "maldi_npz":        {"type": ["string", "null"]},
         "maldi_mzs":        {"type": ["string", "null"]},
@@ -100,7 +105,7 @@
             "finetune_patience":   {"type": "integer", "minimum": 1}
           }
         },
-        "matching_ppm":        {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "matching_ppm":        {"type": ["number", "null"], "minimum": 0},
         "fragment_tol_da":     {"type": ["number", "null"], "exclusiveMinimum": 0},
         "winner_percentile":   {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "rt_window_multiplier":{"type": ["number", "null"], "minimum": 0},
@@ -108,8 +113,18 @@
         "spatial_prior_weight":{"type": ["number", "null"], "minimum": 0},
         "match_ccs":              {"type": ["boolean", "null"]},
         "ccs_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
+        "maldi_query_raw":        {"type": ["boolean", "null"]},
         "mob_coloc":              {"type": ["boolean", "null"]},
         "mob_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
+        "coloc_tic_quantile":     {"type": ["number", "null"], "minimum": 0, "exclusiveMaximum": 1},
+        "nmf_coloc":              {"type": ["boolean", "null"]},
+        "nmf_n_components":       {"type": ["integer", "null"], "minimum": 2},
+        "patch_coloc":            {"type": ["boolean", "null"]},
+        "patch_size":             {"type": ["integer", "null"], "minimum": 1},
+        "patch_coloc_threshold":  {"type": ["number", "null"], "minimum": -1, "maximum": 1},
+        "drop_zero_signal":       {"type": ["boolean", "null"]},
+        "entrapment":             {"type": ["boolean", "null"]},
+        "coloc_measured_mask":    {"type": ["boolean", "null"]},
         "deeplc_finetune_epochs":   {"type": ["integer", "null"], "minimum": 1},
         "deeplc_finetune_lr":       {"type": ["number",  "null"], "minimum": 0},
         "deeplc_finetune_patience": {"type": ["integer", "null"], "minimum": 1},
@@ -121,7 +136,7 @@
           "properties": {
             "ppm_bin":                   {"type": "number", "exclusiveMinimum": 0},
             "extraction_ppm":            {"type": "number", "exclusiveMinimum": 0},
-            "matching_ppm":              {"type": "number", "exclusiveMinimum": 0},
+            "matching_ppm":              {"type": "number", "minimum": 0},
             "min_fraction":              {"type": "number", "minimum": 0, "maximum": 1},
             "peak_prominence":           {"type": "number", "minimum": 0},
             "smoothing_window":          {"type": "integer", "minimum": 1},

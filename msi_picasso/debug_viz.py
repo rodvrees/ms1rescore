@@ -2,8 +2,8 @@
 Debug visualization for the MALDI-MSI rescoring pipeline.
 
 Fourteen subsystems:
-  1. Ion image colocalization  — per-candidate precursor + ALL same-protein co-feature images
-  2. Feature diagnostics       — per-candidate 3×3 panel figure
+  1. Ion image colocalization  — per-candidate precursor + ALL same-protein co-feature images; each panel framed by ID FDR (dark green ≤1%, light green ≤5%, white otherwise)
+  2. Feature diagnostics       — per-candidate 4×3 panel figure (incl. m/z-detrended CCS, ion-image colocalization, theoretical isotope/mass defect)
   3. Isotope envelopes         — per-candidate spectrum-style envelope comparison
   4. Feature importance        — global sorted bar plots (rounds 1 and 2)
   5. Feature distributions     — per-feature target/decoy histograms (all + R2)
@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _save_and_close(fig, path, dpi=120):
+    """Save a figure with the standard tight bounding box and close it."""
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
 
 def _sample_subset(
     features_df: pd.DataFrame,
@@ -198,6 +204,24 @@ def _get(row: pd.Series, col: str) -> float:
     return v
 
 
+def _fdr_frame_color(
+    qval: float, fdr_strict: float = 0.01, fdr_loose: float = 0.05
+) -> str:
+    """Frame colour for an ion-image panel by the identified peptide's FDR:
+    dark green at q ≤ 1%, light green at q ≤ 5%, white otherwise (incl. NaN)."""
+    try:
+        q = float(qval)
+    except (TypeError, ValueError):
+        return "white"
+    if not np.isfinite(q):
+        return "white"
+    if q <= fdr_strict:
+        return "#006400"  # dark green
+    if q <= fdr_loose:
+        return "#90EE90"  # light green
+    return "white"
+
+
 # ---------------------------------------------------------------------------
 # Subsystem 1: Ion image colocalization
 # ---------------------------------------------------------------------------
@@ -254,15 +278,22 @@ def plot_ion_image_colocalization(
     feature_peptides: dict | None = None,
 ) -> None:
     """
-    Per-candidate figure: precursor ion image + ALL same-protein co-feature images
-    (ranked by reweighted q-value ascending) + protein mean.
+    One figure **per protein** (the caller collapses ``subset`` to one
+    representative row — the lowest-q peptide — per protein): the representative
+    feature's ion image + ALL same-protein co-feature images (ranked by
+    reweighted q-value ascending) + protein mean. Per-peptide figures of the same
+    protein would show the identical feature set in a different order, so only the
+    protein-level figure is emitted.
 
     Co-feature panels show the same-protein candidate peptide as the label.  When
     a different-protein peptide is the TDC winner at that feature, it is annotated
     as "(not winner: <winner>)" so mass-coincidence competitors are visible.
 
-    Files are saved as ``{out_dir}/{rank:03d}_{peptide}_{feature_mz:.4f}.png``.
-    Panels are arranged in a grid of up to 8 columns.
+    Files are saved as ``{out_dir}/{T|D}_{rank:03d}_{protein}.png`` (rank = protein
+    rank by best q-value).
+    Panels are arranged in a grid of up to 8 columns.  Each ion-image panel is
+    framed by the identified peptide's FDR at that feature (``feature_qvals``):
+    dark green at q ≤ 1%, light green at q ≤ 5%, white (no frame) otherwise.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -330,21 +361,33 @@ def plot_ion_image_colocalization(
             )
             axes = _axes_grid.ravel()
 
-            def _panel(ax: plt.Axes, img: np.ndarray, title: str, r: float | None = None) -> None:
+            def _panel(
+                ax: plt.Axes, img: np.ndarray, title: str,
+                r: float | None = None, qval: float = float("nan"),
+            ) -> None:
                 im = ax.imshow(img, cmap="hot", aspect="auto")
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 cap = title if r is None else f"{title}\nr={r:.2f}"
                 ax.set_title(cap, fontsize=7)
-                ax.axis("off")
+                # FDR-coded frame: dark green at ≤1% FDR, light green at ≤5%, white otherwise.
+                ax.set_xticks([])
+                ax.set_yticks([])
+                color = _fdr_frame_color(qval)
+                lw = 0.0 if color == "white" else 3.5
+                for spine in ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_color(color)
+                    spine.set_linewidth(lw)
 
             _prec_q = feature_qvals.get(feature_mz, float("nan")) if feature_qvals else float("nan")
             _prec_q_s = f"\nq={_prec_q:.3f}" if np.isfinite(_prec_q) else ""
-            _panel(axes[0], prec_img, f"Precursor\n{feature_mz:.4f}{_prec_q_s}")
+            _panel(axes[0], prec_img, f"Precursor\n{feature_mz:.4f}{_prec_q_s}", qval=_prec_q)
             for i, (cimg, cmz, clabel) in enumerate(zip(co_imgs, co_mzs, co_pep_labels)):
                 _q = feature_qvals.get(cmz, float("nan")) if feature_qvals else float("nan")
                 _q_s = f"\nq={_q:.3f}" if np.isfinite(_q) else ""
                 _co_pep_s = f"\n{clabel}" if clabel else ""
-                _panel(axes[1 + i], cimg, f"{cmz:.4f}{_co_pep_s}{_q_s}", r=_pearson_r(prec_img, cimg))
+                _panel(axes[1 + i], cimg, f"{cmz:.4f}{_co_pep_s}{_q_s}",
+                       r=_pearson_r(prec_img, cimg), qval=_q)
             _panel(axes[n_panels - 1], prot_mean, f"Protein mean\n({len(all_imgs)} imgs)",
                    r=_pearson_r(prec_img, prot_mean))
             for ax in axes[n_panels:]:
@@ -352,9 +395,9 @@ def plot_ion_image_colocalization(
 
             fig.suptitle(_candidate_title(row), fontsize=8, y=1.01)
             plt.tight_layout()
-            fname = f"{prefix}_{td}_{rank:03d}_{_safe_fname(peptide)}_{feature_mz:.4f}.png"
-            fig.savefig(os.path.join(out_dir, fname), dpi=100, bbox_inches="tight")
-            plt.close(fig)
+            _prot_tag = _safe_fname(str(protein)) if protein else _safe_fname(peptide)
+            fname = f"{td}_{rank:03d}_{_prot_tag}.png"
+            _save_and_close(fig, os.path.join(out_dir, fname), dpi=100)
             n_saved += 1
         except Exception as _row_exc:
             logger.debug(
@@ -388,7 +431,7 @@ def plot_feature_diagnostics(
     out_dir: str,
 ) -> None:
     """
-    Per-candidate 3×3 diagnostic figure.
+    Per-candidate 4×3 diagnostic figure.
 
     Panels:
       [0,0] Ion image heatmap + fraction_detected / CV / Moran's I
@@ -400,6 +443,14 @@ def plot_feature_diagnostics(
       [2,0] CHCA cluster proximity gauge (chca_cluster_distance_ppm)
       [2,1] CHCA adduct colocalization (ion image thumbnails or Pearson r gauge)
       [2,2] Monoisotopic confidence gauge (monoisotopic_confidence)
+      [3,0] CCS: raw vs m/z-detrended (``im2deep_*`` vs ``im2deep_*_resid``)
+      [3,1] Ion-image colocalization (isotopologue + adduct Pearson r, incl. ``_mob``)
+      [3,2] Theoretical isotope + mass-defect detail (bar chart)
+
+    The bottom row surfaces features introduced after the original 3×3 layout:
+    the m/z-detrended CCS variants (the ``mz_shuffle`` decoy-leak fix), the
+    isotopologue/adduct ion-image colocalizations, and the theoretical-isotope
+    and mass-defect quantities.
     """
     from msi_picasso.utils import theoretical_isotope_distribution
 
@@ -414,9 +465,9 @@ def plot_feature_diagnostics(
         rank = int(row.get("_rank", 0))
         peptide = str(row.get("peptide", "unknown"))
 
-        fig = plt.figure(figsize=(15, 12))
-        gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.55, wspace=0.38)
-        ax = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(3)]
+        fig = plt.figure(figsize=(15, 16))
+        gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.6, wspace=0.38)
+        ax = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(4)]
 
         # ------------------------------------------------------------------
         # [0,0] Ion image
@@ -686,11 +737,110 @@ def plot_feature_diagnostics(
             ax[2][2].set_title("Monoisotopic confidence", fontsize=8)
 
         # ------------------------------------------------------------------
+        # [3,0] CCS: raw vs m/z-detrended (im2deep_* vs im2deep_*_resid)
+        # ------------------------------------------------------------------
+        # The *_resid variants subtract the expected m/z-gap CCS difference, so
+        # for relocated decoys (mz_shift / mz_shuffle / entrapment) they remove
+        # the trivial m/z-baseline separation that the raw deltas would leak.
+        _ccs_pairs = [
+            ("im2deep_delta_ccs", "im2deep_delta_ccs_resid", "Δ CCS (Å²)"),
+            ("im2deep_abs_delta_ccs_pct", "im2deep_abs_delta_ccs_pct_resid", "|Δ CCS| (%)"),
+            ("im2deep_ccs_zscore", "im2deep_ccs_zscore_resid", "CCS z-score"),
+            ("im2deep_ccs_rank", "im2deep_ccs_rank_resid", "CCS rank"),
+        ]
+        _ccs_names, _ccs_raw, _ccs_res = [], [], []
+        for raw_col, res_col, lab in _ccs_pairs:
+            rv, sv = _get(row, raw_col), _get(row, res_col)
+            if np.isfinite(rv) or np.isfinite(sv):
+                _ccs_names.append(lab)
+                _ccs_raw.append(rv if np.isfinite(rv) else 0.0)
+                _ccs_res.append(sv if np.isfinite(sv) else 0.0)
+        if _ccs_names:
+            _y = np.arange(len(_ccs_names))
+            _h = 0.38
+            ax[3][0].barh(_y + _h / 2, _ccs_raw, height=_h, color="darkorange",
+                          alpha=0.85, label="raw")
+            ax[3][0].barh(_y - _h / 2, _ccs_res, height=_h, color="teal",
+                          alpha=0.85, label="m/z-detrended")
+            ax[3][0].set_yticks(_y)
+            ax[3][0].set_yticklabels(_ccs_names, fontsize=7)
+            ax[3][0].axvline(0, color="gray", lw=0.6, ls="--")
+            ax[3][0].legend(fontsize=6, loc="best")
+        else:
+            ax[3][0].text(0.5, 0.5, "N/A", ha="center", va="center",
+                          transform=ax[3][0].transAxes, fontsize=14, color="gray")
+        ax[3][0].set_title("CCS: raw vs m/z-detrended", fontsize=8)
+
+        # ------------------------------------------------------------------
+        # [3,1] Ion-image colocalization (isotopologue + adduct Pearson r)
+        # ------------------------------------------------------------------
+        _coloc_cols = [
+            ("isotope_image_colocalization_m1", "iso M+1"),
+            ("isotope_image_colocalization_m2", "iso M+2"),
+            ("isotope_image_colocalization_mean", "iso mean"),
+            ("adduct_colocalization_na", "adduct Na"),
+            ("adduct_colocalization_k", "adduct K"),
+            ("adduct_colocalization_chca", "adduct CHCA"),
+            ("protein_colocalization", "protein (mean)"),
+            # Mobility-gated variants (raw-query / --mob-coloc only).
+            ("isotope_colocalization_mean_mob", "iso mean (mob)"),
+            ("adduct_colocalization_chca_mob", "adduct CHCA (mob)"),
+        ]
+        _cnames, _cvals = [], []
+        for col, lab in _coloc_cols:
+            v = _get(row, col)
+            if np.isfinite(v):
+                _cnames.append(lab)
+                _cvals.append(v)
+        if _cnames:
+            _ccolors = ["seagreen" if v >= 0 else "tomato" for v in _cvals]
+            ax[3][1].barh(range(len(_cnames)), _cvals, color=_ccolors, alpha=0.78)
+            ax[3][1].set_yticks(range(len(_cnames)))
+            ax[3][1].set_yticklabels(_cnames, fontsize=7)
+            ax[3][1].set_xlim(-1.0, 1.0)
+            ax[3][1].axvline(0.0, color="gray", lw=0.8, ls="--")
+            ax[3][1].axvline(0.5, color="orange", lw=0.7, ls=":", alpha=0.7)
+            ax[3][1].set_xlabel("Pearson r", fontsize=8)
+        else:
+            ax[3][1].text(0.5, 0.5, "N/A", ha="center", va="center",
+                          transform=ax[3][1].transAxes, fontsize=14, color="gray")
+        ax[3][1].set_title("Ion-image colocalization", fontsize=8)
+
+        # ------------------------------------------------------------------
+        # [3,2] Theoretical isotope + mass-defect detail
+        # ------------------------------------------------------------------
+        _theo_cols = [
+            ("theo_isotope_cosine", "iso cosine"),
+            ("theo_isotope_chi2", "iso χ²"),
+            ("theo_isotope_kl", "iso KL"),
+            ("averagine_deviation", "averagine dev"),
+            ("averagine_deviation_sulfur", "averagine dev (S)"),
+            ("theo_m1_ratio_diff", "ΔM+1 ratio"),
+            ("theo_m2_ratio_diff", "ΔM+2 ratio"),
+            ("kendrick_mass_defect", "Kendrick defect"),
+            ("mass_defect_residual", "mass-defect resid"),
+        ]
+        _tnames, _tvals = [], []
+        for col, lab in _theo_cols:
+            v = _get(row, col)
+            if np.isfinite(v):
+                _tnames.append(lab)
+                _tvals.append(v)
+        if _tnames:
+            ax[3][2].barh(range(len(_tnames)), _tvals, color="slateblue", alpha=0.78)
+            ax[3][2].set_yticks(range(len(_tnames)))
+            ax[3][2].set_yticklabels(_tnames, fontsize=7)
+            ax[3][2].axvline(0, color="gray", lw=0.6, ls="--")
+        else:
+            ax[3][2].text(0.5, 0.5, "N/A", ha="center", va="center",
+                          transform=ax[3][2].transAxes, fontsize=14, color="gray")
+        ax[3][2].set_title("Theoretical isotope + mass defect", fontsize=8)
+
+        # ------------------------------------------------------------------
         fig.suptitle(_candidate_title(row), fontsize=9, y=1.01)
         plt.tight_layout()
         fname = f"{prefix}_{td}_{rank:03d}_{_safe_fname(peptide)}_{feature_mz:.4f}.png" if feature_mz is not None else f"{prefix}_{td}_{rank:03d}_{_safe_fname(peptide)}.png"
-        fig.savefig(os.path.join(out_dir, fname), dpi=100, bbox_inches="tight")
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, fname), dpi=100)
 
 
 # ---------------------------------------------------------------------------
@@ -840,8 +990,7 @@ def plot_isotope_envelope_figures(
             if feature_mz is not None
             else f"{prefix}_{td}_{rank:03d}_{_safe_fname(peptide)}.png"
         )
-        fig.savefig(os.path.join(out_dir, fname), dpi=100, bbox_inches="tight")
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, fname), dpi=100)
 
 
 # ---------------------------------------------------------------------------
@@ -969,11 +1118,7 @@ def plot_feature_importance(
             )
 
         plt.tight_layout()
-        fig.savefig(
-            os.path.join(out_dir, f"{model_name}_{suffix}_feature_importance.png"),
-            dpi=100, bbox_inches="tight",
-        )
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, f"{model_name}_{suffix}_feature_importance.png"), dpi=100)
 
     _one(importances_r1, names_r1, "round1",
          struct_coefs=structure_coefs_r1, struct_names=structure_names_r1)
@@ -998,6 +1143,7 @@ def plot_feature_distributions(
     out_dir: str,
     feature_names: list[str] | None = None,
     gt_peptides: list[str] | None = None,
+    single_round: bool = False,
 ) -> None:
     """
     Per-feature target/decoy distribution figures.
@@ -1025,10 +1171,16 @@ def plot_feature_distributions(
         res.get("is_tdc_winner", pd.Series(False, index=res.index))
         .fillna(False).astype(bool).values
     )
-    target_mask = ~is_decoy
+    # Entrapment pseudo-targets: is_decoy=False but source=="entrapment_shuffled"
+    _src = feat.get("source", pd.Series("", index=feat.index)).fillna("").values
+    entrapment_mask = (~is_decoy) & (_src == "entrapment_shuffled")
+    has_entrapment = entrapment_mask.any()
+
+    target_mask = (~is_decoy) & (~entrapment_mask)
     decoy_mask = is_decoy
     winner_target_mask = is_winner & target_mask
     winner_decoy_mask = is_winner & decoy_mask
+    winner_ent_mask = is_winner & entrapment_mask
 
     gt_mask = np.zeros(len(feat), dtype=bool)
     if gt_peptides and "peptide" in feat.columns:
@@ -1069,7 +1221,8 @@ def plot_feature_distributions(
     feature_names = _explicit + _extra
 
     def _draw(ax: plt.Axes, t_vals: np.ndarray, d_vals: np.ndarray,
-               bins: np.ndarray, subtitle: str) -> None:
+               bins: np.ndarray, subtitle: str,
+               e_vals: np.ndarray | None = None) -> None:
         ax.set_title(subtitle, fontsize=8)
         if len(t_vals) > 0:
             ax.hist(t_vals, bins=bins, density=True, alpha=0.55,
@@ -1081,7 +1234,12 @@ def plot_feature_distributions(
                     color="tomato", label=f"Decoy (n={len(d_vals)})")
             ax.axvline(float(np.nanmedian(d_vals)), color="tomato",
                        lw=1.3, ls="--", alpha=0.85)
-        if len(t_vals) == 0 and len(d_vals) == 0:
+        if e_vals is not None and len(e_vals) > 0:
+            ax.hist(e_vals, bins=bins, density=True, alpha=0.55,
+                    color="goldenrod", label=f"Entrapment (n={len(e_vals)})")
+            ax.axvline(float(np.nanmedian(e_vals)), color="goldenrod",
+                       lw=1.3, ls="--", alpha=0.85)
+        if len(t_vals) == 0 and len(d_vals) == 0 and (e_vals is None or len(e_vals) == 0):
             ax.text(0.5, 0.5, "No data", ha="center", va="center",
                     transform=ax.transAxes, color="gray")
             return
@@ -1109,6 +1267,8 @@ def plot_feature_distributions(
         d_all = vals[decoy_mask & finite_mask]
         t_r2 = vals[winner_target_mask & finite_mask]
         d_r2 = vals[winner_decoy_mask & finite_mask]
+        e_all = vals[entrapment_mask & finite_mask] if has_entrapment else None
+        e_r2  = vals[winner_ent_mask & finite_mask]  if has_entrapment else None
         gt_vals = vals[gt_mask & finite_mask]
 
         all_finite = vals[finite_mask]
@@ -1126,21 +1286,28 @@ def plot_feature_distributions(
         fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
         fig.suptitle(feat_col, fontsize=10)
 
-        _draw(ax_top, t_all, d_all, bins,
-              f"All candidates  (T={len(t_all)}, D={len(d_all)})")
-        _draw(ax_bot, t_r2, d_r2, bins,
-              f"Round-2 candidates  (T={len(t_r2)}, D={len(d_r2)})")
+        _bot_label = "Winners" if single_round else "Round-2 candidates"
+        _e_all_n = len(e_all) if e_all is not None else 0
+        _e_r2_n  = len(e_r2)  if e_r2  is not None else 0
+        _top_title = (
+            f"All candidates  (T={len(t_all)}, D={len(d_all)}, E={_e_all_n})"
+            if has_entrapment
+            else f"All candidates  (T={len(t_all)}, D={len(d_all)})"
+        )
+        _bot_title = (
+            f"{_bot_label}  (T={len(t_r2)}, D={len(d_r2)}, E={_e_r2_n})"
+            if has_entrapment
+            else f"{_bot_label}  (T={len(t_r2)}, D={len(d_r2)})"
+        )
+        _draw(ax_top, t_all, d_all, bins, _top_title, e_vals=e_all)
+        _draw(ax_bot, t_r2, d_r2, bins, _bot_title, e_vals=e_r2)
 
         _draw_gt(ax_top, gt_vals)
         _draw_gt(ax_bot, gt_vals)
 
         ax_bot.set_xlabel(feat_col, fontsize=8)
         plt.tight_layout()
-        fig.savefig(
-            os.path.join(out_dir, f"{_safe_fname(feat_col, maxlen=80)}.png"),
-            dpi=100, bbox_inches="tight",
-        )
-        plt.close(fig)
+        _save_and_close(fig, os.path.join(out_dir, f"{_safe_fname(feat_col, maxlen=80)}.png"), dpi=100)
 
 
 # ---------------------------------------------------------------------------
@@ -1295,8 +1462,7 @@ def plot_ccs_scatter(
     ax.set_title(title, fontsize=9)
     ax.legend(fontsize=7, markerscale=1.5)
     plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, filename), dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, filename))
 
 
 # ---------------------------------------------------------------------------
@@ -1378,11 +1544,7 @@ def plot_ids_vs_fdr(
     ax.legend(fontsize=9)
     ax.grid(True, lw=0.4, alpha=0.4)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "ids_vs_fdr.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "ids_vs_fdr.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -1531,11 +1693,7 @@ def plot_protein_colocalization_by_group(
         fontsize=10, y=1.02,
     )
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "protein_colocalization_by_group.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "protein_colocalization_by_group.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -1684,11 +1842,7 @@ def plot_target_decoy_mz_distribution(
 
     fig.suptitle("Target vs Decoy m/z Distributions", fontsize=11)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "target_decoy_mz_distribution.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "target_decoy_mz_distribution.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -1846,11 +2000,7 @@ def plot_candidate_competition(
     ax.legend(fontsize=7, loc="upper right")
 
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "candidate_competition.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "candidate_competition.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -1936,6 +2086,7 @@ def plot_score_pp(
     out_dir: str,
     n_points: int = 500,
     pi0: float | None = None,
+    single_round: bool = False,
 ) -> None:
     """
     PP plot of score distributions: F_decoy(t) on the x-axis vs F_target(t)
@@ -2000,14 +2151,15 @@ def plot_score_pp(
     else:
         ax.set_visible(False)
 
-    # Centre panel: R2 scores on R1 winners
+    # Centre panel: final (round-2, or round-1 in single-round) scores on winners
     ax = axes[1]
     if r2_col is not None:
         r2_scores = pd.to_numeric(res[r2_col], errors="coerce").values
         finite_w = is_winner & np.isfinite(r2_scores)
         t_r2 = r2_scores[~is_decoy & finite_w]
         d_r2 = r2_scores[ is_decoy & finite_w]
-        _draw_pp_panel(ax, t_r2, d_r2, f"R1 winners — {r2_col}", n_points=n_points, pi0=pi0)
+        _ttl = "Winners — final score (R1)" if single_round else f"R1 winners — {r2_col}"
+        _draw_pp_panel(ax, t_r2, d_r2, _ttl, n_points=n_points, pi0=pi0)
     else:
         ax.set_visible(False)
 
@@ -2024,11 +2176,7 @@ def plot_score_pp(
 
     fig.suptitle("Score PP plot: target vs decoy empirical CDFs", fontsize=11)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "score_pp_plot.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "score_pp_plot.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2040,6 +2188,7 @@ def plot_score_distributions(
     result_df: pd.DataFrame,
     out_dir: str,
     n_bins: int = 60,
+    single_round: bool = False,
 ) -> None:
     """
     Overlapping target/decoy score histograms for R1, R2, and reweighted scores.
@@ -2069,6 +2218,10 @@ def plot_score_distributions(
         res.get("is_tdc_winner", pd.Series(False, index=res.index))
         .fillna(False).astype(bool).values
     )
+    _src_sd = feat.get("source", pd.Series("", index=feat.index)).fillna("").values
+    entrapment_mask_sd = (~is_decoy) & (_src_sd == "entrapment_shuffled")
+    has_entrapment_sd = entrapment_mask_sd.any()
+    real_target_mask_sd = (~is_decoy) & (~entrapment_mask_sd)
 
     r1_cols = [c for c in res.columns if c.endswith("_score_r1")]
     r2_cols = [c for c in res.columns if c.endswith("_score_r2")]
@@ -2096,7 +2249,7 @@ def plot_score_distributions(
     if r2_col and "q_value" in res.columns:
         r2_scores = pd.to_numeric(res[r2_col], errors="coerce").values
         q_vals = pd.to_numeric(res["q_value"], errors="coerce").values
-        mask = is_winner & ~is_decoy & np.isfinite(r2_scores) & np.isfinite(q_vals)
+        mask = is_winner & real_target_mask_sd & np.isfinite(r2_scores) & np.isfinite(q_vals)
         if mask.any():
             passing = r2_scores[mask & (q_vals <= 0.01)]
             if len(passing):
@@ -2105,19 +2258,21 @@ def plot_score_distributions(
     fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4), squeeze=False)
     axes = axes[0]
 
-    colours = {"T": "#2196F3", "D": "#F44336"}
+    colours = {"T": "#2196F3", "D": "#F44336", "E": "goldenrod"}
 
     for ax, (scores, subset_mask, col_label, subset_label) in zip(axes, panels):
-        t_scores = scores[~is_decoy & subset_mask]
-        d_scores = scores[ is_decoy & subset_mask]
+        t_scores = scores[real_target_mask_sd & subset_mask]
+        d_scores = scores[is_decoy & subset_mask]
+        e_scores = scores[entrapment_mask_sd & subset_mask] if has_entrapment_sd else np.array([])
         t_finite = t_scores[np.isfinite(t_scores)]
         d_finite = d_scores[np.isfinite(d_scores)]
+        e_finite = e_scores[np.isfinite(e_scores)] if len(e_scores) else np.array([])
 
         if not len(t_finite) and not len(d_finite):
             ax.set_visible(False)
             continue
 
-        all_finite = np.concatenate([t_finite, d_finite])
+        all_finite = np.concatenate([t_finite, d_finite] + ([e_finite] if len(e_finite) else []))
 
         # IQR-based x-axis limits: robust to heavy-tailed and skewed distributions.
         # Whisker = Q1 - 3*IQR … Q3 + 3*IQR, then clipped to data range.
@@ -2139,6 +2294,11 @@ def plot_score_distributions(
                 d_finite, bins=bins, density=True,
                 color=colours["D"], alpha=0.45, label=f"Decoy (n={len(d_finite):,})",
             )
+        if len(e_finite):
+            ax.hist(
+                e_finite, bins=bins, density=True,
+                color=colours["E"], alpha=0.45, label=f"Entrapment (n={len(e_finite):,})",
+            )
 
         # KDE overlay for clearer shape visualization.
         try:
@@ -2150,6 +2310,9 @@ def plot_score_distributions(
             if len(d_finite) >= 5:
                 ax.plot(x_kde, gaussian_kde(d_finite)(x_kde),
                         color=colours["D"], lw=1.5)
+            if len(e_finite) >= 5:
+                ax.plot(x_kde, gaussian_kde(e_finite)(x_kde),
+                        color=colours["E"], lw=1.5, linestyle="--")
         except Exception:
             pass
 
@@ -2162,16 +2325,13 @@ def plot_score_distributions(
         ax.set_xlabel("Score")
         ax.set_ylabel("Density")
         ax.set_xlim(lo, hi)
-        ax.set_title(f"{col_label}\n({subset_label})", fontsize=9)
+        _disp = "final score (R1)" if (single_round and col_label == r2_col) else col_label
+        ax.set_title(f"{_disp}\n({subset_label})", fontsize=9)
         ax.legend(fontsize=8)
 
     fig.suptitle("Score distributions — target vs decoy", fontsize=11)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "score_distributions.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "score_distributions.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2247,8 +2407,7 @@ def _save_gt_not_found_figures(peptides: list[str], subdirs: list[str]) -> None:
             ax.axis("off")
             fig.suptitle(f"GT: {pep}", fontsize=10)
             fname = f"GT_T_000_{_safe_fname(pep)}.png"
-            fig.savefig(os.path.join(sub, fname), dpi=80, bbox_inches="tight")
-            plt.close(fig)
+            _save_and_close(fig, os.path.join(sub, fname), dpi=80)
 
 
 # ---------------------------------------------------------------------------
@@ -2261,6 +2420,7 @@ def plot_pep_mixture(
     model_name: str = "model",
     n_bins: int = 50,
     pep_method: str = "gaussian",
+    single_round: bool = False,
 ) -> None:
     """
     Overlay histogram of target and decoy R2 scores with fitted density curves
@@ -2383,7 +2543,7 @@ def plot_pep_mixture(
                     s=6, color="grey", alpha=0.4, zorder=3)
         title_suffix = "Gaussian mixture"
 
-    ax1.set_xlabel(f"R2 score ({r2_col})")
+    ax1.set_xlabel("final score (R1)" if single_round else f"R2 score ({r2_col})")
     ax1.set_ylabel("Density")
     ax1.set_xlim(lo, hi)
 
@@ -2396,12 +2556,12 @@ def plot_pep_mixture(
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
 
+    _winner_lbl = "winners" if single_round else "R2 winners"
     ax1.set_title(
-        f"PEP — {model_name} R2 winners (n={len(scores_f)}) [{title_suffix}]"
+        f"PEP — {model_name} {_winner_lbl} (n={len(scores_f)}) [{title_suffix}]"
     )
     plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "pep_mixture.png"), dpi=120, bbox_inches="tight")
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "pep_mixture.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2530,11 +2690,7 @@ def plot_ion_image_pearson_distribution(
     )
     ax.legend(fontsize=9)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "ion_image_pearson_distribution.png"),
-        dpi=120, bbox_inches="tight",
-    )
-    plt.close(fig)
+    _save_and_close(fig, os.path.join(out_dir, "ion_image_pearson_distribution.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -2677,11 +2833,409 @@ def plot_protein_spatial_coherence(
     ax.set_xlim(left=0.0)
     ax.legend(fontsize=8)
     plt.tight_layout()
-    fig.savefig(
-        os.path.join(out_dir, "protein_spatial_coherence.png"),
-        dpi=120, bbox_inches="tight",
+    _save_and_close(fig, os.path.join(out_dir, "protein_spatial_coherence.png"))
+
+
+# ---------------------------------------------------------------------------
+# Subsystem 15: Per-candidate SHAP explanations (LinearExplainer)
+# ---------------------------------------------------------------------------
+
+def _reshape_ion_image(
+    img: np.ndarray, spatial_df: pd.DataFrame | None
+) -> np.ndarray | None:
+    """Return a 2D ion image.
+
+    Ion images in this pipeline are already ``(H, W)`` (the array is indexed
+    ``ion_images[feature_idx]``), so a 2D input is returned unchanged.  A 1D
+    flat image is reshaped from per-pixel ``x``/``y`` coordinates in
+    ``spatial_df`` when those columns are present, falling back to a near-square
+    layout otherwise.
+    """
+    img = np.asarray(img)
+    if img.ndim == 2:
+        return img
+    if img.ndim != 1:
+        return None
+    xs = ys = None
+    if spatial_df is not None:
+        for xc, yc in (("x", "y"), ("x_coords", "y_coords"), ("pixel_x", "pixel_y")):
+            if xc in spatial_df.columns and yc in spatial_df.columns:
+                xs = spatial_df[xc].to_numpy()
+                ys = spatial_df[yc].to_numpy()
+                break
+    if xs is not None and ys is not None and len(xs) == img.size:
+        x0, y0 = int(np.min(xs)), int(np.min(ys))
+        w = int(np.max(xs)) - x0 + 1
+        h = int(np.max(ys)) - y0 + 1
+        grid = np.zeros((h, w), dtype=float)
+        grid[(ys.astype(int) - y0), (xs.astype(int) - x0)] = img
+        return grid
+    side = int(np.ceil(np.sqrt(img.size)))
+    padded = np.zeros(side * side, dtype=float)
+    padded[: img.size] = img
+    return padded.reshape(side, side)
+
+
+def debug_pfm_explanations(
+    result_df: pd.DataFrame,
+    X: np.ndarray,
+    svm_pipeline,
+    feature_names: list[str],
+    ion_images: np.ndarray | None,
+    feature_mzs: np.ndarray | None,
+    spatial_df: pd.DataFrame | None,
+    output_dir: str,
+    n_decoys: int = 10,
+    fdr_threshold: float | None = None,
+) -> None:
+    """
+    Per-PFM SHAP explanation figures for the linear rescoring model.
+
+    For a set of selected peptide-feature matches (PFMs) — all target TDC winners
+    passing FDR plus a random sample of decoy winners — this computes SHAP values
+    with ``shap.LinearExplainer`` (``feature_perturbation="interventional"``) on
+    the bare linear estimator inside ``svm_pipeline`` and saves a three-panel
+    figure per candidate plus a summary TSV.
+
+    ``result_df`` must be aligned row-for-row with ``X`` (the raw, pre-pipeline
+    feature matrix the model was trained on, one row per winner).  ``feature_names``
+    names the columns of ``X``.  ``svm_pipeline`` is the fitted sklearn ``Pipeline``
+    (imputer → scaler → [poly] → linear estimator).
+
+    Selection
+    ---------
+    Targets: all TDC winners with ``q_value <= fdr_threshold`` (default 0.01),
+    falling back to 0.05 when fewer than one target passes at 1%.  Decoys:
+    ``n_decoys`` random TDC winners with ``is_decoy=True`` (``random.seed(42)``).
+
+    Outputs (``<output_dir>/pfm_explanations/``)
+    --------------------------------------------
+    One PNG per candidate, ``{rank:03d}_{peptide}_{feature_mz:.4f}_{target|decoy}.png``
+    (rank by ``q_value`` for targets, sampling order for decoys), each with:
+      Left   — the candidate feature's ion image (``hot`` colormap, gamma 0.5).
+      Middle — SHAP waterfall: top-15 per-feature contributions sorted by |SHAP|,
+               positive (toward target) in steelblue, negative in tomato, with the
+               base value and final score annotated.
+      Right  — percentile rank of each top-15 feature value within the training
+               distribution (0–100 horizontal bar with a marker).
+    Plus ``summary.tsv`` with one row per explained candidate.
+    """
+    import random
+
+    try:
+        import shap
+    except ImportError:
+        logger.warning(
+            "debug_pfm_explanations: the 'shap' package is not installed — "
+            "skipping PFM SHAP explanations (pip install shap)."
+        )
+        return
+
+    out_dir      = os.path.join(output_dir, "pfm_explanations")
+    shap_data_dir = os.path.join(out_dir, "shap_data")
+    os.makedirs(out_dir,       exist_ok=True)
+    os.makedirs(shap_data_dir, exist_ok=True)
+
+    res = result_df.reset_index(drop=True)
+    X = np.asarray(X, dtype=np.float64)
+    if X.shape[0] != len(res):
+        logger.warning(
+            "debug_pfm_explanations: X has %d rows but result_df has %d — "
+            "cannot align; skipping.",
+            X.shape[0], len(res),
+        )
+        return
+
+    # TDC-winner population (the rows passed are winners, but guard anyway).
+    if "is_tdc_winner" in res.columns:
+        winner_mask = res["is_tdc_winner"].fillna(False).astype(bool).values
+    else:
+        winner_mask = np.ones(len(res), dtype=bool)
+    is_decoy = res.get("is_decoy", pd.Series(False, index=res.index)).fillna(False).astype(bool).values
+    q_value = pd.to_numeric(
+        res.get("q_value", pd.Series(np.nan, index=res.index)), errors="coerce"
+    ).values
+
+    # --- Select targets at FDR (fall back 1% → 5%) ---
+    if fdr_threshold is None:
+        thr = 0.01
+        target_pos = np.where(winner_mask & ~is_decoy & (q_value <= thr))[0]
+        if len(target_pos) < 1:
+            thr = 0.05
+            target_pos = np.where(winner_mask & ~is_decoy & (q_value <= thr))[0]
+    else:
+        thr = float(fdr_threshold)
+        target_pos = np.where(winner_mask & ~is_decoy & (q_value <= thr))[0]
+    # Rank targets by q_value ascending.
+    target_pos = target_pos[np.argsort(q_value[target_pos], kind="stable")]
+
+    # --- Sample decoy winners ---
+    decoy_candidates = np.where(winner_mask & is_decoy)[0].tolist()
+    random.seed(42)
+    if len(decoy_candidates) > n_decoys:
+        decoy_pos = sorted(random.sample(decoy_candidates, n_decoys))
+    else:
+        decoy_pos = decoy_candidates
+
+    logger.info(
+        "debug_pfm_explanations: explaining %d targets (q<=%.2g) and %d decoys",
+        len(target_pos), thr, len(decoy_pos),
     )
-    plt.close(fig)
+    if len(target_pos) == 0 and len(decoy_pos) == 0:
+        logger.warning("debug_pfm_explanations: no candidates to explain — skipping.")
+        return
+
+    # --- Pipeline decomposition: pre-processing (imputer/scaler/[poly]) + estimator ---
+    try:
+        pre = svm_pipeline[:-1]
+        estimator = svm_pipeline[-1]
+        Xt_all = np.asarray(pre.transform(X), dtype=np.float64)
+        coef = np.asarray(estimator.coef_, dtype=np.float64).ravel()
+        intercept = float(np.asarray(estimator.intercept_).ravel()[0])
+    except Exception as exc:
+        logger.warning(
+            "debug_pfm_explanations: could not decompose pipeline / estimator (%s) — skipping.",
+            exc,
+        )
+        return
+
+    # The transformed matrix may have more columns than feature_names when a
+    # polynomial-interaction step expands the inputs; in that case raw-value and
+    # percentile annotations fall back to the transformed feature space.
+    if Xt_all.shape[1] == len(feature_names):
+        est_names = list(feature_names)
+        raw_aligned = True
+    else:
+        est_names = [f"f{j}" for j in range(Xt_all.shape[1])]
+        raw_aligned = False
+        logger.info(
+            "debug_pfm_explanations: transformed matrix has %d columns vs %d raw "
+            "feature names (poly expansion?) — using transformed values for labels.",
+            Xt_all.shape[1], len(feature_names),
+        )
+
+    # --- SHAP LinearExplainer on the bare linear estimator ---
+    # feature_perturbation="interventional" with the full transformed training
+    # matrix as background.
+    try:
+        explainer = shap.LinearExplainer(
+            (coef, intercept), Xt_all, feature_perturbation="interventional"
+        )
+        base_value = float(np.asarray(explainer.expected_value).ravel()[0])
+    except Exception as exc:
+        logger.warning("debug_pfm_explanations: LinearExplainer failed (%s) — skipping.", exc)
+        return
+
+    # Per-column training distributions for percentile ranks (raw space when aligned).
+    dist_matrix = X if raw_aligned else Xt_all
+    n_train = dist_matrix.shape[0]
+
+    summary_rows: list[dict] = []
+    top_k = 15
+
+    def _explain_one(pos: int, rank: int, kind: str) -> None:
+        row = res.iloc[pos]
+        peptide = str(row.get("peptide", "unknown"))
+        protein = str(row.get("protein", ""))
+        feature_mz = _get(row, "feature_mz")
+        qv = _get(row, "q_value")
+
+        xt = Xt_all[pos : pos + 1]
+        shap_vals = np.asarray(explainer.shap_values(xt)).reshape(-1)
+        final_score = base_value + float(shap_vals.sum())
+
+        order = np.argsort(np.abs(shap_vals))[::-1][:top_k]
+        sel_names = [est_names[j] for j in order]
+        sel_shap = shap_vals[order]
+        if raw_aligned:
+            sel_raw = X[pos, order]
+        else:
+            sel_raw = Xt_all[pos, order]
+
+        # ----- Figure -----
+        _BG      = "#F7F7F7"
+        _POS_COL = "#4C9BE8"   # steel blue — toward target
+        _NEG_COL = "#E8654C"   # coral     — away from target
+
+        fig, (ax_img, ax_shap, ax_pct) = plt.subplots(
+            1, 3, figsize=(16, 6),
+            gridspec_kw={"width_ratios": [1.0, 1.8, 0.9]},
+            facecolor=_BG,
+        )
+        fig.patch.set_facecolor(_BG)
+
+        # Left: ion image (gamma 0.5, hot)
+        img2d = None
+        if ion_images is not None and feature_mzs is not None and np.isfinite(feature_mz):
+            idx = _find_image_idx(float(feature_mz), feature_mzs)
+            if idx is not None:
+                img2d = _reshape_ion_image(ion_images[idx], spatial_df)
+        ax_img.set_facecolor("black")
+        for _sp in ax_img.spines.values():
+            _sp.set_visible(False)
+        ax_img.set_xticks([]); ax_img.set_yticks([])
+        if img2d is not None:
+            _p99 = np.percentile(img2d[img2d > 0], 99) if (img2d > 0).any() else 1.0
+            _imd = np.clip(img2d / _p99, 0, 1) ** 0.5
+            _im  = ax_img.imshow(_imd, cmap="hot", vmin=0, vmax=1, aspect="auto",
+                                 interpolation="nearest")
+            _cax = ax_img.inset_axes([0.02, 0.02, 0.06, 0.35])
+            _cb  = fig.colorbar(_im, cax=_cax)
+            _cb.set_ticks([0, 1]); _cb.set_ticklabels(["0", "p99"], fontsize=6, color="white")
+            _cb.outline.set_edgecolor("white")
+            _cb.ax.tick_params(colors="white", length=2)
+            ax_img.set_title(f"{peptide}\n{feature_mz:.4f} Da", fontsize=9,
+                             fontweight="bold", color="#222222", pad=4)
+        else:
+            ax_img.text(0.5, 0.5, "No ion image", ha="center", va="center",
+                        transform=ax_img.transAxes, color="gray", fontsize=9)
+            ax_img.set_title(f"{peptide}", fontsize=9, fontweight="bold",
+                             color="#222222", pad=4)
+
+        # Middle: SHAP waterfall (top 15 by |SHAP|)
+        ypos   = np.arange(len(order))[::-1]  # largest |SHAP| at top
+        colors = [_POS_COL if v >= 0 else _NEG_COL for v in sel_shap]
+        ax_shap.set_facecolor("white")
+        ax_shap.barh(ypos, sel_shap, color=colors, height=0.65,
+                     edgecolor="white", linewidth=0.4, zorder=3)
+        ax_shap.axvline(0, color="#333333", lw=1.0, zorder=4)
+        ax_shap.axvline(base_value,  color="#888888", lw=0.8, ls="--", zorder=2)
+        ax_shap.axvline(final_score, color="#222222", lw=1.2, ls=":",  zorder=2)
+        ax_shap.set_yticks(ypos)
+        ax_shap.set_yticklabels(
+            [n.replace("_", " ") for n in sel_names],
+            fontsize=7.5,
+        )
+        ax_shap.set_xlabel("SHAP contribution  (→ target)", fontsize=8, color="#444444")
+        _xlim = (
+            min(sel_shap.min() - 0.3, base_value  - 0.3),
+            max(sel_shap.max() + 0.3, final_score + 0.3),
+        )
+        ax_shap.set_xlim(*_xlim)
+        ax_shap.text(base_value,  1.01, f"base\n{base_value:.3f}",
+                     ha="center", va="bottom", fontsize=6.5, color="#888888",
+                     transform=ax_shap.get_xaxis_transform())
+        ax_shap.text(final_score, 1.01, f"score\n{final_score:.3f}",
+                     ha="center", va="bottom", fontsize=6.5, color="#222222", fontweight="bold",
+                     transform=ax_shap.get_xaxis_transform())
+        ax_shap.tick_params(axis="x", labelsize=7, colors="#555555")
+        ax_shap.tick_params(axis="y", colors="#222222", length=0)
+        ax_shap.xaxis.grid(True, color="#dddddd", lw=0.5, zorder=0)
+        ax_shap.set_axisbelow(True)
+        for _sp in ["top", "right", "left"]: ax_shap.spines[_sp].set_visible(False)
+        ax_shap.spines["bottom"].set_color("#cccccc")
+
+        # Right: percentile rank within training distribution
+        pct = np.full(len(order), np.nan)
+        for i, j in enumerate(order):
+            colvals = dist_matrix[:, j]
+            finite  = colvals[np.isfinite(colvals)]
+            v = sel_raw[i]
+            if finite.size > 0 and np.isfinite(v):
+                pct[i] = 100.0 * np.count_nonzero(finite <= v) / finite.size
+        ax_pct.set_facecolor("white")
+        ax_pct.barh(ypos, np.full(len(order), 100.0), color="#eeeeee", height=0.65, zorder=1)
+        ax_pct.barh(ypos, np.nan_to_num(pct),         color="#cccccc", height=0.65, zorder=2)
+        for yp, p, col in zip(ypos, pct, colors):
+            if np.isfinite(p):
+                ax_pct.plot(p, yp, "o", color=col, ms=7, zorder=5,
+                            markeredgecolor="white", markeredgewidth=0.5)
+                _offset, _ha = (-3, "right") if p > 88 else (2, "left")
+                ax_pct.text(p + _offset, yp, f"{p:.0f}", va="center",
+                            fontsize=6.5, color="#333333", ha=_ha)
+        ax_pct.set_xlim(0, 100)
+        ax_pct.set_ylim(ax_shap.get_ylim())
+        ax_pct.set_yticks([])
+        ax_pct.set_xticks([0, 25, 50, 75, 100])
+        ax_pct.set_xticklabels(["0", "25", "50", "75", "100"], fontsize=6.5, color="#555555")
+        ax_pct.set_xlabel("Percentile in training dist.", fontsize=8, color="#444444")
+        ax_pct.tick_params(axis="x", length=2)
+        for _sp in ["top", "right", "left"]: ax_pct.spines[_sp].set_visible(False)
+        ax_pct.spines["bottom"].set_color("#cccccc")
+        ax_pct.xaxis.grid(True, color="#eeeeee", lw=0.5, zorder=0)
+        ax_pct.set_axisbelow(True)
+
+        # Save per-candidate SHAP data for later reproduction
+        _sel_coef = coef[order] if len(coef) == len(est_names) else np.full(len(order), np.nan)
+        pd.DataFrame({
+            "feature":        sel_names,
+            "shap_value":     sel_shap,
+            "raw_value":      sel_raw,
+            "percentile_rank": pct,
+            "coef":           _sel_coef,
+        }).assign(
+            peptide=peptide, protein=protein,
+            feature_mz=feature_mz, q_value=qv,
+            final_score=final_score, base_value=base_value, kind=kind,
+        ).to_csv(
+            os.path.join(
+                shap_data_dir,
+                f"{rank:03d}_{_safe_fname(peptide)}_{feature_mz:.4f}_{kind}.tsv"
+                if np.isfinite(feature_mz)
+                else f"{rank:03d}_{_safe_fname(peptide)}_{kind}.tsv",
+            ),
+            sep="\t", index=False,
+        )
+
+        _q_s = f"q = {qv:.4f}" if np.isfinite(qv) else "q = NA"
+        fig.tight_layout(rect=[0, 0, 1, 0.91])
+        fig.text(
+            0.5, 0.97,
+            f"[{kind}]  {peptide}  ·  {protein}  ·  m/z {feature_mz:.4f}"
+            f"  ·  {_q_s}  ·  score = {final_score:.3f}",
+            ha="center", va="top", fontsize=10, fontweight="bold",
+            color="#111111",
+        )
+        fname = (
+            f"{rank:03d}_{_safe_fname(peptide)}_{feature_mz:.4f}_{kind}.png"
+            if np.isfinite(feature_mz)
+            else f"{rank:03d}_{_safe_fname(peptide)}_{kind}.png"
+        )
+        _save_and_close(fig, os.path.join(out_dir, fname), dpi=150)
+
+        srow = {
+            "peptide": peptide,
+            "protein": protein,
+            "feature_mz": feature_mz,
+            "q_value": qv,
+            "is_decoy": bool(row.get("is_decoy", False)),
+            "final_score": final_score,
+        }
+        for r2c in res.columns:
+            if r2c.endswith("_score_r2"):
+                srow[r2c] = _get(row, r2c)
+        for t in range(3):
+            if t < len(order):
+                srow[f"shap{t+1}_feature"] = sel_names[t]
+                srow[f"shap{t+1}_value"] = float(sel_shap[t])
+                srow[f"shap{t+1}_feature_value"] = float(sel_raw[t])
+            else:
+                srow[f"shap{t+1}_feature"] = ""
+                srow[f"shap{t+1}_value"] = np.nan
+                srow[f"shap{t+1}_feature_value"] = np.nan
+        summary_rows.append(srow)
+
+    for rank, pos in enumerate(target_pos):
+        try:
+            _explain_one(int(pos), rank, "target")
+        except Exception as exc:
+            logger.debug("debug_pfm_explanations: target row %d failed: %s", pos, exc)
+            plt.close("all")
+    for rank, pos in enumerate(decoy_pos):
+        try:
+            _explain_one(int(pos), rank, "decoy")
+        except Exception as exc:
+            logger.debug("debug_pfm_explanations: decoy row %d failed: %s", pos, exc)
+            plt.close("all")
+
+    if summary_rows:
+        pd.DataFrame(summary_rows).to_csv(
+            os.path.join(out_dir, "summary.tsv"), sep="\t", index=False
+        )
+    logger.info(
+        "debug_pfm_explanations: wrote %d figures + summary.tsv to %s",
+        len(summary_rows), out_dir,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2712,9 +3266,17 @@ def save_debug_figures(
     gt_peptides: list[str] | None = None,
     storey_pi0_val: float | None = None,
     ccs_tol_pct: float | None = None,
+    single_round: bool = False,
 ) -> None:
     """
     Generate all debug figures and save them under ``debug_dir``.
+
+    When ``single_round`` is True (rescore was run with ``single_round``, so no
+    round-2 retrain occurred), the score figures relabel the round-2/final
+    panels as "final (winners)" rather than "R2", and the round-2 feature
+    importance panel is suppressed by the caller (``importances_r2=None``). The
+    final score still lives in the ``*_score_r2`` column (it equals the R1 score
+    on winners); only the labelling changes.
 
     Parameters
     ----------
@@ -2821,23 +3383,49 @@ def save_debug_figures(
             id_subset["_score_r1"] = id_subset[_score_r1_cols[0]] if _score_r1_cols else np.nan
             id_subset["_total"] = len(feat_aligned)
 
-            # Sort by reweighted_q_value ascending so the most confident IDs appear first.
-            if "reweighted_q_value" in id_subset.columns:
-                id_subset = id_subset.sort_values(
-                    "reweighted_q_value", ascending=True
-                ).reset_index(drop=True)
-            id_subset["_rank"] = np.arange(1, len(id_subset) + 1)
-
-            # Combine: all ID rows + sampled R1/L rows from the existing subset.
+            # Combine ID rows + sampled R1/L rows, then collapse to ONE row per
+            # protein. Every ion-image colocalization figure already shows the
+            # whole protein (precursor + all same-protein features + protein
+            # mean), so per-peptide figures of the same protein only differ in
+            # which feature is highlighted and the panel order — no new
+            # information. Keep the best (lowest reweighted_q_value) peptide as
+            # the protein's representative; targets and decoys are separate
+            # proteins (DECOY_ prefix), so each yields its own figure.
             subset_for_images = pd.concat(
                 [id_subset, subset[subset["_group"].isin(["R1", "L"])].copy()],
                 ignore_index=True,
             )
+            if "protein" in subset_for_images.columns and "reweighted_q_value" in subset_for_images.columns:
+                subset_for_images = (
+                    subset_for_images
+                    .sort_values("reweighted_q_value", ascending=True, na_position="last")
+                    .drop_duplicates(subset="protein", keep="first")
+                    .reset_index(drop=True)
+                )
+            # Rank proteins by q-value, then cap the figure count: if more than
+            # 300 proteins, subsample to 200 (reproducible) so the set stays
+            # manageable.
+            subset_for_images = subset_for_images.sort_values(
+                "reweighted_q_value", ascending=True, na_position="last"
+            ).reset_index(drop=True)
+            _PROT_VIZ_CAP, _PROT_VIZ_TARGET = 300, 200
+            _n_prot_total = len(subset_for_images)
+            if _n_prot_total > _PROT_VIZ_CAP:
+                _rng = np.random.default_rng(seed)
+                _keep = sorted(
+                    _rng.choice(_n_prot_total, size=_PROT_VIZ_TARGET, replace=False).tolist()
+                )
+                subset_for_images = subset_for_images.iloc[_keep].reset_index(drop=True)
+                logger.info(
+                    "Ion image colocalization: %d proteins exceed %d; subsampled to %d for visualization",
+                    _n_prot_total, _PROT_VIZ_CAP, _PROT_VIZ_TARGET,
+                )
+            subset_for_images["_rank"] = np.arange(1, len(subset_for_images) + 1)
+            _n_id_prot = int((subset_for_images["_group"] == "ID").sum()) if "_group" in subset_for_images.columns else 0
             logger.info(
-                "Ion image colocalization: %d FDR winners + %d R1/L sampled = %d total",
-                len(id_subset),
-                len(subset_for_images) - len(id_subset),
-                len(subset_for_images),
+                "Ion image colocalization: one figure per protein — %d proteins "
+                "(%d with an ID at ≤5%% FDR)",
+                len(subset_for_images), _n_id_prot,
             )
             plot_ion_image_colocalization(
                 subset_for_images, features_df, ion_images, ion_image_mzs,
@@ -2897,6 +3485,7 @@ def save_debug_figures(
             out_dir=os.path.join(debug_dir, "feature_distributions"),
             feature_names=feature_names,
             gt_peptides=gt_peptides,
+            single_round=single_round,
         )
         logger.info("Feature distribution figures saved to %s/feature_distributions/", debug_dir)
     except Exception as exc:
@@ -2957,6 +3546,7 @@ def save_debug_figures(
             features_df, result_df,
             out_dir=debug_dir,
             pi0=storey_pi0_val,
+            single_round=single_round,
         )
         logger.info("Score PP plot saved to %s/score_pp_plot.png", debug_dir)
     except Exception as exc:
@@ -2968,6 +3558,7 @@ def save_debug_figures(
             out_dir=debug_dir,
             model_name=model_name,
             pep_method=pep_method,
+            single_round=single_round,
         )
         logger.info("PEP mixture plot saved to %s/pep_mixture.png", debug_dir)
     except Exception as exc:
@@ -2977,6 +3568,7 @@ def save_debug_figures(
         plot_score_distributions(
             features_df, result_df,
             out_dir=debug_dir,
+            single_round=single_round,
         )
         logger.info("Score distributions saved to %s/score_distributions.png", debug_dir)
     except Exception as exc:

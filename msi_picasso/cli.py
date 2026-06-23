@@ -373,6 +373,17 @@ def build_parser() -> argparse.ArgumentParser:
             "data column = m/z)."
         ),
     )
+    maldi_group.add_argument(
+        "--maldi-query-raw",
+        action="store_true",
+        default=None,
+        help=(
+            "Raw-query mode (use with --maldi-raw/--maldi-d). Instead of detecting "
+            "a feature list first, generate candidates first and extract ion images "
+            "directly from the raw .d at the candidate-derived m/z values. For "
+            "mz_shift decoys this queries the shifted (off-target) m/z."
+        ),
+    )
 
     # --- Raw extraction parameters ---
     raw_grp = parser.add_argument_group(
@@ -670,11 +681,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cand.add_argument(
         "--decoy-method",
-        choices=("shuffle", "balanced_shuffle", "paired_shuffle"),
+        choices=("shuffle", "mz_shift", "mz_shuffle", "entrapment", "balanced_shuffle", "paired_shuffle"),
         default=None,
         help=(
             "Decoy generation strategy. 'shuffle' (default): K/R-preserving protein "
-            "shuffle, standard target-decoy competition. 'balanced_shuffle': iterative "
+            "shuffle, standard target-decoy competition. 'mz_shift': observation-space "
+            "decoys — each target peptide generates a shifted m/z query "
+            "(delta_min..delta_max Da away) that is snapped to a foreign MALDI feature. "
+            "'mz_shuffle': derangement of the peptide->feature assignment — each real "
+            "target peptide is relocated onto another peptide's real feature (co-located "
+            "1 target + 1 decoy per feature), so feature-quality features are symmetric "
+            "and the ranker must discriminate on the peptide match (CCS/isotope). "
+            "'entrapment': decoys are tryptic peptides from a foreign-organism FASTA "
+            "(--entrapment-fasta), filtered to remove any peptide isobaric with a target. "
+            "'balanced_shuffle': iterative "
             "K/R-preserving protein shuffle with MALDI-match filtering — only shuffled "
             "peptides that match a MALDI feature are kept, length-stratified subsample "
             "to target_ratio * N_target. Ensures ~1:1 T:D even when the MALDI feature "
@@ -682,6 +702,40 @@ def build_parser() -> argparse.ArgumentParser:
             "feature-occupancy-matched — drawn at the same m/z features that targets "
             "occupy, converting target-only features into contested ones to maximise "
             "per-feature competition; preserves the same global ~1:1 T:D ratio."
+        ),
+    )
+    cand.add_argument(
+        "--entrapment-fasta",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Foreign-organism FASTA used as the null for --decoy-method entrapment. "
+            "Required when --decoy-method entrapment is selected; ignored otherwise."
+        ),
+    )
+    cand.add_argument(
+        "--mz-shift-delta-min",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="mz_shift only: minimum absolute m/z shift in Da (default 5.0).",
+    )
+    cand.add_argument(
+        "--mz-shift-delta-max",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="mz_shift only: maximum absolute m/z shift in Da (default 20.0).",
+    )
+    cand.add_argument(
+        "--mz-shift-snap-tolerance-ppm",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "mz_shift only: maximum ppm distance between the shifted query and the "
+            "nearest MALDI feature for the snap to be accepted (default 50.0). "
+            "Increase for sparse feature lists."
         ),
     )
     cand.add_argument(
@@ -712,15 +766,32 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp = parser.add_argument_group("rescoring")
     rescore_grp.add_argument(
         "--model",
-        choices=("svm", "catboost", "lda", "qda"),
+        choices=("lda", "qda", "svm"),
         default=None,
         help=(
-            "Rescoring backend. 'lda': sklearn LDA with median imputation and "
-            "standardization; no extra dependencies (default). 'qda': sklearn QDA "
-            "(QuadraticDiscriminantAnalysis, reg_param=0.1); same structure as LDA. "
-            "'svm': mokapot PercolatorModel trained on MALDI-intrinsic features. "
-            "'catboost': semi-supervised CatBoostRanker with pseudo-label iteration "
-            "(requires pip install MSI-PICASSO[catboost])."
+            "Rescoring backend. 'lda' (default): sklearn LinearDiscriminantAnalysis "
+            "with median imputation and standardization; no extra dependencies. "
+            "'qda': sklearn QuadraticDiscriminantAnalysis (reg_param=0.1); same "
+            "semi-supervised structure as LDA. 'svm': sklearn LinearSVC "
+            "(penalty=l2, squared_hinge, C=--svm-c); same linear/CV machinery as LDA."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--svm-c",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Regularization strength C for the --model svm (LinearSVC) backend. Default 1.0.",
+    )
+    rescore_grp.add_argument(
+        "--single-round",
+        action="store_true",
+        default=None,
+        help=(
+            "Skip the round-2 retrain: score candidates once (R1), select per-feature "
+            "winners (the target-vs-decoy competition / TDC is unchanged), and compute FDR "
+            "on the R1 winner scores. Useful in --maldi-query-raw, where R1 already trains "
+            "on a clean ~1:1 target:decoy set so R2 typically adds little. Default off."
         ),
     )
     rescore_grp.add_argument(
@@ -813,6 +884,17 @@ def build_parser() -> argparse.ArgumentParser:
             "rescoring model. These features aggregate signal across all candidates "
             "sharing a protein, which can break the TDC null model symmetry. "
             "Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--use-spatial-ranker-features",
+        action="store_true",
+        default=None,
+        help=(
+            "Include spatial ranker features (spatial_autocorrelation, spatial_morans_i, "
+            "spatial_gearys_c, fraction_detected, intensity_cv, and protein_colocalization_*) "
+            "in the rescoring model. Only valid with --decoy-method entrapment or mz_shift; "
+            "with shuffle variants it is force-disabled with a warning. Disabled by default."
         ),
     )
     rescore_grp.add_argument(
@@ -984,6 +1066,124 @@ def build_parser() -> argparse.ArgumentParser:
             "calibration matches. Analogous to --rt-window-multiplier. Default 2.0."
         ),
     )
+    rescore_grp.add_argument(
+        "--mob-coloc",
+        action="store_true",
+        default=None,
+        help=(
+            "Compute per-candidate mobility-filtered colocalization features (the *_mob "
+            "features). Reads the raw Bruker .d via alphatims and filters peaks to each "
+            "candidate's predicted 1/K0 window. Requires IM2Deep predicted CCS (i.e. "
+            "observed CCS available) and a raw .d (--maldi-raw/--maldi-d). Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--mob-window-multiplier",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Mobility-window half-width = multiplier × p95 |delta 1/K0| on the calibration "
+            "set, for --mob-coloc. Default 2.0."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--coloc-tic-quantile",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "On-tissue pixel quantile for colocalization features. Pearson r is computed "
+            "only on pixels whose total-ion-current exceeds this quantile of measured TIC, "
+            "removing the shared on/off-tissue component that inflates every correlation. "
+            "0.0 (default) keeps all measured pixels (drops only unmeasured padding); e.g. "
+            "0.25 additionally trims low-signal tissue edges. Range [0, 1)."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--coloc-measured-mask",
+        action="store_true",
+        default=None,
+        help=(
+            "Restrict colocalization to pixels that were actually rastered, using the "
+            "pixel coordinate list from the MALDI data source rather than the TIC > 0 "
+            "heuristic. Useful for partial-raster acquisitions where only a sub-region "
+            "of the slide was scanned. Supported for --maldi-raw/--maldi-d and "
+            "--maldi-imzml inputs; no-op for NPZ/m/z-list inputs."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--nmf-coloc",
+        action="store_true",
+        default=None,
+        help=(
+            "Compute NMF substructure-sharing colocalization features "
+            "(protein_nmf_colocalization*). Factorises the on-tissue ion-image matrix into "
+            "spatial components and measures the within-protein cosine similarity of each "
+            "feature's component loadings, asking whether same-protein peptides occupy the "
+            "same tissue substructure (sharper than global ion-image Pearson r). Requires "
+            "ion images; protein-level, so decoys must occupy a separate protein namespace. "
+            "Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--nmf-n-components",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Number of NMF spatial components for --nmf-coloc. Default 12.",
+    )
+    rescore_grp.add_argument(
+        "--patch-coloc",
+        action="store_true",
+        default=None,
+        help=(
+            "Compute patch-level (local) within-protein colocalization features "
+            "(protein_patch_colocalization_mean/_max/_frac_above). Tiles the ion-image "
+            "grid into patches and computes per-pair Pearson r over each patch's on-tissue "
+            "pixels, aggregated across patches. Protein-level (also needs "
+            "--use-protein-level-feats). Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--patch-size",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Patch edge length in pixels for --patch-coloc. Default 10.",
+    )
+    rescore_grp.add_argument(
+        "--patch-coloc-threshold",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="r threshold for the patch frac_above feature (--patch-coloc). Default 0.5.",
+    )
+    rescore_grp.add_argument(
+        "--drop-zero-signal",
+        action="store_true",
+        default=None,
+        help=(
+            "Remove candidates whose MALDI feature has zero total signal "
+            "(feature_intensity_sum == 0) before scoring. Under raw-query mode these "
+            "candidates have no MALDI evidence and their co-located target/decoy pairs "
+            "differ only on peptide_length, which leaks the mz_shuffle derangement. "
+            "Symmetric: both target and decoy at a zero-signal feature are dropped. "
+            "Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--entrapment",
+        action="store_true",
+        default=None,
+        help=(
+            "Inject shuffled pseudo-protein peptides (derived from LC-MS/MS confirmed "
+            "sequences, one pseudo-protein per identified protein) as entrapment "
+            "pseudo-targets alongside the main candidates. Reports how many entrapment "
+            "peptides are identified at 1%%, 5%%, and 10%% FDR and writes "
+            "entrapment_result.tsv. Requires --lcms-peptides or --msf."
+        ),
+    )
 
     # --- Strategy C: LC-MS/MS-guided candidates ---
     strat_c = parser.add_argument_group(
@@ -1016,12 +1216,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     strat_c.add_argument(
         "--lcms-id-format",
-        choices=("percolator", "mzidentml", "psm_utils", "msf"),
+        choices=("percolator", "mzidentml", "psm_utils", "msf", "ms2rescore"),
         default=None,
         help=(
             "Format of the LC-MS/MS identification files. "
             "Use 'msf' to read directly from a ProteomeDiscoverer .msf file "
-            "(the same file passed to --msf can be reused)."
+            "(the same file passed to --msf can be reused). "
+            "Use 'ms2rescore' to read ms2rescore .psms.tsv output directly."
         ),
     )
     strat_c.add_argument(
@@ -1127,28 +1328,35 @@ def main() -> None:
     _STORE_TRUE_ATTRS = frozenset({
         "verbose", "storey_pi0", "lda_r2_median_filter",
         "only_main_features", "use_protein_level_feats", "match_ccs",
+        "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc",
+        "drop_zero_signal", "entrapment", "coloc_measured_mask",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
     # through the cascade; extraction params are handled separately below.
     _TOP_LEVEL_ATTRS = (
-        "model", "train_fdr", "n_interaction_features", "storey_pi0",
+        "model", "svm_c", "single_round", "train_fdr", "n_interaction_features", "storey_pi0",
         "lda_r2_median_filter", "only_main_features", "use_protein_level_feats",
+        "use_spatial_ranker_features",
         "n_debug", "debug_seed", "verbose", "output_dir",
         "ppm_tolerance", "missed_cleavages", "min_length", "max_length",
-        "decoy_method", "max_shuffle_rounds", "decoy_target_ratio",
+        "decoy_method", "mz_shift_delta_min", "mz_shift_delta_max",
+        "mz_shift_snap_tolerance_ppm", "max_shuffle_rounds", "decoy_target_ratio",
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
         "features_preset", "features_exclude",
         "pseudo_label_max_iter", "pseudo_label_fdr", "r1_seed_percentile", "r2_seed_percentile",
-        "catboost_iterations", "mokapot_max_iter", "max_iter", "init_fdr", "min_seed_positives",
+        "max_iter", "init_fdr", "min_seed_positives",
         "matching_ppm", "fragment_tol_da", "winner_percentile",
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
-        "match_ccs", "ccs_window_multiplier",
+        "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_window_multiplier",
+        "coloc_tic_quantile", "nmf_coloc", "nmf_n_components",
+        "patch_coloc", "patch_size", "patch_coloc_threshold",
+        "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
-        "calibration_percentile",
+        "calibration_percentile", "maldi_query_raw",
         # file paths
-        "fasta", "extra_fasta", "mzml",
+        "fasta", "extra_fasta", "entrapment_fasta", "mzml",
         "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
         "feature_mzs", "save_npz", "save_spatial", "spatial_features",
         "lcms_peptides", "lcms_proteins", "lcms_psms", "msf",
@@ -1241,11 +1449,25 @@ def main() -> None:
     _ccs_source_mzs: np.ndarray | None = None  # mzs aligned with _ccs_arr; may differ from maldi_mzs
     _mzs_intensities: np.ndarray | None = None  # per-feature intensity from SCiLS CSV
     _feature_mzs_intensities: np.ndarray | None = None  # set only in --maldi-raw/--maldi-d block
+    _measured_pixel_mask: "np.ndarray | None" = None  # built when --coloc-measured-mask is set
 
     _maldi_raw_path: str | None = _ms1cfg.get("maldi_raw") or _ms1cfg.get("maldi_d")
     _maldi_imzml_path: str | None = _ms1cfg.get("maldi_imzml")
     _feature_mzs_path: str | None = _ms1cfg.get("feature_mzs")
-    if _maldi_raw_path:
+    _maldi_query_raw = bool(_ms1cfg.get("maldi_query_raw"))
+    if _maldi_raw_path and _maldi_query_raw:
+        # Raw-query mode: defer extraction to rescore(), which queries the .d at
+        # the candidate-derived m/z grid after candidate generation.
+        logger.info(
+            "Raw-query mode (--maldi-query-raw): MALDI ion images will be extracted "
+            "from %s at candidate m/z values during candidate generation.",
+            _maldi_raw_path,
+        )
+        maldi_mzs = np.array([], dtype=np.float64)
+        ion_images = None
+        ion_image_mzs = None
+        extra_ion_images = None
+    elif _maldi_raw_path:
         from msi_picasso.maldi_extraction import extract_maldi_data
 
         logger.info(
@@ -1265,7 +1487,7 @@ def main() -> None:
             logger.info(f"  {len(precomputed_mzs)} features loaded (skipping detection)")
 
         logger.info(f"Extracting MALDI features from raw data: {_maldi_raw_path}")
-        maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes = extract_maldi_data(
+        maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes, _raw_pixel_coords = extract_maldi_data(
             _maldi_raw_path,
             feature_mzs=precomputed_mzs,
             ppm_bin=_extraction["ppm_bin"],
@@ -1302,6 +1524,12 @@ def main() -> None:
             f"  {len(maldi_mzs)} features extracted"
             + (f", ion image shape: {ion_images.shape[1:]}" if ion_images is not None else "")
         )
+        if bool(_ms1cfg.get("coloc_measured_mask", False)) and ion_images is not None:
+            _xc, _yc = _raw_pixel_coords
+            _H, _W = ion_images.shape[1], ion_images.shape[2]
+            _measured_pixel_mask = np.zeros(_H * _W, dtype=bool)
+            _measured_pixel_mask[np.asarray(_yc, dtype=np.int64) * _W + np.asarray(_xc, dtype=np.int64)] = True
+            logger.info(f"  Measured-pixel mask: {int(_measured_pixel_mask.sum())}/{_measured_pixel_mask.size} pixels rastered")
     elif _maldi_imzml_path:
         from msi_picasso.maldi_imzml import (
             SCiLSConfig, extract_scils_features,
@@ -1367,6 +1595,13 @@ def main() -> None:
             from msi_picasso.maldi_imzml import one_over_k0_to_ccs
             _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
             logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
+        if bool(_ms1cfg.get("coloc_measured_mask", False)) and ion_images is not None and len(intervals) > 0:
+            _coords_arr = np.asarray(pixel_coords, dtype=np.int64)
+            _xs_c, _ys_c = _coords_arr[:, 0], _coords_arr[:, 1]
+            _H, _W = ion_images.shape[1], ion_images.shape[2]
+            _measured_pixel_mask = np.zeros(_H * _W, dtype=bool)
+            _measured_pixel_mask[_ys_c * _W + _xs_c] = True
+            logger.info(f"  Measured-pixel mask: {int(_measured_pixel_mask.sum())}/{_measured_pixel_mask.size} pixels rastered")
     else:
         maldi_mzs, ion_images, ion_image_mzs, _ccs_arr, extra_ion_images, _mzs_intensities = _load_maldi(
             _ms1cfg.get("maldi_npz"), _ms1cfg.get("maldi_mzs")
@@ -1503,6 +1738,9 @@ def main() -> None:
         extra_ion_images=extra_ion_images,
         spatial_features=spatial_features,
         maldi_envelopes=maldi_envelopes,
+        maldi_query_raw=_maldi_query_raw,
+        maldi_d_path=_maldi_raw_path,
+        extraction_ppm=_extraction["extraction_ppm"],
         msf_path=args.msf,
         ppm_tolerance=_ms1cfg["ppm_tolerance"],
         init_fdr=_ms1cfg["init_fdr"],
@@ -1511,6 +1749,8 @@ def main() -> None:
         min_length=min_length,
         max_length=max_length,
         model=_ms1cfg["model"],
+        svm_c=_ms1cfg["svm_c"],
+        single_round=bool(_ms1cfg.get("single_round", False)),
         init_ppm_threshold=_ms1cfg["init_ppm_threshold"],
         init_isotope_threshold=_ms1cfg["init_isotope_threshold"],
         n_interaction_features=_ms1cfg["n_interaction_features"],
@@ -1526,6 +1766,7 @@ def main() -> None:
         peptide_fdr=_ms1cfg["peptide_fdr"],
         extra_fasta_path=_ms1cfg.get("extra_fasta"),
         use_protein_level_features=_ms1cfg["use_protein_level_feats"],
+        use_spatial_ranker_features=_ms1cfg["use_spatial_ranker_features"],
         verbose=verbose,
         output_dir=output_dir,
         debug_dir=os.path.join(output_dir, "debug") if verbose else None,
@@ -1542,6 +1783,10 @@ def main() -> None:
         gt_peptides=gt_peptides,
         maldi_intensities=_mzs_intensities,
         decoy_method=_ms1cfg["decoy_method"],
+        entrapment_fasta=_ms1cfg.get("entrapment_fasta"),
+        mz_shift_delta_min=_ms1cfg["mz_shift_delta_min"],
+        mz_shift_delta_max=_ms1cfg["mz_shift_delta_max"],
+        mz_shift_snap_tolerance_ppm=_ms1cfg["mz_shift_snap_tolerance_ppm"],
         max_shuffle_rounds=_ms1cfg["max_shuffle_rounds"],
         target_ratio=_ms1cfg["decoy_target_ratio"],
         features_preset=_ms1cfg["features_preset"],
@@ -1550,8 +1795,6 @@ def main() -> None:
         pseudo_label_fdr=_ms1cfg["pseudo_label_fdr"],
         r1_seed_percentile=_ms1cfg["r1_seed_percentile"],
         r2_seed_percentile=_ms1cfg["r2_seed_percentile"],
-        catboost_iterations=_ms1cfg["catboost_iterations"],
-        mokapot_max_iter=_ms1cfg["mokapot_max_iter"],
         max_iter=_ms1cfg["max_iter"],
         min_seed_positives=_ms1cfg["min_seed_positives"],
         matching_ppm=_ms1cfg["matching_ppm"],
@@ -1565,6 +1808,15 @@ def main() -> None:
         tdf_path=_maldi_raw_path,
         mob_coloc=bool(_ms1cfg.get("mob_coloc", False)),
         mob_window_multiplier=_ms1cfg["mob_window_multiplier"],
+        coloc_tic_quantile=_ms1cfg["coloc_tic_quantile"],
+        coloc_measured_pixel_mask=_measured_pixel_mask,
+        nmf_coloc=_ms1cfg["nmf_coloc"],
+        nmf_n_components=_ms1cfg["nmf_n_components"],
+        patch_coloc=bool(_ms1cfg.get("patch_coloc", False)),
+        patch_size=_ms1cfg["patch_size"],
+        patch_coloc_threshold=_ms1cfg["patch_coloc_threshold"],
+        drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
+        entrapment=bool(_ms1cfg.get("entrapment", False)),
     )
 
     # --- Write results ---

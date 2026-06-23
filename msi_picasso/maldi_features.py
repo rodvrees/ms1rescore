@@ -79,7 +79,19 @@ def compute_protein_consistency_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         protein_total_peptides = df.groupby("protein")["peptide"].nunique()
         total_peps = df["protein"].map(protein_total_peptides).clip(lower=1)
-    df["protein_coverage"] = df["protein_n_features"] / total_peps
+    # protein_coverage = fraction of the protein's tryptic peptides that are
+    # observed. The numerator is the count of distinct *observed peptides*, NOT
+    # distinct features: a target peptide can match several near-isobaric MALDI
+    # features (inflating a feature count), whereas every decoy peptide is placed
+    # on exactly one feature by construction (mz_shift/mz_shuffle). Counting
+    # features made coverage a perfect target/decoy separator (decoys pinned to
+    # n_features == tryptic_count → coverage 1.0). Counting peptides is the
+    # correct sequence-coverage definition and is symmetric: a protein and its
+    # DECOY_/ENTRAPMENT_ namespace share the same peptide set, so they get equal
+    # coverage. The denominator is the true full-digest count (set in pipeline.py).
+    protein_n_peptides = df.groupby("protein")["peptide"].nunique()
+    df["protein_n_peptides"] = df["protein"].map(protein_n_peptides).fillna(0).astype(int)
+    df["protein_coverage"] = (df["protein_n_peptides"] / total_peps).clip(upper=1.0)
 
     df["protein_rank"] = df.groupby("feature_mz")["protein_n_features"].rank(
         ascending=False, method="min"
@@ -220,9 +232,50 @@ def compute_spatial_features(
     return df
 
 
+def compute_tissue_mask(
+    ion_images: np.ndarray,
+    tic_quantile: float = 0.0,
+) -> np.ndarray:
+    """
+    Build an on-tissue pixel mask from a total-ion-current (TIC) proxy.
+
+    Every MALDI ion image is ~0 in the unmeasured padding that surrounds the
+    acquired pixel grid and follows the tissue footprint within it.  A raw
+    Pearson r between two ion images is therefore dominated by this shared
+    on/off-tissue structure, inflating the correlation between *any* pair of
+    images (real or decoy) toward the tissue outline rather than measuring
+    co-distribution within the tissue.  Restricting the correlation to
+    on-tissue pixels removes that common component.
+
+    The TIC proxy is the per-pixel sum over all supplied ion images.  Pixels
+    with TIC == 0 are unmeasured padding and are always excluded.  When
+    ``tic_quantile > 0`` the threshold is raised to that quantile of the
+    measured-pixel TIC, additionally trimming low-signal tissue edges.
+
+    Parameters
+    ----------
+    ion_images : (n_feat, H, W) array
+    tic_quantile : float in [0, 1)
+        0.0 keeps every measured pixel (drops only structural padding).
+        e.g. 0.25 keeps pixels above the 25th percentile of measured TIC.
+
+    Returns
+    -------
+    (H*W,) boolean mask over flattened pixels (True = on-tissue / keep).
+    """
+    n_feat = ion_images.shape[0]
+    tic = ion_images.reshape(n_feat, -1).sum(axis=0)
+    measured = tic > 0
+    if tic_quantile and tic_quantile > 0.0 and measured.any():
+        thr = float(np.quantile(tic[measured], tic_quantile))
+        return tic > thr
+    return measured
+
+
 def _pearson_r_matrix(
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Compute the full (n_valid × n_valid) Pearson correlation matrix.
@@ -230,6 +283,12 @@ def _pearson_r_matrix(
     Uses a manual float32 normalise + BLAS sgemm instead of ``np.corrcoef``
     which unconditionally upcasts to float64, allocating ~2× as much memory.
     For 1398 features × 49 K pixels the saving is ~550 MB at peak.
+
+    When ``pixel_mask`` (a flattened (H*W,) boolean) is supplied the correlation
+    is computed over the selected (on-tissue) pixels only; see
+    ``compute_tissue_mask``.  This is the recommended MALDI default because raw
+    images share a dominant on/off-tissue component that inflates every pairwise
+    r.  Image validity (non-constant) is then assessed on the masked pixels too.
 
     Returns
     -------
@@ -243,6 +302,9 @@ def _pearson_r_matrix(
 
     # Reshape to (n_feat, n_pix); view if already C-contiguous, else copy.
     flat_all = ion_images.reshape(n_feat, n_pix)
+    if pixel_mask is not None:
+        # Restrict to on-tissue pixels (copy: fancy-index breaks the view).
+        flat_all = flat_all[:, np.asarray(pixel_mask, dtype=bool)]
 
     stds = flat_all.std(axis=1)
     valid_mask = stds > 1e-10
@@ -287,6 +349,19 @@ def _find_partner_indices(
     best_idx = np.where(ppm_lo <= ppm_hi, idx_lo, idx_hi)
     within = np.minimum(ppm_lo, ppm_hi) <= ppm_tol
     return np.where(within, best_idx, -1).astype(np.intp)
+
+
+_COLOC_FEATURE_COLS = [
+    "protein_colocalization",
+    "protein_colocalization_max",
+    "protein_colocalization_median",
+    "protein_colocalization_n_partners",
+    "protein_colocalization_weighted",
+    "protein_colocalization_weighted_max",
+    "protein_colocalization_top2",
+    "protein_colocalization_top3",
+    "protein_colocalization_top5",
+]
 
 
 def compute_colocalization_features(
@@ -336,32 +411,352 @@ def compute_colocalization_features(
             pairs["corr_idx"].to_numpy(dtype=int),
             pairs["partner_idx"].to_numpy(dtype=int),
         ]
-        agg = (
-            pairs.groupby(["feature_mz", "protein"])["r"]
-            .agg(
-                protein_colocalization="mean",
-                protein_colocalization_max="max",
-                protein_colocalization_median="median",
-                protein_colocalization_n_partners="count",
-            )
-            .reset_index()
+
+        # Per-pair intensity weight w = sqrt(I_a * I_b), using the LINEAR p90
+        # intensity (not the log) of each feature. Higher-abundance partner pairs
+        # carry more weight. Falls back to feature_intensity, then to uniform
+        # weights (w=1, so weighted == unweighted mean) when no intensity column
+        # is present — blind to is_decoy throughout.
+        _int_col = next(
+            (c for c in ("feature_intensity_p90", "feature_intensity") if c in df.columns),
+            None,
         )
+        if _int_col is not None:
+            _mz_int = df.drop_duplicates("feature_mz").set_index("feature_mz")[_int_col]
+            _Ia = pairs["feature_mz"].map(_mz_int).to_numpy(dtype=float)
+            _Ib = pairs["partner_mz"].map(_mz_int).to_numpy(dtype=float)
+            _Ia = np.where(np.isfinite(_Ia) & (_Ia > 0), _Ia, 0.0)
+            _Ib = np.where(np.isfinite(_Ib) & (_Ib > 0), _Ib, 0.0)
+            pairs["w"] = np.sqrt(_Ia * _Ib)
+        else:
+            pairs["w"] = 1.0
+        pairs["wr"] = pairs["w"] * pairs["r"]
+
+        g = pairs.groupby(["feature_mz", "protein"])
+        agg = g["r"].agg(
+            protein_colocalization="mean",
+            protein_colocalization_max="max",
+            protein_colocalization_median="median",
+            protein_colocalization_n_partners="count",
+        )
+        # Intensity-weighted mean r (Σ w·r / Σ w) and max of w·r.
+        _wsum = g["w"].sum()
+        agg["protein_colocalization_weighted"] = g["wr"].sum() / _wsum.where(_wsum > 0, np.nan)
+        agg["protein_colocalization_weighted_max"] = g["wr"].max()
+        # Rank-weighted: mean r over the top-k highest-weight partner pairs.
+        # head(k) on the weight-sorted frame returns all rows when < k exist.
+        _pairs_by_w = pairs.sort_values("w", ascending=False)
+        for k in (2, 3, 5):
+            topk = (
+                _pairs_by_w.groupby(["feature_mz", "protein"]).head(k)
+                .groupby(["feature_mz", "protein"])["r"].mean()
+            )
+            agg[f"protein_colocalization_top{k}"] = topk
+        agg = agg.reset_index()
         df = df.merge(agg, on=["feature_mz", "protein"], how="left")
     else:
-        for col in ["protein_colocalization", "protein_colocalization_max",
-                    "protein_colocalization_median", "protein_colocalization_n_partners"]:
-            df[col] = 0.0
+        for col in _COLOC_FEATURE_COLS:
+            df[col] = np.nan
 
-    for col in ["protein_colocalization", "protein_colocalization_max",
-                "protein_colocalization_median", "protein_colocalization_n_partners"]:
-        df[col] = df[col].fillna(0.0)
+    # ``has_coloc``: 1.0 where within-protein colocalization is *defined* (the
+    # candidate has >=1 same-protein partner with a valid ion image), 0.0
+    # otherwise.  Computed before any imputation so the ranker can distinguish
+    # "not colocalizable" (a singleton / small protein) from "colocalizes
+    # poorly".  Blind to ``is_decoy``.
+    df["has_coloc"] = df["protein_colocalization"].notna().astype(np.float32)
 
-    n_scored = int((df["protein_colocalization"] != 0).sum())
+    # ``protein_colocalization_n_partners`` is a genuine count: 0 (not
+    # undefined) when a candidate has no partners.  Keep it as an honest 0.
+    df["protein_colocalization_n_partners"] = (
+        df["protein_colocalization_n_partners"].fillna(0.0)
+    )
+
+    # The correlation summaries (mean / median / max / weighted / top-k) are
+    # *undefined* without partners.  Leave them as NaN so the ranker's median
+    # imputer fills them at the train-set median (the colocalizable plateau),
+    # rather than 0.0 which would impose a protein-size-correlated floor that
+    # lifts decoys of abundant proteins into the high-score mode (see
+    # notebooks/check_good_decoys analysis).  ``has_coloc`` carries the
+    # "was it measurable" bit separately.
+
+    n_scored = int(df["protein_colocalization"].notna().sum())
     logger.info(
         f"Co-localization: {len(valid_mzs)} valid features, "
         f"{len(pairs) if len(pairs) > 0 else 0} within-protein pairs, "
         f"{n_scored}/{len(df)} candidates scored"
     )
+    return df
+
+
+_PATCH_COLOC_COLS = [
+    "protein_patch_colocalization_mean",
+    "protein_patch_colocalization_frac_above",
+]
+
+
+def compute_patch_colocalization_features(
+    df: pd.DataFrame,
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+    patch_size: int = 10,
+    threshold: float = 0.5,
+    min_patch_pixels: int = 5,
+) -> pd.DataFrame:
+    """Patch-level (local) within-protein colocalization (opt-in, ``--patch-coloc``).
+
+    Global Pearson r between two ion images is dominated by overall tissue
+    morphology. This asks a more local question: in how many small spatial
+    neighbourhoods do two same-protein peptides co-distribute? The grid is tiled
+    into non-overlapping ``patch_size``×``patch_size`` blocks; for each
+    within-protein pair, the Pearson r is computed over the on-tissue pixels
+    **inside each patch**, then aggregated across patches into
+    ``protein_patch_colocalization_mean`` (mean over partners of the per-pair
+    mean-over-patches r), ``_max`` (max over partners of the per-pair
+    max-over-patches r) and ``_frac_above`` (mean over partners of the per-pair
+    fraction of patches with r > ``threshold``). Purely spatial → blind to
+    ``is_decoy``.
+    """
+    if ion_images is None or ion_image_mzs is None:
+        for col in _PATCH_COLOC_COLS:
+            df[col] = 0.0
+        return df
+
+    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+    n_feat, H, W = ion_images.shape
+    flat = ion_images.reshape(n_feat, H * W)
+    mz_to_idx = {float(mz): i for i, mz in enumerate(mz_arr)}
+
+    # Within-protein ordered feature pairs (same self-join as the global version),
+    # mapped to ion-image row indices.
+    base = (
+        df[["feature_mz", "protein"]]
+        .drop_duplicates()
+        .assign(img_idx=lambda d: d["feature_mz"].map(lambda m: mz_to_idx.get(float(m))))
+    )
+    base = base[base["img_idx"].notna()].copy()
+    base["img_idx"] = base["img_idx"].astype(int)
+    pairs = base.merge(
+        base.rename(columns={"feature_mz": "partner_mz", "img_idx": "partner_idx"}),
+        on="protein",
+    )
+    pairs = pairs[pairs["feature_mz"] != pairs["partner_mz"]].reset_index(drop=True)
+
+    if len(pairs) == 0:
+        for col in _PATCH_COLOC_COLS:
+            df[col] = 0.0
+        return df
+
+    a_idx = pairs["img_idx"].to_numpy(dtype=np.intp)
+    b_idx = pairs["partner_idx"].to_numpy(dtype=np.intp)
+    n_pairs = len(pairs)
+
+    # Tile into patches; keep only on-tissue pixels (drop unmeasured padding).
+    mask_flat = (
+        np.asarray(pixel_mask, dtype=bool) if pixel_mask is not None
+        else np.ones(H * W, dtype=bool)
+    )
+    grid = np.arange(H * W).reshape(H, W)
+    patches: list[np.ndarray] = []
+    n_patches_total = 0
+    for r0 in range(0, H, patch_size):
+        for c0 in range(0, W, patch_size):
+            n_patches_total += 1
+            px = grid[r0:r0 + patch_size, c0:c0 + patch_size].ravel()
+            px = px[mask_flat[px]]
+            if px.size >= min_patch_pixels:
+                patches.append(px)
+
+    if not patches:
+        logger.info(
+            f"Patch colocalization: 0/{n_patches_total} patches kept "
+            f"(patch_size={patch_size}); no on-tissue patches — features set to 0"
+        )
+        for col in _PATCH_COLOC_COLS:
+            df[col] = 0.0
+        return df
+
+    # Only the features that appear in some pair need normalising per patch.
+    feats = np.unique(np.concatenate([a_idx, b_idx]))
+    row2pos = np.full(n_feat, -1, dtype=np.intp)
+    row2pos[feats] = np.arange(len(feats))
+    posA, posB = row2pos[a_idx], row2pos[b_idx]
+
+    s_sum = np.zeros(n_pairs); s_max = np.full(n_pairs, -np.inf)
+    s_cnt = np.zeros(n_pairs); s_above = np.zeros(n_pairs)
+    px_per_patch = 0
+    for px in patches:
+        px_per_patch += px.size
+        Xp = flat[feats][:, px].astype(np.float64)
+        Xc = Xp - Xp.mean(axis=1, keepdims=True)
+        norm = np.sqrt((Xc * Xc).sum(axis=1))
+        ok = norm > 1e-12
+        Xn = Xc / np.where(ok, norm, 1.0)[:, None]
+        rp = (Xn[posA] * Xn[posB]).sum(axis=1)
+        valid = ok[posA] & ok[posB]            # skip features constant in this patch
+        s_sum[valid] += rp[valid]
+        np.maximum.at(s_max, np.where(valid)[0], rp[valid])
+        s_cnt[valid] += 1
+        s_above[valid] += (rp[valid] > threshold)
+
+    seen = s_cnt > 0
+    pairs["pr_mean"] = np.where(seen, s_sum / np.where(seen, s_cnt, 1.0), np.nan)
+    pairs["pr_max"] = np.where(seen, s_max, np.nan)
+    pairs["pr_frac"] = np.where(seen, s_above / np.where(seen, s_cnt, 1.0), np.nan)
+    pairs = pairs[seen]
+
+    if len(pairs):
+        agg = (
+            pairs.groupby(["feature_mz", "protein"])
+            .agg(
+                protein_patch_colocalization_mean=("pr_mean", "mean"),
+                protein_patch_colocalization_max=("pr_max", "max"),
+                protein_patch_colocalization_frac_above=("pr_frac", "mean"),
+            )
+            .reset_index()
+        )
+        df = df.merge(agg, on=["feature_mz", "protein"], how="left")
+    for col in _PATCH_COLOC_COLS:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].fillna(0.0)
+
+    logger.info(
+        f"Patch colocalization: {len(patches)}/{n_patches_total} patches kept "
+        f"(patch_size={patch_size}, mean {px_per_patch / len(patches):.0f} on-tissue px/patch), "
+        f"{n_pairs} within-protein pairs, threshold={threshold}"
+    )
+    return df
+
+
+_NMF_COLOC_COLS = [
+    "protein_nmf_colocalization",
+    "protein_nmf_colocalization_max",
+    "protein_nmf_colocalization_median",
+]
+
+
+def _nmf_loading_cosine_matrix(
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+    n_components: int = 12,
+    random_state: int = 42,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Factorise the (TIC-normalised, on-tissue) ion-image matrix with NMF and
+    return the full cosine-similarity matrix of the per-image loading vectors.
+
+    NMF decomposes each ion image into ``n_components`` additive spatial parts
+    (tissue substructures); each image is then a non-negative loading vector
+    over those parts.  Two features "share a substructure" when their loading
+    vectors are aligned, measured by cosine similarity (scale-invariant, so
+    absolute abundance does not matter).  Images are TIC-normalised (unit sum
+    over on-tissue pixels) first so the decomposition reflects spatial pattern
+    rather than intensity.
+
+    Returns the same triple shape as ``_pearson_r_matrix`` so the colocalization
+    aggregation can be shared: (cos_matrix, valid_mz_arr, mz_to_idx).  Only
+    images with a non-zero loading (i.e. detected somewhere on tissue) are valid.
+    """
+    from sklearn.decomposition import NMF
+
+    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+    n_feat = len(mz_arr)
+    flat = ion_images.reshape(n_feat, -1)
+    if pixel_mask is not None:
+        flat = flat[:, np.asarray(pixel_mask, dtype=bool)]
+    flat = flat.astype(np.float32, copy=True)
+
+    # TIC-normalise each image (unit sum over on-tissue pixels); leave all-zero
+    # (never-detected) images as zero rows.
+    row_sum = flat.sum(axis=1, keepdims=True)
+    np.divide(flat, row_sum, out=flat, where=row_sum > 0)
+
+    k = int(min(n_components, max(2, flat.shape[0] - 1)))
+    nmf = NMF(n_components=k, init="nndsvda", max_iter=400, random_state=random_state, tol=1e-4)
+    W = nmf.fit_transform(flat)  # (n_feat, k) loadings
+    del flat
+
+    # Valid = images that loaded onto at least one component.
+    valid_mask = W.sum(axis=1) > 0
+    valid_mz_arr = mz_arr[valid_mask]
+    L = W[valid_mask]
+    norms = np.sqrt((L * L).sum(axis=1, keepdims=True))
+    L = L / np.where(norms > 1e-12, norms, 1.0)
+    cos_matrix = (L @ L.T).astype(np.float32)
+
+    mz_to_idx = {float(mz): i for i, mz in enumerate(valid_mz_arr)}
+    logger.info(
+        f"NMF colocalization: K={k}, {len(valid_mz_arr)}/{n_feat} images with non-zero loading, "
+        f"reconstruction_err={nmf.reconstruction_err_:.4g}"
+    )
+    return cos_matrix, valid_mz_arr, mz_to_idx
+
+
+def compute_nmf_colocalization_features(
+    df: pd.DataFrame,
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+    n_components: int = 12,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Within-protein NMF substructure-sharing colocalization features.
+
+    Mirrors ``compute_colocalization_features`` but the pairwise quantity is the
+    cosine similarity of NMF spatial-component loadings instead of the pixel
+    Pearson r.  This asks whether same-protein peptides occupy the *same tissue
+    substructure*, a sharper question than global ion-image correlation (which is
+    dominated by overall tissue morphology).  Decoys must occupy a separate
+    protein namespace (every decoy method gives them a ``DECOY_`` / ``ENTRAPMENT_``
+    label), so the within-protein aggregation never pools a decoy with its source
+    target.
+
+    Features added: ``protein_nmf_colocalization`` (mean), ``_max``, ``_median``
+    — the within-protein mean/max/median pairwise loading cosine.
+    """
+    cos_matrix, valid_mz_arr, mz_to_idx = _nmf_loading_cosine_matrix(
+        ion_images, ion_image_mzs, pixel_mask=pixel_mask,
+        n_components=n_components, random_state=random_state,
+    )
+
+    base = (
+        df[["feature_mz", "protein"]]
+        .drop_duplicates()
+        .assign(corr_idx=lambda d: d["feature_mz"].map(lambda m: mz_to_idx.get(float(m))))
+    )
+    base = base[base["corr_idx"].notna()].copy()
+    base["corr_idx"] = base["corr_idx"].astype(int)
+
+    pairs = base.merge(
+        base.rename(columns={"feature_mz": "partner_mz", "corr_idx": "partner_idx"}),
+        on="protein",
+    )
+    pairs = pairs[pairs["feature_mz"] != pairs["partner_mz"]]
+
+    if len(pairs) > 0:
+        pairs = pairs.copy()
+        pairs["c"] = cos_matrix[
+            pairs["corr_idx"].to_numpy(dtype=int),
+            pairs["partner_idx"].to_numpy(dtype=int),
+        ]
+        agg = (
+            pairs.groupby(["feature_mz", "protein"])["c"]
+            .agg(
+                protein_nmf_colocalization="mean",
+                protein_nmf_colocalization_max="max",
+                protein_nmf_colocalization_median="median",
+            )
+            .reset_index()
+        )
+        df = df.merge(agg, on=["feature_mz", "protein"], how="left")
+    else:
+        for col in _NMF_COLOC_COLS:
+            df[col] = 0.0
+
+    for col in _NMF_COLOC_COLS:
+        df[col] = df[col].fillna(0.0)
     return df
 
 
@@ -677,6 +1072,44 @@ def _finetune_and_predict(
     return df["peptide"].map(ft_pred_dict).values.astype(float)
 
 
+def _ccs_mz_baseline(
+    feature_mz: np.ndarray,
+    mh_mz: np.ndarray,
+    fit_mz: np.ndarray,
+    fit_ccs: np.ndarray,
+    min_points: int = 10,
+) -> np.ndarray | None:
+    """Expected CCS difference ``g(feature_mz) − g(mh_mz)`` from a power-law CCS↔m/z
+    trend ``g(mz) = A·mz^B`` fit on ``(fit_mz, fit_ccs)`` (the calibration peptides).
+
+    Subtracting this baseline from the raw CCS delta removes the m/z-gap component,
+    leaving the conformational residual.  For a candidate whose peptide m/z equals
+    its feature m/z (targets) the baseline is 0.  Returns ``None`` when fewer than
+    ``min_points`` finite positive calibration pairs are available (caller then
+    falls back to the raw delta).  Pure / unit-testable (no im2deep needed).
+    """
+    fit_mz = np.asarray(fit_mz, dtype=float)
+    fit_ccs = np.asarray(fit_ccs, dtype=float)
+    ok = np.isfinite(fit_mz) & (fit_mz > 0) & np.isfinite(fit_ccs) & (fit_ccs > 0)
+    if int(ok.sum()) < min_points:
+        return None
+    B, logA = np.polyfit(np.log(fit_mz[ok]), np.log(fit_ccs[ok]), 1)
+    logger.info(
+        "  IM2Deep CCS m/z-trend fit: CCS = %.3g·mz^%.3f (on %d calibration features)",
+        float(np.exp(logA)), float(B), int(ok.sum()),
+    )
+
+    def _g(mz):
+        mz = np.asarray(mz, dtype=float)
+        out = np.full(len(mz), np.nan)
+        m = np.isfinite(mz) & (mz > 0)
+        out[m] = np.exp(logA) * mz[m] ** B
+        return out
+
+    base = _g(feature_mz) - _g(mh_mz)
+    return np.where(np.isfinite(base), base, 0.0)
+
+
 def compute_im2deep_features(
     df: pd.DataFrame,
     observed_ccs_per_feature: dict | None = None,
@@ -697,7 +1130,16 @@ def compute_im2deep_features(
     im2deep_abs_delta_ccs_pct   |residual| / predicted × 100
     im2deep_ccs_zscore          z-score of delta_ccs within each feature group
     im2deep_ccs_rank            rank of abs_delta_ccs_pct within feature group
+    im2deep_delta_ccs_resid           m/z-detrended (conformational) signed residual
+    im2deep_abs_delta_ccs_pct_resid   |detrended residual| / predicted × 100
+    im2deep_ccs_zscore_resid          z-score of the detrended residual per group
+    im2deep_ccs_rank_resid            rank of the detrended |residual| per group
     # im2deep_mahalanobis         Mahalanobis distance in (ppm_error_abs, delta_ccs) space
+
+    The ``*_resid`` features subtract the fitted CCS↔m/z trend so they measure
+    conformational mismatch rather than the m/z baseline (see below).  For
+    targets they equal the raw features; for decoys whose peptide m/z differs
+    from the feature m/z they remove the trivial m/z-gap separation.
     """
     if not observed_ccs_per_feature:
         return df
@@ -738,10 +1180,11 @@ def compute_im2deep_features(
     # is_calibration_peptide column is absent (e.g. direct callers).  Three methods:
     #   linear  — global additive shift (LinearCCSCalibration, default; symmetric
     #             across targets/decoys, so safe for the ranker CCS features)
+    #   raw     — no calibration (use raw IM2Deep predictions)
     #   spline  — piecewise spline mapping (SplineCCSCalibration)
     #   finetune — transfer-learning re-training of the neural network weights
     predicted_cal = predicted.copy()
-    if "is_calibration_peptide" in df.columns or "n_candidates" in df.columns:
+    if calibration_method != "raw" and ("is_calibration_peptide" in df.columns or "n_candidates" in df.columns):
         try:
             if "is_calibration_peptide" in df.columns:
                 single_mask = df["is_calibration_peptide"].to_numpy(dtype=bool)
@@ -824,37 +1267,92 @@ def compute_im2deep_features(
     )
     df["im2deep_ccs_rank"] = df.groupby("feature_mz")["_im2deep_abspct"].rank(method="min")
 
-    # # Mahalanobis distance in (ppm_error_abs, delta_ccs) space per feature
-    # mahal = np.full(len(df), np.nan)
-    # df_reset = df.reset_index(drop=False)
-    # for _, grp in df_reset.groupby("feature_mz"):
-    #     if len(grp) < 3:
-    #         continue
-    #     X = grp[["ppm_error_abs", "_im2deep_delta"]].values.astype(float)
-    #     valid_mask = ~np.isnan(X).any(axis=1)
-    #     X_valid = X[valid_mask]
-    #     if X_valid.shape[0] < 3:
-    #         continue
-    #     try:
-    #         cov = np.cov(X_valid.T)
-    #         if np.linalg.matrix_rank(cov) < 2:
-    #             continue
-    #         cov_inv = np.linalg.inv(cov)
-    #         mean = X_valid.mean(axis=0)
-    #         for row_pos, orig_idx in enumerate(grp.index):
-    #             if valid_mask[row_pos]:
-    #                 diff = X[row_pos] - mean
-    #                 mahal[orig_idx] = float(np.sqrt(diff @ cov_inv @ diff))
-    #     except np.linalg.LinAlgError:
-    #         continue
+    # --- m/z-detrended (conformational) CCS residual ---------------------------
+    # The raw CCS delta leaks the m/z baseline when a candidate's peptide m/z
+    # differs from its feature m/z (decoys: mz_shift / mz_shuffle / entrapment).
+    # CCS rises monotonically with m/z, so |observed_CCS(feature) −
+    # predicted_CCS(peptide)| is dominated by the m/z gap, not conformation —
+    # e.g. mz_shuffle deliberately relocates peptides far in mass, giving decoys a
+    # huge, trivially-separable CCS delta that does NOT reflect a real (isobaric)
+    # false positive.  Fit the population CCS↔m/z trend g(mz) = A·mz^B on the
+    # calibration peptides and subtract it from both sides: the residual measures
+    # the conformational mismatch only.  For targets (feature_mz == mh_mz) the two
+    # g terms cancel → identical to the raw delta; for decoys the baseline cancels,
+    # leaving conf(observed) − conf(predicted), exchangeable with an isobaric FP.
+    if "is_calibration_peptide" in df.columns:
+        cal_m = df["is_calibration_peptide"].to_numpy(dtype=bool)
+    elif "n_candidates" in df.columns:
+        cal_m = df["n_candidates"].values == 1
+    else:
+        cal_m = ~np.asarray(
+            df.get("is_decoy", pd.Series(False, index=df.index)), dtype=bool
+        )
+    fmz = df["feature_mz"].to_numpy(dtype=float)
+    baseline = _ccs_mz_baseline(
+        fmz, df["mh_mz"].to_numpy(dtype=float),
+        fit_mz=fmz[cal_m], fit_ccs=observed[cal_m],
+    )
+    if baseline is not None:
+        resid_delta = delta - baseline  # remove the expected m/z-gap CCS difference
+    else:
+        logger.warning("IM2Deep CCS m/z-detrend: trend fit unavailable — residual = raw delta")
+        resid_delta = delta.copy()
+    resid_abspct = (
+        np.abs(resid_delta)
+        / np.where(np.abs(predicted_cal) > 1e-6, np.abs(predicted_cal), 1.0)
+        * 100.0
+    )
 
-    # df["im2deep_mahalanobis"] = mahal
-    df.drop(columns=["_im2deep_delta", "_im2deep_abspct"], inplace=True, errors="ignore")
+    df["_resid_delta"] = resid_delta
+    df["_resid_abspct"] = resid_abspct
+    df["im2deep_delta_ccs_resid"] = resid_delta
+    df["im2deep_abs_delta_ccs_pct_resid"] = resid_abspct
+    df["im2deep_ccs_zscore_resid"] = df.groupby("feature_mz")["_resid_delta"].transform(
+        lambda x: pd.Series(0.0, index=x.index)
+        if len(x) < 2 or x.std() < 1e-12
+        else (x - x.mean()) / x.std()
+    )
+    df["im2deep_ccs_rank_resid"] = df.groupby("feature_mz")["_resid_abspct"].rank(method="min")
+
+    # Diagnostic: the detrended decoy residual should NOT track the m/z relocation
+    # distance (decoy_delta_da), unlike the raw delta — confirms the leak is gone.
+    if "is_decoy" in df.columns and "decoy_delta_da" in df.columns:
+        dmask = df["is_decoy"].astype(bool).to_numpy()
+        dd = np.abs(df.loc[dmask, "decoy_delta_da"].to_numpy(dtype=float))
+
+        def _abscorr(vals) -> tuple[float, int]:
+            # Correlate only over decoys with a FINITE CCS delta AND a finite,
+            # non-zero relocation distance. Masking per-array (not just on dd) is
+            # essential: a single NaN CCS delta makes np.std/np.corrcoef return NaN,
+            # which previously produced an all-NaN leak check even when most decoys
+            # had a valid CCS delta.
+            a = np.abs(np.asarray(vals, dtype=float))
+            m = np.isfinite(a) & np.isfinite(dd) & (dd > 0)
+            n = int(m.sum())
+            if n < 10 or np.std(a[m]) < 1e-12 or np.std(dd[m]) < 1e-12:
+                return float("nan"), n
+            return float(abs(np.corrcoef(a[m], dd[m])[0, 1])), n
+
+        raw_c, n_raw = _abscorr(df.loc[dmask, "im2deep_delta_ccs"].to_numpy())
+        res_c, _ = _abscorr(resid_delta[dmask])
+        _fmt = lambda x: "n/a" if not np.isfinite(x) else f"{x:.2f}"
+        logger.info(
+            "  CCS m/z-leak check (decoys, n=%d): |corr(raw Δ, decoy_delta_da)|=%s → "
+            "|corr(residual Δ, decoy_delta_da)|=%s",
+            n_raw, _fmt(raw_c), _fmt(res_c),
+        )
+
+    df.drop(
+        columns=["_im2deep_delta", "_im2deep_abspct", "_resid_delta", "_resid_abspct"],
+        inplace=True, errors="ignore",
+    )
 
     # Fill NaN with median (symmetric fill — no target/decoy information)
     for col in [
         "im2deep_delta_ccs", "im2deep_abs_delta_ccs_pct",
         "im2deep_ccs_zscore", "im2deep_ccs_rank",
+        "im2deep_delta_ccs_resid", "im2deep_abs_delta_ccs_pct_resid",
+        "im2deep_ccs_zscore_resid", "im2deep_ccs_rank_resid",
     ]:
         valid = df[col].dropna()
         fill = float(valid.median()) if len(valid) > 0 else 0.0
@@ -957,16 +1455,46 @@ def compute_peptide_property_features(df: pd.DataFrame) -> pd.DataFrame:
 # E1 — Isotopologue spatial co-localization
 # ---------------------------------------------------------------------------
 
-def _pearson_r_pairwise(images_a: np.ndarray, images_b: np.ndarray) -> np.ndarray:
-    """Per-feature Pearson r between corresponding images in two (N, H, W) arrays."""
+def _pearson_r_pairwise(
+    images_a: np.ndarray,
+    images_b: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-feature Pearson r between corresponding images in two (N, H, W) arrays.
+
+    When ``pixel_mask`` (flattened (H*W,) boolean) is given, r is computed over
+    the selected on-tissue pixels only (see ``compute_tissue_mask``).
+    """
     n = len(images_a)
     a = images_a.reshape(n, -1).astype(np.float32)
     b = images_b.reshape(n, -1).astype(np.float32)
+    if pixel_mask is not None:
+        m = np.asarray(pixel_mask, dtype=bool)
+        a = a[:, m]
+        b = b[:, m]
     a -= a.mean(axis=1, keepdims=True)
     b -= b.mean(axis=1, keepdims=True)
     num = (a * b).sum(axis=1)
     denom = np.sqrt((a * a).sum(axis=1)) * np.sqrt((b * b).sum(axis=1))
     return np.where(denom > 1e-10, num / denom, np.nan).astype(np.float32)
+
+
+def _m0_valid_mask(ion_images, ion_image_mzs, pixel_mask=None):
+    """Boolean (N,) mask of M0 images with non-constant signal over the
+    (optionally pixel-masked) pixels. Shared by the direct-image colocalization
+    paths."""
+    flat_m0 = ion_images.reshape(len(np.asarray(ion_image_mzs, dtype=np.float64)), -1)
+    if pixel_mask is not None:
+        flat_m0 = flat_m0[:, np.asarray(pixel_mask, dtype=bool)]
+    return flat_m0.std(axis=1) > 1e-10
+
+
+def _assign_coloc_column(df, col, mapping):
+    """Map ``feature_mz`` → Pearson r and fill missing values with the column
+    median (0.0 when no finite value exists). Shared colocalization tail."""
+    df[col] = df["feature_mz"].map(mapping)
+    valid = df[col].dropna()
+    df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
 
 
 def compute_isotopologue_colocalization(
@@ -976,6 +1504,7 @@ def compute_isotopologue_colocalization(
     ppm_tolerance: float = 10.0,
     _corr_cache: tuple | None = None,
     extra_ion_images: dict | None = None,
+    pixel_mask: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
     Pearson r between the M0 ion image and the M+1 / M+2 ion images (E1).
@@ -1005,10 +1534,9 @@ def compute_isotopologue_colocalization(
 
     if m1_images is not None and m2_images is not None:
         # Direct per-feature Pearson r: no partner lookup needed.
-        mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
-        valid_mask = ion_images.reshape(len(mz_arr), -1).std(axis=1) > 1e-10
-        r_m1_arr = _pearson_r_pairwise(ion_images[valid_mask], m1_images[valid_mask])
-        r_m2_arr = _pearson_r_pairwise(ion_images[valid_mask], m2_images[valid_mask])
+        valid_mask = _m0_valid_mask(ion_images, ion_image_mzs, pixel_mask)
+        r_m1_arr = _pearson_r_pairwise(ion_images[valid_mask], m1_images[valid_mask], pixel_mask=pixel_mask)
+        r_m2_arr = _pearson_r_pairwise(ion_images[valid_mask], m2_images[valid_mask], pixel_mask=pixel_mask)
         n_m1_found = int(np.isfinite(r_m1_arr).sum())
         logger.info(
             f"Isotopologue colocalization (E1): direct images — "
@@ -1040,9 +1568,7 @@ def compute_isotopologue_colocalization(
         ("isotope_image_colocalization_m2",   r_m2_map),
         ("isotope_image_colocalization_mean", r_mean_map),
     ]:
-        df[col] = df["feature_mz"].map(mapping)
-        valid = df[col].dropna()
-        df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
+        _assign_coloc_column(df, col, mapping)
 
     return df
 
@@ -1058,6 +1584,7 @@ def compute_adduct_colocalization(
     ppm_tolerance: float = 10.0,
     _corr_cache: tuple | None = None,
     extra_ion_images: dict | None = None,
+    pixel_mask: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """
     Pearson r between the M0 ion image and Na/K/CHCA adduct ion images (E2).
@@ -1084,20 +1611,16 @@ def compute_adduct_colocalization(
 
     if extra_ion_images and any(k in extra_ion_images for k in _ADDUCT_DELTAS):
         # Direct per-feature Pearson r using pre-extracted adduct images.
-        mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
-        valid_mask = ion_images.reshape(len(mz_arr), -1).std(axis=1) > 1e-10
+        valid_mask = _m0_valid_mask(ion_images, ion_image_mzs, pixel_mask)
         m0_valid = ion_images[valid_mask]
         for adduct_name in _ADDUCT_DELTAS:
             adduct_imgs = extra_ion_images.get(adduct_name)
             if adduct_imgs is not None:
-                r_arr = _pearson_r_pairwise(m0_valid, adduct_imgs[valid_mask])
+                r_arr = _pearson_r_pairwise(m0_valid, adduct_imgs[valid_mask], pixel_mask=pixel_mask)
             else:
                 r_arr = np.full(n_valid, np.nan, dtype=np.float32)
             mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
-            col = f"adduct_colocalization_{adduct_name}"
-            df[col] = df["feature_mz"].map(mapping)
-            valid_col = df[col].dropna()
-            df[col] = df[col].fillna(float(valid_col.median()) if len(valid_col) > 0 else 0.0)
+            _assign_coloc_column(df, f"adduct_colocalization_{adduct_name}", mapping)
         logger.info(
             f"Adduct colocalization (E2): direct images used for "
             f"{[k for k in _ADDUCT_DELTAS if extra_ion_images.get(k) is not None]}"
@@ -1113,10 +1636,7 @@ def compute_adduct_colocalization(
                 np.nan,
             )
             mapping = {float(mz): float(r) for mz, r in zip(valid_mz_arr, r_arr)}
-            col = f"adduct_colocalization_{adduct_name}"
-            df[col] = df["feature_mz"].map(mapping)
-            valid_col = df[col].dropna()
-            df[col] = df[col].fillna(float(valid_col.median()) if len(valid_col) > 0 else 0.0)
+            _assign_coloc_column(df, f"adduct_colocalization_{adduct_name}", mapping)
         n_found = sum(
             int((_find_partner_indices(valid_mz_arr, valid_mz_arr + d, ppm_tolerance) >= 0).sum())
             for d in _ADDUCT_DELTAS.values()
