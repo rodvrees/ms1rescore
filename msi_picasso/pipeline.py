@@ -1318,6 +1318,38 @@ def _select_feature_winners(
     return winner_pos, winners_df
 
 
+def _report_entrapment(result_df: "pd.DataFrame", features_df: "pd.DataFrame", output_dir: str) -> None:
+    """Count entrapment pseudo-target survivals and write entrapment_result.tsv."""
+    if "source" not in features_df.columns:
+        return
+    result_df = result_df.copy()
+    result_df["source"] = features_df["source"].values
+    ent = result_df["source"] == "entrapment_shuffled"
+    if not ent.any():
+        return
+    winner = result_df["is_tdc_winner"].fillna(False).astype(bool)
+    q = result_df["q_value"].fillna(np.inf)
+    n_sub = int(ent.sum())
+    is_decoy = result_df["is_decoy"].astype(bool)
+    # Denominator = real targets only (exclude entrapment pseudo-targets and all decoys).
+    real_target = (~is_decoy) & (~ent)
+    lines = ["\nEntrapment validation results:"]
+    lines.append(f"  Entrapment peptides submitted: {n_sub}")
+    for fdr in [0.01, 0.05, 0.10]:
+        mask = winner & (q <= fdr)
+        n_ent = int((ent & mask).sum())
+        n_all = int((real_target & mask).sum())
+        frac = n_ent / n_all if n_all else 0.0
+        lines.append(
+            f"  Entrapment IDs at {fdr*100:.0f}% FDR: {n_ent} "
+            f"({frac*100:.1f}% of {n_all} total IDs; expected ≤{fdr*100:.0f}%)"
+        )
+    print("\n".join(lines))
+    out = os.path.join(output_dir, "entrapment_result.tsv")
+    result_df[ent].to_csv(out, sep="\t", index=False)
+    logger.info("entrapment: results written to %s", out)
+
+
 def rescore(
     fasta_path: str,
     maldi_mzs: np.ndarray,
@@ -1399,12 +1431,14 @@ def rescore(
     mob_coloc: bool = False,
     mob_window_multiplier: float = 2.0,
     coloc_tic_quantile: float = 0.0,
+    coloc_measured_pixel_mask: "np.ndarray | None" = None,
     nmf_coloc: bool = False,
     nmf_n_components: int = 12,
     patch_coloc: bool = False,
     patch_size: int = 10,
     patch_coloc_threshold: float = 0.5,
     drop_zero_signal: bool = False,
+    entrapment: bool = False,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -1760,6 +1794,26 @@ def rescore(
         peptide_db.loc[~_pdb_decoy].groupby("protein")["peptide"].nunique().to_dict()
     )
 
+    # --- Pre-generate entrapment DB (before maldi_mzs is fixed for raw-query mode) ---
+    # In raw-query mode maldi_mzs is derived from peptide_db mzs; entrapment
+    # peptides are not in that grid.  Building _entrapment_db here lets us expand
+    # the grid before Step 1c so entrapment mzs are included in the extraction.
+    _entrapment_db = None
+    if entrapment:
+        if lcms_ids is None:
+            raise ValueError(
+                "--entrapment requires LC-MS/MS IDs (--lcms-peptides or --msf); "
+                "entrapment candidates are generated from confirmed sequences."
+            )
+        from msi_picasso.candidates import generate_entrapment_from_lcms_ids
+        _entrapment_db = generate_entrapment_from_lcms_ids(
+            lcms_ids,
+            matching_ppm=matching_ppm,
+            missed_cleavages=missed_cleavages,
+            min_length=min_length,
+            max_length=max_length,
+        )
+
     # --- Raw-query mode: invert ordering (candidates drive MALDI extraction) ---
     # The candidate digest m/z become the matching grid; the actual ion images
     # are queried from the raw .d AFTER candidate generation (see below).
@@ -1777,10 +1831,21 @@ def rescore(
                 UserWarning,
                 stacklevel=2,
             )
-        maldi_mzs = np.sort(
+        _target_mzs = np.sort(np.unique(
             peptide_db["mh_mz"].dropna().to_numpy(dtype=np.float64)
-        )
-        maldi_mzs = np.unique(maldi_mzs)
+        ))
+        if _entrapment_db is not None and len(_entrapment_db) > 0:
+            _ent_extra = np.sort(np.unique(
+                _entrapment_db["mh_mz"].dropna().to_numpy(dtype=np.float64)
+            ))
+            maldi_mzs = np.sort(np.unique(np.concatenate([_target_mzs, _ent_extra])))
+            logger.info(
+                "Raw-query mode + entrapment: expanded matching grid from %d to %d "
+                "unique m/z (added %d entrapment mzs).",
+                len(_target_mzs), len(maldi_mzs), len(_ent_extra),
+            )
+        else:
+            maldi_mzs = _target_mzs
         logger.info(
             "Raw-query mode: using %d unique candidate m/z as the matching grid; "
             "ion images will be extracted from %s after candidate generation.",
@@ -1840,9 +1905,17 @@ def rescore(
         # peptide-specific predicted-vs-observed match (CCS, isotope).
         target_db = peptide_db[~peptide_db["is_decoy"].astype(bool)].reset_index(drop=True)
         logger.info("Step 1c: Generating m/z-assignment-shuffle (derangement) decoys...")
+        # In raw-query mode with entrapment the grid is expanded; restrict the
+        # shuffle destinations to target mzs so decoys don't land on entrapment
+        # features (_target_mzs is set in the raw-query block above, else maldi_mzs).
+        _shuffle_grid = (
+            _target_mzs
+            if maldi_query_raw and _entrapment_db is not None and len(_entrapment_db) > 0
+            else maldi_mzs
+        )
         candidates = generate_mz_shuffle_candidates(
             target_db,
-            maldi_mzs,
+            _shuffle_grid,
             matching_ppm=matching_ppm,
             maldi_intensities=_maldi_intensities_arr,
             maldi_intensities_p90=maldi_intensities_p90,
@@ -1921,6 +1994,34 @@ def rescore(
             maldi_intensities_p90=maldi_intensities_p90,
             maldi_intensities_sum=maldi_intensities_sum,
         )
+    # --- Entrapment: inject shuffled pseudo-target candidates ---
+    if _entrapment_db is not None and len(_entrapment_db) > 0:
+        from msi_picasso.candidates import match_to_maldi_features as _mtf
+        _ent_cands = _mtf(
+            maldi_mzs, _entrapment_db, matching_ppm,
+            maldi_intensities=_maldi_intensities_arr,
+            maldi_intensities_p90=maldi_intensities_p90,
+            maldi_intensities_sum=maldi_intensities_sum,
+        )
+        if len(_ent_cands) > 0:
+            candidates = pd.concat([candidates, _ent_cands], ignore_index=True)
+            candidates["is_decoy"] = candidates["is_decoy"].astype(bool)
+            _fc = "feature_idx" if "feature_idx" in candidates.columns else "feature_mz"
+            candidates["n_candidates"] = (
+                candidates.groupby(_fc)[_fc].transform("count")
+            )
+            logger.info(
+                "entrapment: added %d shuffled pseudo-target candidates "
+                "(%d ENTRAPMENT proteins, %d features).",
+                len(_ent_cands), _ent_cands["protein"].nunique(), _ent_cands[_fc].nunique(),
+            )
+        else:
+            logger.warning(
+                "entrapment: no shuffled candidates matched any MALDI feature "
+                "(matching_ppm=%.1f). Validation will report 0 entrapment IDs.",
+                matching_ppm,
+            )
+
     if verbose:
         logger.debug(f"Writing matched candidates to {output_dir}/9_debug_candidates.tsv")
         candidates.to_csv(f"{output_dir}/9_debug_candidates.tsv", sep="\t", index=False)
@@ -2239,6 +2340,7 @@ def rescore(
         im2deep_calibration=im2deep_calibration,
         im2deep_kwargs=im2deep_kwargs,
         coloc_tic_quantile=coloc_tic_quantile,
+        coloc_measured_pixel_mask=coloc_measured_pixel_mask,
         nmf_coloc=nmf_coloc,
         nmf_n_components=nmf_n_components,
         patch_coloc=patch_coloc,
@@ -2725,6 +2827,8 @@ def rescore(
                 except Exception as _pfm_exc:
                     logger.warning("debug_pfm_explanations failed: %s", _pfm_exc)
 
+        if entrapment:
+            _report_entrapment(result_df, features_df, output_dir)
         return psm_list, result_df, feature_names, features_df
 
     elif model == "qda":
@@ -2912,6 +3016,8 @@ def rescore(
                 ccs_tol_pct=_ccs_tol_pct, single_round=single_round,
             )
 
+        if entrapment:
+            _report_entrapment(result_df, features_df, output_dir)
         return psm_list, result_df, feature_names, features_df
 
     else:

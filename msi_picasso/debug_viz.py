@@ -1171,10 +1171,16 @@ def plot_feature_distributions(
         res.get("is_tdc_winner", pd.Series(False, index=res.index))
         .fillna(False).astype(bool).values
     )
-    target_mask = ~is_decoy
+    # Entrapment pseudo-targets: is_decoy=False but source=="entrapment_shuffled"
+    _src = feat.get("source", pd.Series("", index=feat.index)).fillna("").values
+    entrapment_mask = (~is_decoy) & (_src == "entrapment_shuffled")
+    has_entrapment = entrapment_mask.any()
+
+    target_mask = (~is_decoy) & (~entrapment_mask)
     decoy_mask = is_decoy
     winner_target_mask = is_winner & target_mask
     winner_decoy_mask = is_winner & decoy_mask
+    winner_ent_mask = is_winner & entrapment_mask
 
     gt_mask = np.zeros(len(feat), dtype=bool)
     if gt_peptides and "peptide" in feat.columns:
@@ -1215,7 +1221,8 @@ def plot_feature_distributions(
     feature_names = _explicit + _extra
 
     def _draw(ax: plt.Axes, t_vals: np.ndarray, d_vals: np.ndarray,
-               bins: np.ndarray, subtitle: str) -> None:
+               bins: np.ndarray, subtitle: str,
+               e_vals: np.ndarray | None = None) -> None:
         ax.set_title(subtitle, fontsize=8)
         if len(t_vals) > 0:
             ax.hist(t_vals, bins=bins, density=True, alpha=0.55,
@@ -1227,7 +1234,12 @@ def plot_feature_distributions(
                     color="tomato", label=f"Decoy (n={len(d_vals)})")
             ax.axvline(float(np.nanmedian(d_vals)), color="tomato",
                        lw=1.3, ls="--", alpha=0.85)
-        if len(t_vals) == 0 and len(d_vals) == 0:
+        if e_vals is not None and len(e_vals) > 0:
+            ax.hist(e_vals, bins=bins, density=True, alpha=0.55,
+                    color="goldenrod", label=f"Entrapment (n={len(e_vals)})")
+            ax.axvline(float(np.nanmedian(e_vals)), color="goldenrod",
+                       lw=1.3, ls="--", alpha=0.85)
+        if len(t_vals) == 0 and len(d_vals) == 0 and (e_vals is None or len(e_vals) == 0):
             ax.text(0.5, 0.5, "No data", ha="center", va="center",
                     transform=ax.transAxes, color="gray")
             return
@@ -1255,6 +1267,8 @@ def plot_feature_distributions(
         d_all = vals[decoy_mask & finite_mask]
         t_r2 = vals[winner_target_mask & finite_mask]
         d_r2 = vals[winner_decoy_mask & finite_mask]
+        e_all = vals[entrapment_mask & finite_mask] if has_entrapment else None
+        e_r2  = vals[winner_ent_mask & finite_mask]  if has_entrapment else None
         gt_vals = vals[gt_mask & finite_mask]
 
         all_finite = vals[finite_mask]
@@ -1273,10 +1287,20 @@ def plot_feature_distributions(
         fig.suptitle(feat_col, fontsize=10)
 
         _bot_label = "Winners" if single_round else "Round-2 candidates"
-        _draw(ax_top, t_all, d_all, bins,
-              f"All candidates  (T={len(t_all)}, D={len(d_all)})")
-        _draw(ax_bot, t_r2, d_r2, bins,
-              f"{_bot_label}  (T={len(t_r2)}, D={len(d_r2)})")
+        _e_all_n = len(e_all) if e_all is not None else 0
+        _e_r2_n  = len(e_r2)  if e_r2  is not None else 0
+        _top_title = (
+            f"All candidates  (T={len(t_all)}, D={len(d_all)}, E={_e_all_n})"
+            if has_entrapment
+            else f"All candidates  (T={len(t_all)}, D={len(d_all)})"
+        )
+        _bot_title = (
+            f"{_bot_label}  (T={len(t_r2)}, D={len(d_r2)}, E={_e_r2_n})"
+            if has_entrapment
+            else f"{_bot_label}  (T={len(t_r2)}, D={len(d_r2)})"
+        )
+        _draw(ax_top, t_all, d_all, bins, _top_title, e_vals=e_all)
+        _draw(ax_bot, t_r2, d_r2, bins, _bot_title, e_vals=e_r2)
 
         _draw_gt(ax_top, gt_vals)
         _draw_gt(ax_bot, gt_vals)
@@ -2194,6 +2218,10 @@ def plot_score_distributions(
         res.get("is_tdc_winner", pd.Series(False, index=res.index))
         .fillna(False).astype(bool).values
     )
+    _src_sd = feat.get("source", pd.Series("", index=feat.index)).fillna("").values
+    entrapment_mask_sd = (~is_decoy) & (_src_sd == "entrapment_shuffled")
+    has_entrapment_sd = entrapment_mask_sd.any()
+    real_target_mask_sd = (~is_decoy) & (~entrapment_mask_sd)
 
     r1_cols = [c for c in res.columns if c.endswith("_score_r1")]
     r2_cols = [c for c in res.columns if c.endswith("_score_r2")]
@@ -2221,7 +2249,7 @@ def plot_score_distributions(
     if r2_col and "q_value" in res.columns:
         r2_scores = pd.to_numeric(res[r2_col], errors="coerce").values
         q_vals = pd.to_numeric(res["q_value"], errors="coerce").values
-        mask = is_winner & ~is_decoy & np.isfinite(r2_scores) & np.isfinite(q_vals)
+        mask = is_winner & real_target_mask_sd & np.isfinite(r2_scores) & np.isfinite(q_vals)
         if mask.any():
             passing = r2_scores[mask & (q_vals <= 0.01)]
             if len(passing):
@@ -2230,19 +2258,21 @@ def plot_score_distributions(
     fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4), squeeze=False)
     axes = axes[0]
 
-    colours = {"T": "#2196F3", "D": "#F44336"}
+    colours = {"T": "#2196F3", "D": "#F44336", "E": "goldenrod"}
 
     for ax, (scores, subset_mask, col_label, subset_label) in zip(axes, panels):
-        t_scores = scores[~is_decoy & subset_mask]
-        d_scores = scores[ is_decoy & subset_mask]
+        t_scores = scores[real_target_mask_sd & subset_mask]
+        d_scores = scores[is_decoy & subset_mask]
+        e_scores = scores[entrapment_mask_sd & subset_mask] if has_entrapment_sd else np.array([])
         t_finite = t_scores[np.isfinite(t_scores)]
         d_finite = d_scores[np.isfinite(d_scores)]
+        e_finite = e_scores[np.isfinite(e_scores)] if len(e_scores) else np.array([])
 
         if not len(t_finite) and not len(d_finite):
             ax.set_visible(False)
             continue
 
-        all_finite = np.concatenate([t_finite, d_finite])
+        all_finite = np.concatenate([t_finite, d_finite] + ([e_finite] if len(e_finite) else []))
 
         # IQR-based x-axis limits: robust to heavy-tailed and skewed distributions.
         # Whisker = Q1 - 3*IQR … Q3 + 3*IQR, then clipped to data range.
@@ -2264,6 +2294,11 @@ def plot_score_distributions(
                 d_finite, bins=bins, density=True,
                 color=colours["D"], alpha=0.45, label=f"Decoy (n={len(d_finite):,})",
             )
+        if len(e_finite):
+            ax.hist(
+                e_finite, bins=bins, density=True,
+                color=colours["E"], alpha=0.45, label=f"Entrapment (n={len(e_finite):,})",
+            )
 
         # KDE overlay for clearer shape visualization.
         try:
@@ -2275,6 +2310,9 @@ def plot_score_distributions(
             if len(d_finite) >= 5:
                 ax.plot(x_kde, gaussian_kde(d_finite)(x_kde),
                         color=colours["D"], lw=1.5)
+            if len(e_finite) >= 5:
+                ax.plot(x_kde, gaussian_kde(e_finite)(x_kde),
+                        color=colours["E"], lw=1.5, linestyle="--")
         except Exception:
             pass
 
@@ -2893,8 +2931,10 @@ def debug_pfm_explanations(
         )
         return
 
-    out_dir = os.path.join(output_dir, "pfm_explanations")
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir      = os.path.join(output_dir, "pfm_explanations")
+    shap_data_dir = os.path.join(out_dir, "shap_data")
+    os.makedirs(out_dir,       exist_ok=True)
+    os.makedirs(shap_data_dir, exist_ok=True)
 
     res = result_df.reset_index(drop=True)
     X = np.asarray(X, dtype=np.float64)
@@ -3013,9 +3053,16 @@ def debug_pfm_explanations(
             sel_raw = Xt_all[pos, order]
 
         # ----- Figure -----
+        _BG      = "#F7F7F7"
+        _POS_COL = "#4C9BE8"   # steel blue — toward target
+        _NEG_COL = "#E8654C"   # coral     — away from target
+
         fig, (ax_img, ax_shap, ax_pct) = plt.subplots(
-            1, 3, figsize=(14, 6), gridspec_kw={"width_ratios": [1.0, 1.3, 1.0]}
+            1, 3, figsize=(16, 6),
+            gridspec_kw={"width_ratios": [1.0, 1.8, 0.9]},
+            facecolor=_BG,
         )
+        fig.patch.set_facecolor(_BG)
 
         # Left: ion image (gamma 0.5, hot)
         img2d = None
@@ -3023,65 +3070,128 @@ def debug_pfm_explanations(
             idx = _find_image_idx(float(feature_mz), feature_mzs)
             if idx is not None:
                 img2d = _reshape_ion_image(ion_images[idx], spatial_df)
+        ax_img.set_facecolor("black")
+        for _sp in ax_img.spines.values():
+            _sp.set_visible(False)
+        ax_img.set_xticks([]); ax_img.set_yticks([])
         if img2d is not None:
-            im = ax_img.imshow(np.clip(img2d, 0, None) ** 0.5, cmap="hot", aspect="auto")
-            plt.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04)
-            ax_img.set_title(f"{peptide}\nm/z {feature_mz:.4f}", fontsize=9)
+            _p99 = np.percentile(img2d[img2d > 0], 99) if (img2d > 0).any() else 1.0
+            _imd = np.clip(img2d / _p99, 0, 1) ** 0.5
+            _im  = ax_img.imshow(_imd, cmap="hot", vmin=0, vmax=1, aspect="auto",
+                                 interpolation="nearest")
+            _cax = ax_img.inset_axes([0.02, 0.02, 0.06, 0.35])
+            _cb  = fig.colorbar(_im, cax=_cax)
+            _cb.set_ticks([0, 1]); _cb.set_ticklabels(["0", "p99"], fontsize=6, color="white")
+            _cb.outline.set_edgecolor("white")
+            _cb.ax.tick_params(colors="white", length=2)
+            ax_img.set_title(f"{peptide}\n{feature_mz:.4f} Da", fontsize=9,
+                             fontweight="bold", color="#222222", pad=4)
         else:
             ax_img.text(0.5, 0.5, "No ion image", ha="center", va="center",
-                        transform=ax_img.transAxes, color="gray")
-            ax_img.set_title(f"{peptide}", fontsize=9)
-        ax_img.set_xticks([])
-        ax_img.set_yticks([])
+                        transform=ax_img.transAxes, color="gray", fontsize=9)
+            ax_img.set_title(f"{peptide}", fontsize=9, fontweight="bold",
+                             color="#222222", pad=4)
 
         # Middle: SHAP waterfall (top 15 by |SHAP|)
-        ypos = np.arange(len(order))[::-1]  # largest |SHAP| at top
-        colors = ["steelblue" if v >= 0 else "tomato" for v in sel_shap]
-        ax_shap.barh(ypos, sel_shap, color=colors, alpha=0.85, height=0.7)
-        ax_shap.axvline(0, color="black", lw=0.8)
+        ypos   = np.arange(len(order))[::-1]  # largest |SHAP| at top
+        colors = [_POS_COL if v >= 0 else _NEG_COL for v in sel_shap]
+        ax_shap.set_facecolor("white")
+        ax_shap.barh(ypos, sel_shap, color=colors, height=0.65,
+                     edgecolor="white", linewidth=0.4, zorder=3)
+        ax_shap.axvline(0, color="#333333", lw=1.0, zorder=4)
+        ax_shap.axvline(base_value,  color="#888888", lw=0.8, ls="--", zorder=2)
+        ax_shap.axvline(final_score, color="#222222", lw=1.2, ls=":",  zorder=2)
         ax_shap.set_yticks(ypos)
         ax_shap.set_yticklabels(
-            [f"{n} = {v:.3g}" for n, v in zip(sel_names, sel_raw)], fontsize=7
+            [n.replace("_", " ") for n in sel_names],
+            fontsize=7.5,
         )
-        ax_shap.set_xlabel("SHAP contribution (→ target)", fontsize=8)
-        ax_shap.set_title(
-            f"base = {base_value:.3f}   final = {final_score:.3f}", fontsize=9
+        ax_shap.set_xlabel("SHAP contribution  (→ target)", fontsize=8, color="#444444")
+        _xlim = (
+            min(sel_shap.min() - 0.3, base_value  - 0.3),
+            max(sel_shap.max() + 0.3, final_score + 0.3),
         )
-        ax_shap.tick_params(axis="x", labelsize=7)
+        ax_shap.set_xlim(*_xlim)
+        ax_shap.text(base_value,  1.01, f"base\n{base_value:.3f}",
+                     ha="center", va="bottom", fontsize=6.5, color="#888888",
+                     transform=ax_shap.get_xaxis_transform())
+        ax_shap.text(final_score, 1.01, f"score\n{final_score:.3f}",
+                     ha="center", va="bottom", fontsize=6.5, color="#222222", fontweight="bold",
+                     transform=ax_shap.get_xaxis_transform())
+        ax_shap.tick_params(axis="x", labelsize=7, colors="#555555")
+        ax_shap.tick_params(axis="y", colors="#222222", length=0)
+        ax_shap.xaxis.grid(True, color="#dddddd", lw=0.5, zorder=0)
+        ax_shap.set_axisbelow(True)
+        for _sp in ["top", "right", "left"]: ax_shap.spines[_sp].set_visible(False)
+        ax_shap.spines["bottom"].set_color("#cccccc")
 
         # Right: percentile rank within training distribution
         pct = np.full(len(order), np.nan)
         for i, j in enumerate(order):
             colvals = dist_matrix[:, j]
-            finite = colvals[np.isfinite(colvals)]
+            finite  = colvals[np.isfinite(colvals)]
             v = sel_raw[i]
             if finite.size > 0 and np.isfinite(v):
                 pct[i] = 100.0 * np.count_nonzero(finite <= v) / finite.size
-        ax_pct.barh(ypos, np.full(len(order), 100.0), color="0.90", height=0.7)
-        ax_pct.barh(ypos, np.nan_to_num(pct), color="0.70", height=0.7)
-        for yp, p in zip(ypos, pct):
+        ax_pct.set_facecolor("white")
+        ax_pct.barh(ypos, np.full(len(order), 100.0), color="#eeeeee", height=0.65, zorder=1)
+        ax_pct.barh(ypos, np.nan_to_num(pct),         color="#cccccc", height=0.65, zorder=2)
+        for yp, p, col in zip(ypos, pct, colors):
             if np.isfinite(p):
-                ax_pct.plot(p, yp, "o", color="darkorange", ms=6, zorder=5)
-                ax_pct.text(min(p + 2, 98), yp, f"{p:.0f}", va="center", fontsize=6)
+                ax_pct.plot(p, yp, "o", color=col, ms=7, zorder=5,
+                            markeredgecolor="white", markeredgewidth=0.5)
+                _offset, _ha = (-3, "right") if p > 88 else (2, "left")
+                ax_pct.text(p + _offset, yp, f"{p:.0f}", va="center",
+                            fontsize=6.5, color="#333333", ha=_ha)
         ax_pct.set_xlim(0, 100)
-        ax_pct.set_yticks(ypos)
-        ax_pct.set_yticklabels([])
-        ax_pct.set_xlabel("Percentile in training dist.", fontsize=8)
-        ax_pct.set_title(f"n_train = {n_train}", fontsize=9)
+        ax_pct.set_ylim(ax_shap.get_ylim())
+        ax_pct.set_yticks([])
+        ax_pct.set_xticks([0, 25, 50, 75, 100])
+        ax_pct.set_xticklabels(["0", "25", "50", "75", "100"], fontsize=6.5, color="#555555")
+        ax_pct.set_xlabel("Percentile in training dist.", fontsize=8, color="#444444")
+        ax_pct.tick_params(axis="x", length=2)
+        for _sp in ["top", "right", "left"]: ax_pct.spines[_sp].set_visible(False)
+        ax_pct.spines["bottom"].set_color("#cccccc")
+        ax_pct.xaxis.grid(True, color="#eeeeee", lw=0.5, zorder=0)
+        ax_pct.set_axisbelow(True)
 
-        _q_s = f"q={qv:.3g}" if np.isfinite(qv) else "q=NA"
-        fig.suptitle(
-            f"[{kind}] {peptide} | {protein} | m/z "
-            f"{feature_mz:.4f} | {_q_s} | score={final_score:.3f}",
-            fontsize=10, y=1.02,
+        # Save per-candidate SHAP data for later reproduction
+        _sel_coef = coef[order] if len(coef) == len(est_names) else np.full(len(order), np.nan)
+        pd.DataFrame({
+            "feature":        sel_names,
+            "shap_value":     sel_shap,
+            "raw_value":      sel_raw,
+            "percentile_rank": pct,
+            "coef":           _sel_coef,
+        }).assign(
+            peptide=peptide, protein=protein,
+            feature_mz=feature_mz, q_value=qv,
+            final_score=final_score, base_value=base_value, kind=kind,
+        ).to_csv(
+            os.path.join(
+                shap_data_dir,
+                f"{rank:03d}_{_safe_fname(peptide)}_{feature_mz:.4f}_{kind}.tsv"
+                if np.isfinite(feature_mz)
+                else f"{rank:03d}_{_safe_fname(peptide)}_{kind}.tsv",
+            ),
+            sep="\t", index=False,
         )
-        plt.tight_layout()
+
+        _q_s = f"q = {qv:.4f}" if np.isfinite(qv) else "q = NA"
+        fig.tight_layout(rect=[0, 0, 1, 0.91])
+        fig.text(
+            0.5, 0.97,
+            f"[{kind}]  {peptide}  ·  {protein}  ·  m/z {feature_mz:.4f}"
+            f"  ·  {_q_s}  ·  score = {final_score:.3f}",
+            ha="center", va="top", fontsize=10, fontweight="bold",
+            color="#111111",
+        )
         fname = (
             f"{rank:03d}_{_safe_fname(peptide)}_{feature_mz:.4f}_{kind}.png"
             if np.isfinite(feature_mz)
             else f"{rank:03d}_{_safe_fname(peptide)}_{kind}.png"
         )
-        _save_and_close(fig, os.path.join(out_dir, fname), dpi=110)
+        _save_and_close(fig, os.path.join(out_dir, fname), dpi=150)
 
         srow = {
             "peptide": peptide,

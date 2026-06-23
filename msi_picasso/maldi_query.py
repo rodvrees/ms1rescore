@@ -258,7 +258,7 @@ def query_raw_maldi(
         "Raw-query MALDI extraction: %d candidate-derived m/z values at ±%.1f ppm",
         len(query_mzs), extraction_ppm,
     )
-    feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes = extract_maldi_data(
+    feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes, _pixel_coords = extract_maldi_data(
         d_path,
         extraction_ppm=extraction_ppm,
         feature_mzs=query_mzs,

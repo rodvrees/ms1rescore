@@ -11,7 +11,7 @@ from msi_picasso import maldi_query
 
 
 def _stub_5tuple(query_mzs):
-    """A stand-in for extract_maldi_data's 5-tuple output."""
+    """A stand-in for extract_maldi_data's 6-tuple output."""
     n = len(query_mzs)
     ion_images = np.ones((n, 3, 3), dtype=np.float32)
     extra = {k: np.ones((n, 3, 3), dtype=np.float32) for k in ("m1", "m2", "na", "k", "chca")}
@@ -22,7 +22,9 @@ def _stub_5tuple(query_mzs):
         "mean_intensity": np.arange(n, dtype=float),
     })
     envelopes = {float(mz): [1.0, 0.5, 0.2] for mz in query_mzs}
-    return np.asarray(query_mzs, dtype=np.float64), ion_images, extra, spatial, envelopes
+    xs = np.array([0, 1, 2], dtype=np.int32)
+    ys = np.array([0, 1, 2], dtype=np.int32)
+    return np.asarray(query_mzs, dtype=np.float64), ion_images, extra, spatial, envelopes, (xs, ys)
 
 
 class TestQueryRawMaldiAssertions:

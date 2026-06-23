@@ -806,6 +806,202 @@ def load_entrapment_candidates(
     return decoy_candidates
 
 
+def _digest_shuffled_pseudo_protein(
+    pseudo_protein: str,
+    seed: int,
+    enzyme: str,
+    missed_cleavages: int,
+    min_length: int,
+    max_length: int,
+    exclude_seqs: set,
+) -> list[str]:
+    """Shuffle pseudo_protein, digest, filter length and exact-sequence exclusions."""
+    shuffled = _shuffle_protein(pseudo_protein, random_state=seed)
+    rule = parser.expasy_rules.get(enzyme, enzyme)
+    seen: set[str] = set()
+    kept = []
+    for pep in parser.cleave(shuffled, rule, missed_cleavages=missed_cleavages):
+        if (
+            min_length <= len(pep) <= max_length
+            and pep not in exclude_seqs
+            and pep not in seen
+        ):
+            seen.add(pep)
+            kept.append(pep)
+    return kept
+
+
+def _contamination_filter(
+    candidates: pd.DataFrame,
+    reference_mzs: np.ndarray,
+    matching_ppm: float,
+    label: str,
+) -> pd.DataFrame:
+    """Remove rows from candidates whose mh_mz is within matching_ppm of reference_mzs."""
+    if len(candidates) == 0:
+        return candidates
+    cand_mzs = candidates["mh_mz"].values.astype(np.float64)
+    n_total = len(candidates)
+    collided_idx: set[int] = set()
+    try:
+        from ms1rescore_rs import match_mz
+        _f, pep_idx, _e = match_mz(reference_mzs.tolist(), cand_mzs.tolist(), matching_ppm)
+        collided_idx = set(int(i) for i in pep_idx)
+    except ImportError:
+        sorted_idx = np.argsort(cand_mzs)
+        sorted_mzs = cand_mzs[sorted_idx]
+        for tmz in reference_mzs:
+            tol = tmz * matching_ppm / 1e6
+            lo = np.searchsorted(sorted_mzs, tmz - tol, side="left")
+            hi = np.searchsorted(sorted_mzs, tmz + tol, side="right")
+            for j in range(lo, hi):
+                collided_idx.add(int(sorted_idx[j]))
+    n_collided = len(collided_idx)
+    collision_rate = n_collided / n_total if n_total else 0.0
+    logger.info(
+        "%s: contamination filter removed %d/%d peptides (%.1f%% isobaric)",
+        label, n_collided, n_total, 100.0 * collision_rate,
+    )
+    if collision_rate > 0.10:
+        logger.warning(
+            "%s: collision rate %.1f%% > 10%% — m/z-space overlap with reference "
+            "is high; the null may be biased.",
+            label, 100.0 * collision_rate,
+        )
+    return candidates[~candidates.index.isin(collided_idx)].reset_index(drop=True)
+
+
+def generate_entrapment_from_lcms_ids(
+    lcms_ids,
+    matching_ppm: float = 20.0,
+    missed_cleavages: int = 2,
+    min_length: int = 7,
+    max_length: int = 30,
+    enzyme: str = "trypsin",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """
+    Generate entrapment pseudo-target candidates and their paired decoys from
+    shuffled LC-MS/MS peptides.
+
+    Each identified protein's confirmed peptide sequences are sorted and
+    concatenated into a per-protein pseudo-protein, then shuffled twice with
+    ``_shuffle_protein`` (K/R-preserving):
+
+    * First shuffle (seed = ``random_state + hash(accession)``):
+      pseudo-targets — ``is_decoy=False``, ``source="entrapment_shuffled"``,
+      ``protein="ENTRAPMENT_{accession}"``.
+    * Second shuffle (seed XOR ``0xDEADBEEF``):
+      paired decoys — ``is_decoy=True``, ``source="entrapment_decoy"``,
+      ``protein="ENTRAPMENT_DECOY_{accession}"``.
+
+    Both sets are required so that TDC competition stays balanced (Wen et al.).
+    The pseudo-targets that survive TDC are the false-positive estimates;
+    the decoys serve only to keep the TDC denominator correct.
+
+    Both sets are filtered: exact-sequence matches with any LC-MS/MS confirmed
+    peptide are removed, then isobaric matches (within ``matching_ppm``) against
+    confirmed peptide m/z values are removed; a collision rate > 10% triggers a
+    warning.
+
+    Returns a combined peptide-DB DataFrame (pseudo-targets + decoys); the
+    caller matches it to MALDI features via ``match_to_maldi_features``.
+    """
+    peps_df = lcms_ids.peptides
+    if "protein" not in peps_df.columns or "sequence" not in peps_df.columns:
+        raise ValueError(
+            "lcms_ids.peptides must have 'sequence' and 'protein' columns"
+        )
+
+    target_seqs: set[str] = set(peps_df["sequence"].dropna())
+
+    tgt_rows: list[pd.DataFrame] = []
+    dec_rows: list[pd.DataFrame] = []
+
+    for prot_acc, grp in peps_df.groupby("protein"):
+        sorted_seqs = sorted(set(grp["sequence"].dropna()))
+        if not sorted_seqs:
+            continue
+        pseudo_protein = "".join(sorted_seqs)
+        prot_seed = (random_state + hash(str(prot_acc))) & 0xFFFFFFFF
+        dec_seed  = (prot_seed ^ 0xDEADBEEF) & 0xFFFFFFFF
+
+        tgt_peps = _digest_shuffled_pseudo_protein(
+            pseudo_protein, prot_seed, enzyme, missed_cleavages,
+            min_length, max_length, target_seqs,
+        )
+        dec_peps = _digest_shuffled_pseudo_protein(
+            pseudo_protein, dec_seed, enzyme, missed_cleavages,
+            min_length, max_length, target_seqs,
+        )
+
+        if tgt_peps:
+            df = pd.DataFrame({"peptide": tgt_peps})
+            df["protein"] = f"ENTRAPMENT_{prot_acc}"
+            tgt_rows.append(df)
+        if dec_peps:
+            df = pd.DataFrame({"peptide": dec_peps})
+            df["protein"] = f"ENTRAPMENT_DECOY_{prot_acc}"
+            dec_rows.append(df)
+
+    if not tgt_rows:
+        logger.warning(
+            "generate_entrapment_from_lcms_ids: no entrapment peptides generated "
+            "(all shuffled digest sequences were exact matches with LC-MS/MS IDs)"
+        )
+        return pd.DataFrame()
+
+    tgt_db = pd.concat(tgt_rows, ignore_index=True).drop_duplicates(subset="peptide").reset_index(drop=True)
+    dec_db = pd.concat(dec_rows, ignore_index=True).drop_duplicates(subset="peptide").reset_index(drop=True) if dec_rows else pd.DataFrame()
+
+    for db in [tgt_db, dec_db]:
+        if len(db):
+            _assign_mass_columns(db)
+
+    tgt_db = tgt_db[tgt_db.get("mass", pd.Series(0, index=tgt_db.index)) > 0].reset_index(drop=True)
+    if len(dec_db):
+        dec_db = dec_db[dec_db["mass"] > 0].reset_index(drop=True)
+
+    if len(tgt_db) == 0:
+        return pd.DataFrame()
+
+    # Contamination filter against confirmed LC-MS/MS peptide m/z values.
+    _target_db_tmp = pd.DataFrame({"peptide": sorted(target_seqs)})
+    _assign_mass_columns(_target_db_tmp)
+    target_mzs = _target_db_tmp["mh_mz"].dropna().values.astype(np.float64)
+
+    tgt_db = _contamination_filter(tgt_db, target_mzs, matching_ppm, "entrapment_shuffled")
+    if len(dec_db):
+        dec_db = _contamination_filter(dec_db, target_mzs, matching_ppm, "entrapment_decoy")
+
+    if len(tgt_db) == 0:
+        logger.warning("entrapment_shuffled: all pseudo-targets removed by contamination filter")
+        return pd.DataFrame()
+
+    tgt_db["is_decoy"] = False
+    tgt_db["source"] = "entrapment_shuffled"
+
+    parts = [tgt_db]
+    if len(dec_db):
+        dec_db["is_decoy"] = True
+        dec_db["source"] = "entrapment_decoy"
+        parts.append(dec_db)
+    else:
+        logger.warning(
+            "entrapment_decoy: no paired decoys generated; TDC denominator will "
+            "not account for entrapment peptides"
+        )
+
+    result = pd.concat(parts, ignore_index=True)
+    logger.info(
+        "entrapment: %d pseudo-targets + %d paired decoys across %d ENTRAPMENT proteins",
+        len(tgt_db),
+        len(dec_db) if len(dec_db) else 0,
+        tgt_db["protein"].nunique(),
+    )
+    return result
+
+
 def generate_balanced_shuffle_candidates(
     fasta_path: str | None,
     lcms_ids,

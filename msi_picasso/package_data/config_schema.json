@@ -123,6 +123,8 @@
         "patch_size":             {"type": ["integer", "null"], "minimum": 1},
         "patch_coloc_threshold":  {"type": ["number", "null"], "minimum": -1, "maximum": 1},
         "drop_zero_signal":       {"type": ["boolean", "null"]},
+        "entrapment":             {"type": ["boolean", "null"]},
+        "coloc_measured_mask":    {"type": ["boolean", "null"]},
         "deeplc_finetune_epochs":   {"type": ["integer", "null"], "minimum": 1},
         "deeplc_finetune_lr":       {"type": ["number",  "null"], "minimum": 0},
         "deeplc_finetune_patience": {"type": ["integer", "null"], "minimum": 1},

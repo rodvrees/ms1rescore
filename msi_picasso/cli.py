@@ -1101,6 +1101,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--coloc-measured-mask",
+        action="store_true",
+        default=None,
+        help=(
+            "Restrict colocalization to pixels that were actually rastered, using the "
+            "pixel coordinate list from the MALDI data source rather than the TIC > 0 "
+            "heuristic. Useful for partial-raster acquisitions where only a sub-region "
+            "of the slide was scanned. Supported for --maldi-raw/--maldi-d and "
+            "--maldi-imzml inputs; no-op for NPZ/m/z-list inputs."
+        ),
+    )
+    rescore_grp.add_argument(
         "--nmf-coloc",
         action="store_true",
         default=None,
@@ -1158,6 +1170,18 @@ def build_parser() -> argparse.ArgumentParser:
             "differ only on peptide_length, which leaks the mz_shuffle derangement. "
             "Symmetric: both target and decoy at a zero-signal feature are dropped. "
             "Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--entrapment",
+        action="store_true",
+        default=None,
+        help=(
+            "Inject shuffled pseudo-protein peptides (derived from LC-MS/MS confirmed "
+            "sequences, one pseudo-protein per identified protein) as entrapment "
+            "pseudo-targets alongside the main candidates. Reports how many entrapment "
+            "peptides are identified at 1%%, 5%%, and 10%% FDR and writes "
+            "entrapment_result.tsv. Requires --lcms-peptides or --msf."
         ),
     )
 
@@ -1305,7 +1329,7 @@ def main() -> None:
         "verbose", "storey_pi0", "lda_r2_median_filter",
         "only_main_features", "use_protein_level_feats", "match_ccs",
         "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc",
-        "drop_zero_signal",
+        "drop_zero_signal", "entrapment", "coloc_measured_mask",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
@@ -1328,7 +1352,7 @@ def main() -> None:
         "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_window_multiplier",
         "coloc_tic_quantile", "nmf_coloc", "nmf_n_components",
         "patch_coloc", "patch_size", "patch_coloc_threshold",
-        "drop_zero_signal",
+        "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         "calibration_percentile", "maldi_query_raw",
         # file paths
@@ -1425,6 +1449,7 @@ def main() -> None:
     _ccs_source_mzs: np.ndarray | None = None  # mzs aligned with _ccs_arr; may differ from maldi_mzs
     _mzs_intensities: np.ndarray | None = None  # per-feature intensity from SCiLS CSV
     _feature_mzs_intensities: np.ndarray | None = None  # set only in --maldi-raw/--maldi-d block
+    _measured_pixel_mask: "np.ndarray | None" = None  # built when --coloc-measured-mask is set
 
     _maldi_raw_path: str | None = _ms1cfg.get("maldi_raw") or _ms1cfg.get("maldi_d")
     _maldi_imzml_path: str | None = _ms1cfg.get("maldi_imzml")
@@ -1462,7 +1487,7 @@ def main() -> None:
             logger.info(f"  {len(precomputed_mzs)} features loaded (skipping detection)")
 
         logger.info(f"Extracting MALDI features from raw data: {_maldi_raw_path}")
-        maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes = extract_maldi_data(
+        maldi_mzs, ion_images, extra_ion_images, spatial_features, maldi_envelopes, _raw_pixel_coords = extract_maldi_data(
             _maldi_raw_path,
             feature_mzs=precomputed_mzs,
             ppm_bin=_extraction["ppm_bin"],
@@ -1499,6 +1524,12 @@ def main() -> None:
             f"  {len(maldi_mzs)} features extracted"
             + (f", ion image shape: {ion_images.shape[1:]}" if ion_images is not None else "")
         )
+        if bool(_ms1cfg.get("coloc_measured_mask", False)) and ion_images is not None:
+            _xc, _yc = _raw_pixel_coords
+            _H, _W = ion_images.shape[1], ion_images.shape[2]
+            _measured_pixel_mask = np.zeros(_H * _W, dtype=bool)
+            _measured_pixel_mask[np.asarray(_yc, dtype=np.int64) * _W + np.asarray(_xc, dtype=np.int64)] = True
+            logger.info(f"  Measured-pixel mask: {int(_measured_pixel_mask.sum())}/{_measured_pixel_mask.size} pixels rastered")
     elif _maldi_imzml_path:
         from msi_picasso.maldi_imzml import (
             SCiLSConfig, extract_scils_features,
@@ -1564,6 +1595,13 @@ def main() -> None:
             from msi_picasso.maldi_imzml import one_over_k0_to_ccs
             _ccs_arr = one_over_k0_to_ccs(mean_1_over_k0, maldi_mzs)
             logger.info("  Converted mean 1/K0 to CCS using Mason-Schamp equation")
+        if bool(_ms1cfg.get("coloc_measured_mask", False)) and ion_images is not None and len(intervals) > 0:
+            _coords_arr = np.asarray(pixel_coords, dtype=np.int64)
+            _xs_c, _ys_c = _coords_arr[:, 0], _coords_arr[:, 1]
+            _H, _W = ion_images.shape[1], ion_images.shape[2]
+            _measured_pixel_mask = np.zeros(_H * _W, dtype=bool)
+            _measured_pixel_mask[_ys_c * _W + _xs_c] = True
+            logger.info(f"  Measured-pixel mask: {int(_measured_pixel_mask.sum())}/{_measured_pixel_mask.size} pixels rastered")
     else:
         maldi_mzs, ion_images, ion_image_mzs, _ccs_arr, extra_ion_images, _mzs_intensities = _load_maldi(
             _ms1cfg.get("maldi_npz"), _ms1cfg.get("maldi_mzs")
@@ -1771,12 +1809,14 @@ def main() -> None:
         mob_coloc=bool(_ms1cfg.get("mob_coloc", False)),
         mob_window_multiplier=_ms1cfg["mob_window_multiplier"],
         coloc_tic_quantile=_ms1cfg["coloc_tic_quantile"],
+        coloc_measured_pixel_mask=_measured_pixel_mask,
         nmf_coloc=_ms1cfg["nmf_coloc"],
         nmf_n_components=_ms1cfg["nmf_n_components"],
         patch_coloc=bool(_ms1cfg.get("patch_coloc", False)),
         patch_size=_ms1cfg["patch_size"],
         patch_coloc_threshold=_ms1cfg["patch_coloc_threshold"],
         drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
+        entrapment=bool(_ms1cfg.get("entrapment", False)),
     )
 
     # --- Write results ---

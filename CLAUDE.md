@@ -48,6 +48,8 @@ MSI-PICASSO/
 │       ├── test_config_parser.py
 │       ├── test_debug_viz.py
 │       ├── test_deisotoping.py
+│       ├── test_drop_zero_signal.py
+│       ├── test_nosignal_coloc_fill.py
 │       ├── test_entrapment_decoys.py
 │       ├── test_evidence_score.py            # pre-existing broken (stale import)
 │       ├── test_isotope_distribution.py
@@ -453,7 +455,7 @@ In addition to `protein_colocalization` (mean), `_max`, `_median`, `_n_partners`
 - `protein_colocalization_weighted_max` = max(w·r)
 - `protein_colocalization_top{2,3,5}` = mean r over the k highest-weight partner pairs (`sort_values("w").groupby(...).head(k)`; uses all pairs when fewer than k exist, no NaN padding)
 
-**`compute_patch_colocalization_features()`** — patch-level (local) colocalization (opt-in, `--patch-coloc`; also needs `--use-protein-level-feats`). Tiles the `(H,W)` grid into `patch_size`×`patch_size` blocks (default 10), keeps only on-tissue pixels (`pixel_mask`) and skips patches with < ~5 measured pixels, then for each within-protein pair computes the Pearson r over **each patch's pixels** (mean-center + normalize + dot, features constant within a patch skipped). Per pair → mean/max/`>threshold` (default 0.5) across patches; per `(feature_mz, protein)` → `protein_patch_colocalization_mean` (mean over partners of per-pair mean), `_max` (max over partners of per-pair max), `_frac_above` (mean over partners of per-pair fraction). Asks "in how many local neighbourhoods do same-protein peptides co-distribute," sidestepping the global tissue-outline correlation. Purely spatial → symmetric. Logs `kept/total patches` and mean on-tissue pixels/patch (on a TMA most patches are off-tissue and skipped, so it runs well below worst case; the log also flags a mis-sized `patch_size`). Columns in `maldi_features._PATCH_COLOC_COLS`, added to `PROTEIN_LEVEL_FEATURES` (computed only when `patch_coloc=True`; absent columns are dropped by the pool's presence filter otherwise). Config: `patch_size` (`--patch-size`, default 10), `patch_coloc_threshold` (`--patch-coloc-threshold`, default 0.5).
+**`compute_patch_colocalization_features()`** — patch-level (local) colocalization (opt-in, `--patch-coloc`; also needs `--use-protein-level-feats`). Tiles the `(H,W)` grid into `patch_size`×`patch_size` blocks (default 10), keeps only on-tissue pixels (`pixel_mask`) and skips patches with < ~5 measured pixels, then for each within-protein pair computes the Pearson r over **each patch's pixels** (mean-center + normalize + dot, features constant within a patch skipped). Per pair → mean/`>threshold` (default 0.5) across patches; per `(feature_mz, protein)` → `protein_patch_colocalization_mean` (mean over partners of per-pair mean), `_frac_above` (mean over partners of per-pair fraction). Asks "in how many local neighbourhoods do same-protein peptides co-distribute," sidestepping the global tissue-outline correlation. Purely spatial → symmetric. Logs `kept/total patches` and mean on-tissue pixels/patch (on a TMA most patches are off-tissue and skipped, so it runs well below worst case; the log also flags a mis-sized `patch_size`). Columns in `maldi_features._PATCH_COLOC_COLS`, added to `PROTEIN_LEVEL_FEATURES` (computed only when `patch_coloc=True`; absent columns are dropped by the pool's presence filter otherwise). Config: `patch_size` (`--patch-size`, default 10), `patch_coloc_threshold` (`--patch-coloc-threshold`, default 0.5).
 
 **`_pearson_r_pairwise(images_a, images_b, pixel_mask=None)`** — helper used by isotopologue and adduct colocalization. Takes two `(N, H, W)` float32 arrays and returns a length-N array of per-feature Pearson r values. Uses manual mean-centering and dot product (avoids `np.corrcoef` memory overhead). When `pixel_mask` is given, r is computed over on-tissue pixels only (consistent with `_pearson_r_matrix`). Returns `np.nan` for constant images.
 
@@ -530,7 +532,7 @@ from MSI-PICASSO.feature_generator import (
 
 **`PROTEIN_LEVEL_FEATURES`** — excluded from the ranker by default; opt-in via `--use-protein-level-feats`:
 - Protein consistency: `protein_n_features`, `log_protein_n_features`, `protein_coverage`, `protein_rank`, `protein_best_ratio`
-- Protein co-localization (optional, requires ion_images): `protein_colocalization`, `protein_colocalization_max`, `protein_colocalization_median`, `protein_colocalization_n_partners`, `protein_colocalization_weighted`, `protein_colocalization_weighted_max`, `protein_colocalization_top2/top3/top5`; patch-level (opt-in `--patch-coloc`): `protein_patch_colocalization_mean/_max/_frac_above`
+- Protein co-localization (optional, requires ion_images): `protein_colocalization`, `protein_colocalization_max`, `protein_colocalization_median`, `protein_colocalization_n_partners`, `protein_colocalization_weighted`, `protein_colocalization_weighted_max`, `protein_colocalization_top2/top3/top5`; patch-level (opt-in `--patch-coloc`): `protein_patch_colocalization_mean/_frac_above`
 
 **Why excluded by default:** these features aggregate counts and correlations over all candidates sharing a protein. They are only valid when decoys occupy a **separate protein namespace** from targets — every decoy method gives decoys a distinct protein label (`DECOY_…` for shuffle / balanced_shuffle / paired_shuffle / mz_shift / mz_shuffle, `ENTRAPMENT_…` for entrapment), so a decoy is never pooled with its source target's protein. (Before this was fixed, `mz_shift`/`mz_shuffle` decoys kept the real target protein name, which pooled targets and decoys under one protein and made decoy proteins colocalize as well as — or better than — targets: an invalid null.) Even with the namespace correct, these features can interact subtly with the decoy model, so they stay opt-in via `--use-protein-level-feats`.
 
@@ -620,6 +622,7 @@ Parses LC-MS/MS identification results into an `LCMSIds(proteins, peptides)` nam
 | `"mzidentml"` | single mzIdentML file as `peptides_path` | q-value from CV `MS:1002354`, PEP from `MS:1002356` |
 | `"psm_utils"` | any psm_utils-supported file as `peptides_path` | Aggregated to peptide level |
 | `"msf"` | ProteomeDiscoverer `.msf` SQLite file as `peptides_path` | Queries `TargetPsms` joined with `TargetProteins`; filters by `PercolatorqValue <= peptide_fdr`; no separate PEP stored (`pep` column is NaN). In the CLI, passing `--msf` without `--lcms-peptides` automatically activates Strategy C using the MSF as the ID source. |
+| `"ms2rescore"` | ms2rescore `.psms.tsv` output as `peptides_path` | Alias for `psm_utils` reader with `psm_utils_reader="tsv"`. Use when LC-MS/MS IDs come from an ms2rescore-rescored PSM list. |
 
 **Accession normalisation** (`_normalize_accession`): strips UniProt/RefSeq prefixes before comparing against the FASTA:
 
@@ -653,6 +656,7 @@ P12345  →  P12345
 | `maldi_d_path` | None | Raw Bruker `.d` directory; required when `maldi_query_raw=True` |
 | `extraction_ppm` | 25.0 | Ion image extraction half-window (ppm) for raw-query mode |
 | `use_spatial_ranker_features` | False | Include `SPATIAL_RANKER_FEATURES` in the ranker; only valid with `decoy_method` ∈ {entrapment, mz_shift} |
+| `drop_zero_signal` | False | Remove candidates where `feature_intensity_sum == 0` after feature computation. Symmetric: co-located target+decoy are both dropped. Prevents `peptide_length` leak from the `mz_shuffle` zero-signal subpopulation. CLI `--drop-zero-signal`. |
 
 **Decoy mode parameter:** `decoy_method` (str, default `"shuffle"`) controls Step 1c:
 - `"shuffle"` — standard K/R-preserving protein shuffle (via `digest_fasta` / `digest_identified_proteins`). Decoys are sequence-space decoys with distinct elemental compositions (different `theo_isotope_cosine`).
@@ -664,7 +668,7 @@ P12345  →  P12345
 - `"balanced_shuffle"` — iterative K/R-preserving protein shuffle with MALDI-match filtering via `generate_balanced_shuffle_candidates()`. Runs up to `max_shuffle_rounds` (default 50) rounds of protein-level shuffle, keeping only decoy peptides that match a MALDI feature within `matching_ppm`. Subsamples the collected pool to `target_ratio * N_target` (default 1.0). Unlike standard shuffle (one decoy per target regardless of MALDI match), this ensures decoys compete in the same observation space as targets and achieves ~1:1 T:D even when the MALDI feature list is sparse. LC-MS/MS evidence columns are NaN for all decoy rows (shuffle decoys have different sequences; inheriting evidence would break TDC symmetry). `source = "decoy_balanced_shuffle"`. **Not compatible with `use_spatial_ranker_features`** (no consistent spatial anchor).
 - `"paired_shuffle"` — same shuffle pool as `balanced_shuffle` but decoys are feature-occupancy-matched (`selection_mode="feature"`), drawn at the same m/z features that targets occupy to maximise per-feature competition. **Not compatible with `use_spatial_ranker_features`.**
 
-CLI flags: `--decoy-method {shuffle,mz_shift,mz_shuffle,entrapment,balanced_shuffle,paired_shuffle}`, `--entrapment-fasta PATH`, `--mz-shift-delta-min FLOAT`, `--mz-shift-delta-max FLOAT`, `--mz-shift-snap-tolerance-ppm FLOAT`, `--max-shuffle-rounds INT`, `--decoy-target-ratio FLOAT`, `--maldi-query-raw`, `--use-spatial-ranker-features`.
+CLI flags: `--decoy-method {shuffle,mz_shift,mz_shuffle,entrapment,balanced_shuffle,paired_shuffle}`, `--entrapment-fasta PATH`, `--mz-shift-delta-min FLOAT`, `--mz-shift-delta-max FLOAT`, `--mz-shift-snap-tolerance-ppm FLOAT`, `--max-shuffle-rounds INT`, `--decoy-target-ratio FLOAT`, `--maldi-query-raw`, `--use-spatial-ranker-features`, `--drop-zero-signal`.
 
 1. Generate candidates (Strategy A or C) + match to MALDI features
 2. Load LC-MS/MS data
@@ -672,7 +676,9 @@ CLI flags: `--decoy-method {shuffle,mz_shift,mz_shuffle,entrapment,balanced_shuf
 4. DeepLC: optionally fine-tune on PD MSF or FragPipe RT table, then predict RT for all unique peptides
 5. Compute LC-MS/MS evidence features (DeepLC-anchored MS1 features; fully symmetric)
 6. Compute all features (includes IM2Deep finetuning on `n_candidates==1` matches when CCS data is available)
-6b. *(optional)* **CCS filter** — when `match_ccs=True`: compute p95 of `im2deep_abs_delta_ccs_pct` on single-candidate matches; remove all candidates where `im2deep_abs_delta_ccs_pct > ccs_window_multiplier × p95`; recompute `n_candidates` and `log_n_candidates`. LDA positive seeding at step 9 uses post-filter `n_candidates`, so newly unambiguous features (filtered down to one candidate) contribute as seed positives.
+6a. **No-signal colocalization fill** — `_fill_nosignal_coloc_worst_case()` runs unconditionally: for candidates where `feature_intensity_sum == 0`, any protein-colocalization NaN (which the imputer would otherwise fill with the column median, silently rewarding zero-evidence candidates) is replaced by the pooled finite minimum — the worst in-distribution value. The mask and fill value are both `is_decoy`-blind (co-located pairs under `mz_shuffle` share the same `feature_intensity_sum`).
+6b. *(optional)* **Zero-signal drop** — when `drop_zero_signal=True` (`--drop-zero-signal`): all candidates where `feature_intensity_sum == 0` are removed. Symmetric (both target and decoy at a zero-signal feature are dropped, preserving T:D balance). Recommended for raw-query + `mz_shuffle` to prevent `peptide_length` leak (see Known Bias §1).
+6c. *(optional)* **CCS filter** — when `match_ccs=True`: compute p95 of `im2deep_abs_delta_ccs_pct` on single-candidate matches; remove all candidates where `im2deep_abs_delta_ccs_pct > ccs_window_multiplier × p95`; recompute `n_candidates` and `log_n_candidates`. LDA positive seeding at step 9 uses post-filter `n_candidates`, so newly unambiguous features (filtered down to one candidate) contribute as seed positives.
 7. Build PSMList + populate rescoring features
 8. Rescore using selected backend (see "Rescoring backends" below)
 
@@ -868,7 +874,9 @@ Each entry names the bias, which decoy method(s) and pipeline mode it affects, w
 
 **Why it arises.** The mz_shuffle derangement is a mass-sorted cyclic rotation: each target peptide is relocated onto the feature of a peptide ~n/4–3n/4 positions away in mass-sorted order. Consequently, the decoy peptide co-located on a given feature has a systematically *different* mass (and therefore a different `peptide_length`) from the target peptide. For features that have genuine MALDI signal (`feature_intensity_sum > 0`), MALDI-dependent features (`log_maldi_intensity*`, `ppm_error`, isotope, CCS, etc.) provide the discrimination signal and overwhelm `peptide_length`. For **zero-signal features** — m/z bins with no detected peak across all pixels — all MALDI-dependent features collapse to 0 or their imputed median, leaving only sequence-derived features (`peptide_length`, amino acid composition) to separate targets from decoys. Because `peptide_length` ∝ mass and the derangement enforces a large mass gap, `peptide_length` achieves AUC ≈ 0.91 in the zero-signal subpopulation. This skews the FDR: the semi-supervised ranker trains on these easy zero-signal decoys and assigns artificially high scores to short (or long) target peptides regardless of MALDI evidence.
 
-**Mitigation.** `drop_zero_signal=True` (CLI `--drop-zero-signal`, default in raw-query mode) removes all candidates where `feature_intensity_sum == 0` before scoring. The mask is `is_decoy`-blind: under mz_shuffle co-located target and decoy share the identical ion image, so both are dropped together, preserving the 1:1 T:D ratio. This is the right fix; retaining zero-signal rows only adds noise because no MALDI evidence supports them.
+**Mitigation.** Two layers:
+1. `_fill_nosignal_coloc_worst_case()` runs unconditionally after feature computation: protein-colocalization NaNs on zero-signal rows are replaced with the pooled finite minimum (worst in-distribution value) rather than being left for the median imputer to silently fill to an average colocalization score.
+2. `drop_zero_signal=True` (CLI `--drop-zero-signal`, disabled by default) removes all candidates where `feature_intensity_sum == 0` before scoring. The mask is `is_decoy`-blind: under mz_shuffle co-located target and decoy share the identical ion image, so both are dropped together, preserving the 1:1 T:D ratio. Recommended in raw-query + mz_shuffle; retaining zero-signal rows adds only noise because no MALDI evidence supports them.
 
 **Symptom.** If zero-signal rows are retained, the ranked-list shows an inflated tail of short peptides (low mass → negative mass-sorted offset → `peptide_length` of decoy > target) passing FDR, with no supporting MALDI ion image.
 

@@ -365,6 +365,7 @@ def compute_all_features(
     im2deep_calibration: str = "linear",
     im2deep_kwargs: dict | None = None,
     coloc_tic_quantile: float = 0.0,
+    coloc_measured_pixel_mask: "np.ndarray | None" = None,
     nmf_coloc: bool = False,
     nmf_n_components: int = 12,
     patch_coloc: bool = False,
@@ -491,9 +492,12 @@ def compute_all_features(
         # colocalization reflects co-distribution within the tissue (see
         # compute_tissue_mask). TIC == 0 padding is always dropped.
         pixel_mask = compute_tissue_mask(ion_images, tic_quantile=coloc_tic_quantile)
+        if coloc_measured_pixel_mask is not None:
+            pixel_mask = pixel_mask & coloc_measured_pixel_mask
+        _mask_suffix = ", measured-coord mask applied" if coloc_measured_pixel_mask is not None else ""
         logger.info(
             f"Colocalization on-tissue mask: {int(pixel_mask.sum())}/{pixel_mask.size} "
-            f"pixels kept (tic_quantile={coloc_tic_quantile})"
+            f"pixels kept (tic_quantile={coloc_tic_quantile}{_mask_suffix})"
         )
         # Compute the full Pearson correlation matrix once (single BLAS call) and
         # share it across all three colocalization functions to avoid 3× redundant work.

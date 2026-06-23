@@ -1234,4 +1234,4 @@ def extract_maldi_data(
     }
     logger.info(f"  {len(maldi_envelopes)}/{len(feature_mzs)} features with M0 signal for envelope scoring")
 
-    return feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes
+    return feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes, (x_coords, y_coords)

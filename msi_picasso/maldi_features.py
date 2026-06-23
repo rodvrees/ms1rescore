@@ -1180,10 +1180,11 @@ def compute_im2deep_features(
     # is_calibration_peptide column is absent (e.g. direct callers).  Three methods:
     #   linear  — global additive shift (LinearCCSCalibration, default; symmetric
     #             across targets/decoys, so safe for the ranker CCS features)
+    #   raw     — no calibration (use raw IM2Deep predictions)
     #   spline  — piecewise spline mapping (SplineCCSCalibration)
     #   finetune — transfer-learning re-training of the neural network weights
     predicted_cal = predicted.copy()
-    if "is_calibration_peptide" in df.columns or "n_candidates" in df.columns:
+    if calibration_method != "raw" and ("is_calibration_peptide" in df.columns or "n_candidates" in df.columns):
         try:
             if "is_calibration_peptide" in df.columns:
                 single_mask = df["is_calibration_peptide"].to_numpy(dtype=bool)
