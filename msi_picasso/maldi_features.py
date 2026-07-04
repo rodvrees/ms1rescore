@@ -6,6 +6,8 @@ All functions are symmetric — no is_decoy branching in feature computation.
 """
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -1929,21 +1931,43 @@ def compute_mobility_colocalization_features(
 
         total_filtered = len(mzs_all)
         total_all      = int(peak_counts_pp.sum())
+        n_workers = min(os.cpu_count() or 1, 16)
         logger.info(
             f"Mobility colocalization: {total_filtered:,} relevant peaks "
             f"({100.0 * total_filtered / max(total_all, 1):.1f}% of {total_all:,} total); "
-            f"sorting…"
+            f"sorting per-pixel m/z across {n_workers} threads…"
         )
 
-        # Sort by (pixel_id, mz) so Rust can binary-search per-pixel m/z windows
-        order    = np.lexsort((mzs_all, pix_ids))
-        pix_ids  = pix_ids[order]
-        scan_ids = scan_ids[order]
-        mzs_all  = mzs_all[order]
-        ints_all = ints_all[order]
+        # Rust binary-searches per-pixel m/z windows, so peaks must be ordered by
+        # (pixel_id, mz). pix_ids is ALREADY globally non-decreasing here: the batch
+        # loop above emits pixels in ascending order and b_pix is ascending within
+        # each batch, so a global lexsort over ~2.5e9 rows is wasted work — only the
+        # m/z axis needs sorting *within* each pixel. Compute the CSR pixel offsets
+        # from the already-sorted pix_ids, then sort each pixel's disjoint m/z slice
+        # in parallel (numpy argsort releases the GIL; disjoint slice writes are
+        # race-free). This replaces a single-threaded ~11 min lexsort with a parallel
+        # segmented sort that also does strictly less total work (Σ k·log k over
+        # pixels, not N·log N).
+        # ponytail: relies on pix_ids being pixel-sorted by construction above; if
+        # that batch loop changes, restore `np.lexsort((mzs_all, pix_ids))`.
+        pixel_offsets_arr = np.searchsorted(pix_ids, np.arange(n_pixels + 1), side="left")
+
+        def _sort_pixel_slices(pxs):
+            for px in pxs:
+                s = int(pixel_offsets_arr[px])
+                e = int(pixel_offsets_arr[px + 1])
+                if e - s > 1:
+                    loc = np.argsort(mzs_all[s:e], kind="stable")
+                    mzs_all[s:e]  = mzs_all[s:e][loc]
+                    scan_ids[s:e] = scan_ids[s:e][loc]
+                    ints_all[s:e] = ints_all[s:e][loc]
+
+        if n_pixels > 1:
+            with ThreadPoolExecutor(max_workers=n_workers) as _ex:
+                list(_ex.map(_sort_pixel_slices,
+                             np.array_split(np.arange(n_pixels), n_workers * 4)))
 
         # CSR offsets: pixel_offsets[px] … pixel_offsets[px+1] = peak range for pixel px
-        pixel_offsets_arr = np.searchsorted(pix_ids, np.arange(n_pixels + 1), side="left")
         pixel_offsets = pixel_offsets_arr.astype(np.uint64).tolist()
 
         # Pixel coordinates in the same order as sorted_fids
