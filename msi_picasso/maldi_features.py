@@ -268,7 +268,7 @@ def compute_tissue_mask(
     measured = tic > 0
     if tic_quantile and tic_quantile > 0.0 and measured.any():
         thr = float(np.quantile(tic[measured], tic_quantile))
-        return tic > thr
+        return tic >= thr  # >= keeps pixels at the threshold; > can leave an empty mask when many pixels tie
     return measured
 
 
@@ -276,6 +276,8 @@ def _pearson_r_matrix(
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
     pixel_mask: np.ndarray | None = None,
+    tic_normalize: bool = False,
+    common_mode_removal: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Compute the full (n_valid × n_valid) Pearson correlation matrix.
@@ -289,6 +291,19 @@ def _pearson_r_matrix(
     ``compute_tissue_mask``.  This is the recommended MALDI default because raw
     images share a dominant on/off-tissue component that inflates every pairwise
     r.  Image validity (non-constant) is then assessed on the masked pixels too.
+
+    ``tic_normalize`` and ``common_mode_removal`` are optional pre-correlation
+    transforms that strip the shared tissue/ionization envelope which otherwise
+    dominates the per-image Pearson centring and inflates every pairwise r toward
+    a common value (see the per-pixel masking note above — masking removes only
+    the off-tissue component, not the on-tissue abundance gradient shared across
+    images).  Both operate on the (n_feat, n_pix) matrix *before* the usual
+    per-image centring:
+      * ``tic_normalize``: divide each pixel (column) by its total signal across
+        images, removing the multiplicative "more tissue = more of everything"
+        brightness envelope.
+      * ``common_mode_removal``: subtract the per-pixel mean image (the additive
+        shared spatial component) so only the protein-specific residual remains.
 
     Returns
     -------
@@ -305,6 +320,17 @@ def _pearson_r_matrix(
     if pixel_mask is not None:
         # Restrict to on-tissue pixels (copy: fancy-index breaks the view).
         flat_all = flat_all[:, np.asarray(pixel_mask, dtype=bool)]
+
+    if tic_normalize or common_mode_removal:
+        # Own a writeable float32 buffer (the no-mask path above is a view onto
+        # ion_images; the in-place transforms below must not mutate the caller's
+        # array).
+        flat_all = flat_all.astype(np.float32, copy=True)
+        if tic_normalize:
+            col_tic = flat_all.sum(axis=0, keepdims=True)
+            np.divide(flat_all, col_tic, out=flat_all, where=col_tic > 0)
+        if common_mode_removal:
+            flat_all -= flat_all.mean(axis=0, keepdims=True)
 
     stds = flat_all.std(axis=1)
     valid_mask = stds > 1e-10
@@ -488,238 +514,146 @@ def compute_colocalization_features(
     return df
 
 
-_PATCH_COLOC_COLS = [
-    "protein_patch_colocalization_mean",
-    "protein_patch_colocalization_frac_above",
+_REGION_COLOC_COLS = [
+    "protein_region_colocalization",
+    "protein_region_colocalization_max",
+    "protein_region_colocalization_median",
 ]
 
 
-def compute_patch_colocalization_features(
-    df: pd.DataFrame,
+def _region_profile_corr_matrix(
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
     pixel_mask: np.ndarray | None = None,
-    patch_size: int = 10,
-    threshold: float = 0.5,
-    min_patch_pixels: int = 5,
-) -> pd.DataFrame:
-    """Patch-level (local) within-protein colocalization (opt-in, ``--patch-coloc``).
-
-    Global Pearson r between two ion images is dominated by overall tissue
-    morphology. This asks a more local question: in how many small spatial
-    neighbourhoods do two same-protein peptides co-distribute? The grid is tiled
-    into non-overlapping ``patch_size``×``patch_size`` blocks; for each
-    within-protein pair, the Pearson r is computed over the on-tissue pixels
-    **inside each patch**, then aggregated across patches into
-    ``protein_patch_colocalization_mean`` (mean over partners of the per-pair
-    mean-over-patches r), ``_max`` (max over partners of the per-pair
-    max-over-patches r) and ``_frac_above`` (mean over partners of the per-pair
-    fraction of patches with r > ``threshold``). Purely spatial → blind to
-    ``is_decoy``.
-    """
-    if ion_images is None or ion_image_mzs is None:
-        for col in _PATCH_COLOC_COLS:
-            df[col] = 0.0
-        return df
-
-    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
-    n_feat, H, W = ion_images.shape
-    flat = ion_images.reshape(n_feat, H * W)
-    mz_to_idx = {float(mz): i for i, mz in enumerate(mz_arr)}
-
-    # Within-protein ordered feature pairs (same self-join as the global version),
-    # mapped to ion-image row indices.
-    base = (
-        df[["feature_mz", "protein"]]
-        .drop_duplicates()
-        .assign(img_idx=lambda d: d["feature_mz"].map(lambda m: mz_to_idx.get(float(m))))
-    )
-    base = base[base["img_idx"].notna()].copy()
-    base["img_idx"] = base["img_idx"].astype(int)
-    pairs = base.merge(
-        base.rename(columns={"feature_mz": "partner_mz", "img_idx": "partner_idx"}),
-        on="protein",
-    )
-    pairs = pairs[pairs["feature_mz"] != pairs["partner_mz"]].reset_index(drop=True)
-
-    if len(pairs) == 0:
-        for col in _PATCH_COLOC_COLS:
-            df[col] = 0.0
-        return df
-
-    a_idx = pairs["img_idx"].to_numpy(dtype=np.intp)
-    b_idx = pairs["partner_idx"].to_numpy(dtype=np.intp)
-    n_pairs = len(pairs)
-
-    # Tile into patches; keep only on-tissue pixels (drop unmeasured padding).
-    mask_flat = (
-        np.asarray(pixel_mask, dtype=bool) if pixel_mask is not None
-        else np.ones(H * W, dtype=bool)
-    )
-    grid = np.arange(H * W).reshape(H, W)
-    patches: list[np.ndarray] = []
-    n_patches_total = 0
-    for r0 in range(0, H, patch_size):
-        for c0 in range(0, W, patch_size):
-            n_patches_total += 1
-            px = grid[r0:r0 + patch_size, c0:c0 + patch_size].ravel()
-            px = px[mask_flat[px]]
-            if px.size >= min_patch_pixels:
-                patches.append(px)
-
-    if not patches:
-        logger.info(
-            f"Patch colocalization: 0/{n_patches_total} patches kept "
-            f"(patch_size={patch_size}); no on-tissue patches — features set to 0"
-        )
-        for col in _PATCH_COLOC_COLS:
-            df[col] = 0.0
-        return df
-
-    # Only the features that appear in some pair need normalising per patch.
-    feats = np.unique(np.concatenate([a_idx, b_idx]))
-    row2pos = np.full(n_feat, -1, dtype=np.intp)
-    row2pos[feats] = np.arange(len(feats))
-    posA, posB = row2pos[a_idx], row2pos[b_idx]
-
-    s_sum = np.zeros(n_pairs); s_max = np.full(n_pairs, -np.inf)
-    s_cnt = np.zeros(n_pairs); s_above = np.zeros(n_pairs)
-    px_per_patch = 0
-    for px in patches:
-        px_per_patch += px.size
-        Xp = flat[feats][:, px].astype(np.float64)
-        Xc = Xp - Xp.mean(axis=1, keepdims=True)
-        norm = np.sqrt((Xc * Xc).sum(axis=1))
-        ok = norm > 1e-12
-        Xn = Xc / np.where(ok, norm, 1.0)[:, None]
-        rp = (Xn[posA] * Xn[posB]).sum(axis=1)
-        valid = ok[posA] & ok[posB]            # skip features constant in this patch
-        s_sum[valid] += rp[valid]
-        np.maximum.at(s_max, np.where(valid)[0], rp[valid])
-        s_cnt[valid] += 1
-        s_above[valid] += (rp[valid] > threshold)
-
-    seen = s_cnt > 0
-    pairs["pr_mean"] = np.where(seen, s_sum / np.where(seen, s_cnt, 1.0), np.nan)
-    pairs["pr_max"] = np.where(seen, s_max, np.nan)
-    pairs["pr_frac"] = np.where(seen, s_above / np.where(seen, s_cnt, 1.0), np.nan)
-    pairs = pairs[seen]
-
-    if len(pairs):
-        agg = (
-            pairs.groupby(["feature_mz", "protein"])
-            .agg(
-                protein_patch_colocalization_mean=("pr_mean", "mean"),
-                protein_patch_colocalization_max=("pr_max", "max"),
-                protein_patch_colocalization_frac_above=("pr_frac", "mean"),
-            )
-            .reset_index()
-        )
-        df = df.merge(agg, on=["feature_mz", "protein"], how="left")
-    for col in _PATCH_COLOC_COLS:
-        if col not in df.columns:
-            df[col] = 0.0
-        df[col] = df[col].fillna(0.0)
-
-    logger.info(
-        f"Patch colocalization: {len(patches)}/{n_patches_total} patches kept "
-        f"(patch_size={patch_size}, mean {px_per_patch / len(patches):.0f} on-tissue px/patch), "
-        f"{n_pairs} within-protein pairs, threshold={threshold}"
-    )
-    return df
-
-
-_NMF_COLOC_COLS = [
-    "protein_nmf_colocalization",
-    "protein_nmf_colocalization_max",
-    "protein_nmf_colocalization_median",
-]
-
-
-def _nmf_loading_cosine_matrix(
-    ion_images: np.ndarray,
-    ion_image_mzs: np.ndarray,
-    pixel_mask: np.ndarray | None = None,
-    n_components: int = 12,
+    n_regions: int = 20,
     random_state: int = 42,
-) -> tuple[np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, dict, np.ndarray, np.ndarray]:
     """
-    Factorise the (TIC-normalised, on-tissue) ion-image matrix with NMF and
-    return the full cosine-similarity matrix of the per-image loading vectors.
+    Segment the tissue into ``n_regions`` regions and return the full Pearson
+    correlation matrix of the per-image per-region composition profiles.
 
-    NMF decomposes each ion image into ``n_components`` additive spatial parts
-    (tissue substructures); each image is then a non-negative loading vector
-    over those parts.  Two features "share a substructure" when their loading
-    vectors are aligned, measured by cosine similarity (scale-invariant, so
-    absolute abundance does not matter).  Images are TIC-normalised (unit sum
-    over on-tissue pixels) first so the decomposition reflects spatial pattern
-    rather than intensity.
+    Rationale: a raw Pearson r over all on-tissue pixels is dominated by the
+    shared tissue/ionization envelope every image carries, so it measures "is
+    this on tissue" rather than protein-specific co-distribution.  This instead
+    asks "do two peptides light up the *same regions*?":
 
-    Returns the same triple shape as ``_pearson_r_matrix`` so the colocalization
-    aggregation can be shared: (cos_matrix, valid_mz_arr, mz_to_idx).  Only
-    images with a non-zero loading (i.e. detected somewhere on tissue) are valid.
+      1. Per-pixel TIC-normalise the on-tissue pixels (divide out the shared
+         abundance envelope), ``log1p``, and segment the pixels with
+         MiniBatchKMeans into ``n_regions`` regions (pixels = samples, images =
+         features).
+      2. Reduce each image to its per-region mean of the *per-image*
+         TIC-normalised image — an ``n_regions``-vector "region fingerprint".
+      3. Correlate the fingerprints with signed Pearson r (centre + L2-normalise
+         + gemm).  Unlike a cosine of non-negative loadings, this can go negative
+         when two peptides occupy *different* regions, which is exactly the
+         discriminative signal a decoy at a foreign m/z should produce.
+
+    Returns ``(corr_matrix, valid_mz_arr, mz_to_idx, region_labels, profiles)``.
+    The first three match ``_pearson_r_matrix``'s contract so the within-protein
+    aggregation is shared.  ``region_labels`` is an ``(H*W,)`` int32 array of the
+    per-pixel region id (off-mask pixels = -1) and ``profiles`` is the
+    ``(n_valid, n_regions)`` fingerprint matrix; both are returned only for the
+    debug visualization.  Only images with any on-tissue signal are valid.
     """
-    from sklearn.decomposition import NMF
+    from sklearn.cluster import MiniBatchKMeans
 
     mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
     n_feat = len(mz_arr)
-    flat = ion_images.reshape(n_feat, -1)
-    if pixel_mask is not None:
-        flat = flat[:, np.asarray(pixel_mask, dtype=bool)]
-    flat = flat.astype(np.float32, copy=True)
+    H, W = ion_images.shape[1], ion_images.shape[2]
+    flat = ion_images.reshape(n_feat, H * W)
+    mask = (
+        np.asarray(pixel_mask, dtype=bool) if pixel_mask is not None
+        else np.ones(H * W, dtype=bool)
+    )
+    on = flat[:, mask].astype(np.float32, copy=True)  # (n_feat, n_on)
+    n_on = on.shape[1]
 
-    # TIC-normalise each image (unit sum over on-tissue pixels); leave all-zero
-    # (never-detected) images as zero rows.
-    row_sum = flat.sum(axis=1, keepdims=True)
-    np.divide(flat, row_sum, out=flat, where=row_sum > 0)
+    # Segmentation feature matrix: per-pixel TIC-normalised composition, log1p.
+    col_tic = on.sum(axis=0, keepdims=True)
+    comp = np.divide(on, col_tic, out=np.zeros_like(on), where=col_tic > 0)
+    seg_feat = np.log1p(comp).T  # (n_on, n_feat) — pixels are samples
 
-    k = int(min(n_components, max(2, flat.shape[0] - 1)))
-    nmf = NMF(n_components=k, init="nndsvda", max_iter=400, random_state=random_state, tol=1e-4)
-    W = nmf.fit_transform(flat)  # (n_feat, k) loadings
-    del flat
+    if n_on < 2:
+        logger.warning("Region colocalization: %d on-tissue pixels — skipping (need ≥ 2).", n_on)
+        empty_mz = np.empty(0, dtype=np.float64)
+        region_labels = np.full(H * W, -1, dtype=np.int32)
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            empty_mz,
+            {},
+            region_labels,
+            np.empty((0, 0), dtype=np.float32),
+        )
 
-    # Valid = images that loaded onto at least one component.
-    valid_mask = W.sum(axis=1) > 0
+    k = int(min(n_regions, max(2, n_on - 1)))
+    km = MiniBatchKMeans(n_clusters=k, random_state=random_state, n_init=3)
+    labels = km.fit_predict(seg_feat)  # (n_on,)
+
+    # Per-image, per-region mean of the per-IMAGE TIC-normalised image.
+    img_sum = on.sum(axis=1, keepdims=True)
+    img_norm = np.divide(on, img_sum, out=np.zeros_like(on), where=img_sum > 0)
+    onehot = np.zeros((n_on, k), dtype=np.float32)
+    onehot[np.arange(n_on), labels] = 1.0
+    counts = onehot.sum(axis=0) + 1e-9
+    profiles = (img_norm @ onehot) / counts  # (n_feat, k) region fingerprints
+
+    # Valid = images with any on-tissue signal.
+    valid_mask = img_sum.ravel() > 0
     valid_mz_arr = mz_arr[valid_mask]
-    L = W[valid_mask]
-    norms = np.sqrt((L * L).sum(axis=1, keepdims=True))
-    L = L / np.where(norms > 1e-12, norms, 1.0)
-    cos_matrix = (L @ L.T).astype(np.float32)
+    P = profiles[valid_mask]  # (n_valid, k)
+
+    # Signed Pearson r between region fingerprints.
+    Pc = P - P.mean(axis=1, keepdims=True)
+    norms = np.sqrt((Pc * Pc).sum(axis=1, keepdims=True))
+    Pn = Pc / np.where(norms > 1e-12, norms, 1.0)
+    corr_matrix = (Pn @ Pn.T).astype(np.float32)
 
     mz_to_idx = {float(mz): i for i, mz in enumerate(valid_mz_arr)}
+    region_labels = np.full(H * W, -1, dtype=np.int32)
+    region_labels[mask] = labels
     logger.info(
-        f"NMF colocalization: K={k}, {len(valid_mz_arr)}/{n_feat} images with non-zero loading, "
-        f"reconstruction_err={nmf.reconstruction_err_:.4g}"
+        f"Region colocalization: K={k}, {len(valid_mz_arr)}/{n_feat} images with "
+        f"on-tissue signal, {n_on} on-tissue pixels"
     )
-    return cos_matrix, valid_mz_arr, mz_to_idx
+    return corr_matrix, valid_mz_arr, mz_to_idx, region_labels, P
 
 
-def compute_nmf_colocalization_features(
+def compute_region_colocalization_features(
     df: pd.DataFrame,
     ion_images: np.ndarray,
     ion_image_mzs: np.ndarray,
     pixel_mask: np.ndarray | None = None,
-    n_components: int = 12,
+    n_regions: int = 20,
     random_state: int = 42,
+    debug: dict | None = None,
 ) -> pd.DataFrame:
-    """Within-protein NMF substructure-sharing colocalization features.
+    """Within-protein region-profile colocalization features (opt-in, ``--region-coloc``).
 
     Mirrors ``compute_colocalization_features`` but the pairwise quantity is the
-    cosine similarity of NMF spatial-component loadings instead of the pixel
-    Pearson r.  This asks whether same-protein peptides occupy the *same tissue
-    substructure*, a sharper question than global ion-image correlation (which is
-    dominated by overall tissue morphology).  Decoys must occupy a separate
-    protein namespace (every decoy method gives them a ``DECOY_`` / ``ENTRAPMENT_``
-    label), so the within-protein aggregation never pools a decoy with its source
-    target.
+    Pearson r of the per-region composition fingerprints (see
+    ``_region_profile_corr_matrix``) instead of the raw pixel Pearson r.  This
+    asks whether same-protein peptides occupy the *same tissue regions*, a sharper
+    question than global ion-image correlation (which is dominated by overall
+    tissue morphology).  Decoys occupy a separate protein namespace (every decoy
+    method gives them a ``DECOY_`` / ``ENTRAPMENT_`` label), so the within-protein
+    aggregation never pools a decoy with its source target — the feature stays
+    symmetric (blind to ``is_decoy``).
 
-    Features added: ``protein_nmf_colocalization`` (mean), ``_max``, ``_median``
-    — the within-protein mean/max/median pairwise loading cosine.
+    Features added: ``protein_region_colocalization`` (mean), ``_max``, ``_median``
+    — the within-protein mean/max/median pairwise region-profile r.
+
+    When ``debug`` is a dict it is populated with ``region_labels`` (per-pixel
+    region map), ``region_profiles`` ((n_valid, n_regions) fingerprints) and
+    ``region_profile_mzs`` for the debug visualization.
     """
-    cos_matrix, valid_mz_arr, mz_to_idx = _nmf_loading_cosine_matrix(
+    corr_matrix, valid_mz_arr, mz_to_idx, region_labels, profiles = _region_profile_corr_matrix(
         ion_images, ion_image_mzs, pixel_mask=pixel_mask,
-        n_components=n_components, random_state=random_state,
+        n_regions=n_regions, random_state=random_state,
     )
+    if debug is not None:
+        debug["region_labels"] = region_labels
+        debug["region_profiles"] = profiles
+        debug["region_profile_mzs"] = valid_mz_arr
 
     base = (
         df[["feature_mz", "protein"]]
@@ -737,25 +671,25 @@ def compute_nmf_colocalization_features(
 
     if len(pairs) > 0:
         pairs = pairs.copy()
-        pairs["c"] = cos_matrix[
+        pairs["c"] = corr_matrix[
             pairs["corr_idx"].to_numpy(dtype=int),
             pairs["partner_idx"].to_numpy(dtype=int),
         ]
         agg = (
             pairs.groupby(["feature_mz", "protein"])["c"]
             .agg(
-                protein_nmf_colocalization="mean",
-                protein_nmf_colocalization_max="max",
-                protein_nmf_colocalization_median="median",
+                protein_region_colocalization="mean",
+                protein_region_colocalization_max="max",
+                protein_region_colocalization_median="median",
             )
             .reset_index()
         )
         df = df.merge(agg, on=["feature_mz", "protein"], how="left")
     else:
-        for col in _NMF_COLOC_COLS:
+        for col in _REGION_COLOC_COLS:
             df[col] = 0.0
 
-    for col in _NMF_COLOC_COLS:
+    for col in _REGION_COLOC_COLS:
         df[col] = df[col].fillna(0.0)
     return df
 
@@ -1466,6 +1400,8 @@ def _pearson_r_pairwise(
     the selected on-tissue pixels only (see ``compute_tissue_mask``).
     """
     n = len(images_a)
+    if n == 0:
+        return np.empty(0, dtype=np.float32)
     a = images_a.reshape(n, -1).astype(np.float32)
     b = images_b.reshape(n, -1).astype(np.float32)
     if pixel_mask is not None:
@@ -1748,6 +1684,8 @@ def compute_mobility_colocalization_features(
     tdf_path: str,
     mob_window_multiplier: float = 2.0,
     extraction_ppm: float = 25.0,
+    protein_coloc: bool = False,
+    tic_normalize: bool = False,
 ) -> pd.DataFrame:
     """
     Per-candidate isotopologue and adduct colocalization using mobility-filtered images.
@@ -1878,6 +1816,10 @@ def compute_mobility_colocalization_features(
         _use_rust = True
     except ImportError:
         _use_rust = False
+
+    # Per-candidate M0 images collected by whichever path runs; used below for
+    # protein-level pairwise r.
+    _cand_m0_images: dict = {}
 
     if _use_rust:
         # ------------------------------------------------------------------ #
@@ -2067,6 +2009,60 @@ def compute_mobility_colocalization_features(
         for col_i, col in enumerate(NEW_COLS):
             df[col] = pd.Series(raw_mat[:, col_i], index=cand_df_indices, dtype=np.float64)
 
+        # Rebuild per-candidate M0 images from the already-loaded flat arrays so
+        # protein-level pairwise r can be computed without a second TDF read.
+        # Only build images for candidates in proteins with ≥2 detected members
+        # (singletons cannot contribute to within-protein r).
+        if protein_coloc and "protein" in df.columns:
+            _prot_sizes = df.groupby("protein").size()
+            _multi_prots = set(_prot_sizes[_prot_sizes >= 2].index)
+            _needs_img = frozenset(
+                df.index[
+                    df["protein"].isin(_multi_prots)
+                    & df["_pred_inv_k0"].notna()
+                ]
+            )
+        else:
+            _needs_img = frozenset()
+
+        if _needs_img:
+            pixel_xi_arr = np.array(pixel_xi_list, dtype=np.int32)
+            pixel_yi_arr = np.array(pixel_yi_list, dtype=np.int32)
+            _n_pix_total = max_y * max_x
+            for _, grp in groups:
+                cands_needed = [i for i in grp.index if i in _needs_img]
+                if not cands_needed:
+                    continue
+                feat_mz = float(grp["feature_mz"].iloc[0])
+                mz_lo = feat_mz * (1.0 - ppm_factor)
+                mz_hi = feat_mz * (1.0 + ppm_factor)
+                mz_mask = (mzs_all >= mz_lo) & (mzs_all <= mz_hi)
+                if not mz_mask.any():
+                    continue
+                sub_pix  = pix_ids[mz_mask]
+                sub_mob  = mob_arr[scan_ids[mz_mask]]
+                # bincount requires float64 weights
+                sub_ints = ints_all[mz_mask].astype(np.float64)
+                flat_xy  = (
+                    pixel_yi_arr[sub_pix].astype(np.int64) * max_x
+                    + pixel_xi_arr[sub_pix].astype(np.int64)
+                )
+                for idx in cands_needed:
+                    pred_k0 = df.at[idx, "_pred_inv_k0"]
+                    k0_mask = (
+                        (sub_mob >= pred_k0 - k0_half_win)
+                        & (sub_mob <= pred_k0 + k0_half_win)
+                    )
+                    if k0_mask.any():
+                        img_flat = np.bincount(
+                            flat_xy[k0_mask],
+                            weights=sub_ints[k0_mask],
+                            minlength=_n_pix_total,
+                        ).astype(np.float32)
+                    else:
+                        img_flat = np.zeros(_n_pix_total, dtype=np.float32)
+                    _cand_m0_images[idx] = img_flat.reshape(max_y, max_x)
+
     else:
         # ------------------------------------------------------------------ #
         # Python fallback: per-feature read with pre-read optimisation        #
@@ -2138,6 +2134,8 @@ def compute_mobility_colocalization_features(
                 r_mean = float(np.mean(valid_r)) if valid_r else np.nan
 
                 m0 = imgs["m0"]
+                if protein_coloc:
+                    _cand_m0_images[idx] = m0
                 nonzero = m0[m0 > 0]
                 cv = float(nonzero.std() / nonzero.mean()) if len(nonzero) > 1 else 0.0
                 morans_val, _ = _morans_gearys_chunk(m0[np.newaxis], _neighbor_counts, _N, _W_sum)
@@ -2164,10 +2162,57 @@ def compute_mobility_colocalization_features(
         valid = df[col].dropna()
         df[col] = df[col].fillna(float(valid.median()) if len(valid) > 0 else 0.0)
 
+    # Protein-level pairwise colocalization using mobility-gated M0 images.
+    # Only added when protein_coloc=True; omitted entirely otherwise so the
+    # columns are absent and the ranker's present-column filter ignores them.
+    if protein_coloc:
+        PROT_MOB_COLS = [
+            "protein_colocalization_mob",
+            "protein_colocalization_mob_max",
+            "protein_colocalization_mob_n_partners",
+        ]
+        for col in PROT_MOB_COLS:
+            df[col] = np.nan
+
+    if protein_coloc and "protein" in df.columns and _cand_m0_images:
+        for _prot, _grp in df.groupby("protein"):
+            valid_idx = [i for i in _grp.index if i in _cand_m0_images]
+            n = len(valid_idx)
+            if n == 0:
+                continue
+            if n == 1:
+                df.at[valid_idx[0], "protein_colocalization_mob_n_partners"] = 0.0
+                continue
+            # Vectorised Pearson r: L2-normalise then sgemm for the full n×n matrix
+            X = np.stack(
+                [_cand_m0_images[i].ravel() for i in valid_idx], axis=0
+            ).astype(np.float32)                       # (n, H*W)
+            if tic_normalize:
+                col_sum = X.sum(axis=0)
+                X /= np.where(col_sum > 0, col_sum, 1.0)[np.newaxis, :]
+            X -= X.mean(axis=1, keepdims=True)         # centre each image
+            norms = np.linalg.norm(X, axis=1)          # (n,)
+            good = norms > 1e-10
+            X[~good] = 0.0
+            norms = np.where(good, norms, 1.0)
+            X /= norms[:, np.newaxis]
+            C = X @ X.T                                # (n, n) Pearson r matrix
+            np.fill_diagonal(C, np.nan)
+            for ci, idx in enumerate(valid_idx):
+                row = C[ci]
+                partners = row[~np.isnan(row)]
+                df.at[idx, "protein_colocalization_mob_n_partners"] = float(len(partners))
+                if len(partners) > 0:
+                    df.at[idx, "protein_colocalization_mob"] = float(partners.mean())
+                    df.at[idx, "protein_colocalization_mob_max"] = float(partners.max())
+        df["protein_colocalization_mob_n_partners"] = (
+            df["protein_colocalization_mob_n_partners"].fillna(0.0)
+        )
+
     df = df.drop(columns=["_pred_inv_k0"])
     logger.info(
-        f"Mobility colocalization: computed 10 per-candidate features for "
-        f"{len(df)} candidates across {len(groups)} features."
+        f"Mobility colocalization: computed 10 per-candidate + 3 protein-level "
+        f"features for {len(df)} candidates across {len(groups)} features."
     )
     return df
 

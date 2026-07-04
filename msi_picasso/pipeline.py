@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from msi_picasso.candidates import (
+    generate_substitution_candidates,
     digest_fasta,
     digest_identified_proteins,
     generate_balanced_shuffle_candidates,
@@ -22,7 +23,7 @@ from msi_picasso.feature_generator import (
     LCMS_PRIOR_FEATURES,
     MAIN_FEATURES,
     MALDI_INTRINSIC_FEATURES,
-    NMF_COLOCALIZATION_FEATURES,
+    REGION_COLOCALIZATION_FEATURES,
     PROTEIN_LEVEL_FEATURES,
     SPATIAL_PRIOR_FEATURES,
     SPATIAL_RANKER_FEATURES,
@@ -47,7 +48,7 @@ _SPATIAL_INVERT_FEATURES = frozenset(["spatial_gearys_c"])
 
 # Decoy methods whose decoys land on real MALDI features, giving spatial ranker
 # features a symmetric null.  shuffle/balanced_shuffle/paired_shuffle do not.
-_SPATIAL_RANKER_OK_DECOYS = frozenset(["entrapment", "mz_shift", "mz_shuffle"])
+_SPATIAL_RANKER_OK_DECOYS = frozenset(["entrapment", "mz_shift", "mz_shuffle", "substitution"])
 
 # Features that use the candidate's PREDICTED CCS/mobility to gate or compare against
 # the observed feature. For mz_shuffle (peptide relocated far in mass; CCS/1-K0 ∝ m/z)
@@ -167,8 +168,7 @@ def _recompute_ppm_from_centroids(
 # no-signal candidate is penalised on coloc rather than imputed up to average.
 _PROTEIN_COLOC_WORST_PREFIXES = (
     "protein_colocalization",
-    "protein_patch_colocalization",
-    "protein_nmf_colocalization",
+    "protein_region_colocalization",
 )
 
 
@@ -820,8 +820,15 @@ def _rescore_linear(
     feature_names_out = present
     if pipe is not None:
         try:
-            importances = pipe[clf_name].coef_[0]
-            if use_poly:
+            est = pipe[clf_name]
+            if hasattr(est, "coef_"):
+                importances = est.coef_[0]
+            elif hasattr(est, "feature_importances_"):
+                # Tree ensembles (e.g. the gbt backend) expose impurity-based
+                # feature_importances_ instead of coef_. Same reporting slot; the
+                # FDR scores are always the decision_function values, never these.
+                importances = est.feature_importances_
+            if importances is not None and use_poly:
                 feature_names_out = expanded_names
         except Exception:
             pass
@@ -838,6 +845,13 @@ def _rescore_linear(
             struct_coefs = np.nan_to_num(struct_coefs, nan=0.0)
         except Exception:
             pass
+        # Kernel models (e.g. the rbf_svm backend) expose neither coef_ nor
+        # feature_importances_ — the decision function lives in kernel space, not
+        # per-feature. Fall back to |structure coefficient| so the importance TSV
+        # stays populated and sortable. Only valid when not using poly expansion
+        # (struct_coefs align with `present`, the un-expanded feature list).
+        if importances is None and struct_coefs is not None and not use_poly:
+            importances = np.abs(struct_coefs)
     # Expose the fitted pipeline + raw feature matrix for downstream SHAP debug
     # explanations (populated only when the caller passes a mutable dict).
     if fitted_out is not None and pipe is not None:
@@ -871,6 +885,92 @@ def _rescore_svm(features_df, intrinsic_feature_names, init_ppm_threshold, svm_c
     return _rescore_linear(
         features_df, intrinsic_feature_names, init_ppm_threshold,
         clf_name="svm", make_clf=make_clf, **kwargs,
+    )
+
+
+def _rescore_gbt(
+    features_df, intrinsic_feature_names, init_ppm_threshold,
+    gbt_n_estimators: int = 200,
+    gbt_max_depth: int = 3,
+    gbt_learning_rate: float = 0.1,
+    gbt_subsample: float = 0.7,
+    **kwargs,
+):
+    """Semi-supervised gradient-boosted-tree backend (nonlinear).
+
+    Uses ``sklearn.ensemble.GradientBoostingClassifier`` as the final pipeline
+    step. It exposes ``decision_function()`` (consumed by the out-of-fold CV
+    scorer) and ``feature_importances_`` (impurity-based, written to the
+    importance TSV), so it slots into the exact same ``_rescore_linear`` machinery
+    as LDA/SVM — seed selection, pseudo-label iteration, per-feature winner
+    selection, TDC, PEP-from-scores, and reweighting are all unchanged; only the
+    final estimator differs. Score columns are tagged ``gbt_score_r1/r2`` and the
+    importance TSV ``17_debug_gbt_importances_r{1,2}.tsv``.
+
+    Unlike the linear backends, gbt can fit nonlinear feature interactions (e.g.
+    colocalization only discriminating where MALDI signal is present), which is
+    where it materially outperforms LDA/SVM on heterogeneous samples.
+    ``subsample<1`` (stochastic gradient boosting) regularises against overfitting
+    the target/decoy null, complementing the out-of-fold CV. The median imputer
+    is kept (GradientBoostingClassifier rejects NaN); the StandardScaler is a
+    harmless no-op for trees (monotone transforms do not change split points)."""
+    from sklearn.ensemble import GradientBoostingClassifier
+
+    def make_clf():
+        return GradientBoostingClassifier(
+            n_estimators=gbt_n_estimators,
+            max_depth=gbt_max_depth,
+            learning_rate=gbt_learning_rate,
+            subsample=gbt_subsample,
+            random_state=0,
+        )
+
+    return _rescore_linear(
+        features_df, intrinsic_feature_names, init_ppm_threshold,
+        clf_name="gbt", make_clf=make_clf, **kwargs,
+    )
+
+
+def _rescore_rbf_svm(
+    features_df, intrinsic_feature_names, init_ppm_threshold,
+    rbf_svm_c: float = 1.0,
+    rbf_svm_gamma="scale",
+    **kwargs,
+):
+    """Semi-supervised RBF-kernel SVM backend (nonlinear, continuous scores).
+
+    Uses ``sklearn.svm.SVC(kernel="rbf")`` as the final pipeline step. Unlike the
+    ``gbt`` (tree) backend, a kernel SVM's ``decision_function`` is a smooth,
+    continuous function of the inputs, so the score distribution stays continuous
+    and bimodal-looking (no discrete leaf-value spikes) even with a small
+    semi-supervised seed set. This is the nonlinear analog of the linear ``svm``
+    backend and reuses the exact same ``_rescore_linear`` machinery — seed,
+    pseudo-label iteration, out-of-fold CV, winner selection, TDC, PEP,
+    reweighting — via ``decision_function``. Score columns are tagged
+    ``rbf_svm_score_r1/r2``.
+
+    A kernel SVM has no ``coef_``/``feature_importances_`` (its weights live in
+    kernel space), so ``_rescore_linear`` reports per-feature importances as
+    ``|structure coefficient|`` (correlation of each feature with the score).
+
+    ``rbf_svm_gamma`` accepts ``"scale"``/``"auto"`` or a float. On standardized
+    features, gamma ≈ 0.01-0.03 with ``rbf_svm_c`` ≈ 5-10 typically outperforms
+    the ``"scale"`` default; tune via ``--rbf-svm-gamma`` / ``--rbf-svm-c``. The
+    median imputer + StandardScaler are kept (SVC rejects NaN and is scale-
+    sensitive). Note SVC training is ~O(N^2); fine at MALDI candidate scale
+    (~5-10 K rows) but slower than the linear backends."""
+    from sklearn.svm import SVC
+
+    gamma = rbf_svm_gamma
+    if isinstance(gamma, str) and gamma not in ("scale", "auto"):
+        gamma = float(gamma)
+
+    def make_clf():
+        return SVC(kernel="rbf", C=rbf_svm_c, gamma=gamma)
+
+    return _rescore_linear(
+        features_df, intrinsic_feature_names, init_ppm_threshold,
+        clf_name="rbf_svm", make_clf=make_clf, **kwargs,
     )
 
 
@@ -1372,6 +1472,11 @@ def rescore(
     max_length: int = 30,
     model: str = "lda",
     svm_c: float = 1.0,
+    gbt_n_estimators: int = 200,
+    gbt_max_depth: int = 3,
+    gbt_learning_rate: float = 0.1,
+    rbf_svm_c: float = 1.0,
+    rbf_svm_gamma: str = "scale",
     single_round: bool = False,
     init_ppm_threshold: float = 5.0,
     init_isotope_threshold: float = 0.7,
@@ -1429,16 +1534,20 @@ def rescore(
     ccs_window_multiplier: float = 2.0,
     tdf_path: str | None = None,
     mob_coloc: bool = False,
+    mob_protein_coloc: bool = False,
     mob_window_multiplier: float = 2.0,
     coloc_tic_quantile: float = 0.0,
     coloc_measured_pixel_mask: "np.ndarray | None" = None,
-    nmf_coloc: bool = False,
-    nmf_n_components: int = 12,
-    patch_coloc: bool = False,
-    patch_size: int = 10,
-    patch_coloc_threshold: float = 0.5,
+    coloc_tic_normalize: bool = False,
+    coloc_common_mode: bool = False,
+    region_coloc: bool = False,
+    region_coloc_k: int = 20,
     drop_zero_signal: bool = False,
     entrapment: bool = False,
+    substitution_n_residues: int = 1,
+    substitution_seed: int = 42,
+    substitution_collision_filter: bool = True,
+    substitution_mass_shift_min_da: float | None = None,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -1491,9 +1600,13 @@ def rescore(
     max_length
         Maximum peptide length (residues) after digest filtering.
     model
-        Rescoring backend: ``"lda"`` (default, LinearDiscriminantAnalysis) or
-        ``"qda"`` (QuadraticDiscriminantAnalysis, reg_param=0.1). Both train on
-        ``MALDI_INTRINSIC_FEATURES`` only; LC-MS/MS evidence is applied as an
+        Rescoring backend: ``"lda"`` (default, LinearDiscriminantAnalysis),
+        ``"qda"`` (QuadraticDiscriminantAnalysis, reg_param=0.1), ``"svm"``
+        (LinearSVC, C=``svm_c``), ``"gbt"`` (GradientBoostingClassifier,
+        nonlinear; tuned by ``gbt_n_estimators`` / ``gbt_max_depth`` /
+        ``gbt_learning_rate``), or ``"rbf_svm"`` (RBF-kernel SVC, nonlinear with
+        continuous scores; tuned by ``rbf_svm_c`` / ``rbf_svm_gamma``). All train
+        on ``MALDI_INTRINSIC_FEATURES`` only; LC-MS/MS evidence is applied as an
         additive log-prior after scoring.
     init_ppm_threshold
         ppm_error_abs threshold for the initial positive seed in the LDA/QDA
@@ -1985,6 +2098,26 @@ def rescore(
             max_length=max_length,
             selection_mode=_selection_mode,
         )
+    elif decoy_method == "substitution":
+        target_db = peptide_db[~peptide_db["is_decoy"].astype(bool)].reset_index(drop=True)
+        logger.info(
+            "Step 1c: Generating substitution decoys "
+            "(n_residues=%d, seed=%d, collision_filter=%s)...",
+            substitution_n_residues, substitution_seed, substitution_collision_filter,
+        )
+        candidates = generate_substitution_candidates(
+            target_db,
+            maldi_mzs,
+            matching_ppm=matching_ppm,
+            n_residues=substitution_n_residues,
+            random_seed=substitution_seed,
+            mass_shift_min_da=substitution_mass_shift_min_da,
+            collision_filter=substitution_collision_filter,
+            snap_to_features=not maldi_query_raw,
+            maldi_intensities=_maldi_intensities_arr,
+            maldi_intensities_p90=maldi_intensities_p90,
+            maldi_intensities_sum=maldi_intensities_sum,
+        )
     else:
         candidates = match_to_maldi_features(
             maldi_mzs,
@@ -2171,10 +2304,10 @@ def rescore(
         f"candidates (top {calibration_percentile:.0%} by low ppm + high isotope cosine)"
     )
 
-    # --- Steps 2–5: LC-MS/MS data (skipped entirely when no mzML is provided) ---
+    # --- Steps 2–5: LC-MS/MS data (skipped when no mzML or prior weight is 0) ---
     lcms_evidence = {}
 
-    if mzml_paths:
+    if mzml_paths and lcms_prior_weight > 0:
         # --- Step 2: Load LC-MS/MS data ---
         logger.info("Step 2: Loading LC-MS/MS data...")
         lcms_data = load_lcms_data(mzml_paths)
@@ -2305,7 +2438,10 @@ def rescore(
             )
 
     else:
-        logger.info("Steps 2–5: No mzML files provided — skipping LC-MS/MS evidence.")
+        if not mzml_paths:
+            logger.info("Steps 2–5: No mzML files provided — skipping LC-MS/MS evidence.")
+        else:
+            logger.info("Steps 2–5: lcms_prior_weight=0 — skipping DeepLC / MS2PIP / LC-MS/MS evidence.")
 
     # --- Override protein_tryptic_count with the true full-digest count ---
     # Replaces the candidate-pool count (= observed peptides, which makes
@@ -2328,6 +2464,9 @@ def rescore(
 
     # --- Step 6: Compute all features ---
     logger.info("Step 6: Computing all features...")
+    # When region colocalization is on and debug figures are requested, collect the
+    # segmentation map + region fingerprints so save_debug_figures can visualize them.
+    region_coloc_debug = {} if (region_coloc and debug_dir is not None) else None
     features_df = compute_all_features(
         candidates,
         lcms_evidence=lcms_evidence,
@@ -2341,11 +2480,11 @@ def rescore(
         im2deep_kwargs=im2deep_kwargs,
         coloc_tic_quantile=coloc_tic_quantile,
         coloc_measured_pixel_mask=coloc_measured_pixel_mask,
-        nmf_coloc=nmf_coloc,
-        nmf_n_components=nmf_n_components,
-        patch_coloc=patch_coloc,
-        patch_size=patch_size,
-        patch_coloc_threshold=patch_coloc_threshold,
+        coloc_tic_normalize=coloc_tic_normalize,
+        coloc_common_mode=coloc_common_mode,
+        region_coloc=region_coloc,
+        region_coloc_k=region_coloc_k,
+        region_coloc_debug=region_coloc_debug,
     )
     # Worst-case fill of protein-colocalization NaNs for zero-signal candidates, so a
     # feature with no MALDI signal is penalised rather than median-imputed to an average
@@ -2391,11 +2530,6 @@ def rescore(
         _exclude_set |= _ccs_mz_leak_feats
     if _exclude_set:
         logger.info(f"  Excluding {len(_exclude_set)} features: {sorted(_exclude_set)}")
-
-    if verbose:
-        logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
-        _debug_cols = [c for c in features_df.columns if c not in _exclude_set]
-        features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
     # --- CCS-based candidate filtering (optional) ---
     # IM2Deep finetuning (inside compute_all_features) uses the calibration-peptide
@@ -2460,10 +2594,17 @@ def rescore(
                 tdf_path,
                 mob_window_multiplier=mob_window_multiplier,
                 extraction_ppm=ppm_tolerance,
+                protein_coloc=mob_protein_coloc,
+                tic_normalize=coloc_tic_normalize,
             )
             _has_mob_coloc = True
         except Exception as exc:
             logger.warning(f"Per-candidate mobility colocalization failed: {exc}. Skipping.")
+
+    if verbose:
+        logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
+        _debug_cols = [c for c in features_df.columns if c not in _exclude_set]
+        features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
@@ -2493,8 +2634,8 @@ def rescore(
     )
 
     # _exclude_set (features_exclude + the mz_shuffle CCS/mobility leak features) was
-    # resolved earlier, before the 13_debug_features.tsv write, so the debug table and
-    # the ranker apply identical exclusions. See that block for the mz_shuffle rationale.
+    # resolved earlier (and 13_debug_features.tsv written after mob_coloc), so the debug
+    # table and the ranker apply identical exclusions. See that block for the mz_shuffle rationale.
     # Assemble the intrinsic feature pool: base + optional protein-level + optional
     # spatial-ranker.  protein_colocalization_* appear in both PROTEIN_LEVEL_FEATURES
     # and SPATIAL_RANKER_FEATURES; the order-preserving dedup below prevents
@@ -2508,10 +2649,10 @@ def rescore(
             f"  Spatial ranker features enabled ({len(SPATIAL_RANKER_FEATURES)} features) "
             f"with decoy_method='{decoy_method}'"
         )
-    if nmf_coloc:
-        _pool += NMF_COLOCALIZATION_FEATURES
+    if region_coloc:
+        _pool += REGION_COLOCALIZATION_FEATURES
         logger.info(
-            f"  NMF colocalization features enabled ({len(NMF_COLOCALIZATION_FEATURES)} features)"
+            f"  Region colocalization features enabled ({len(REGION_COLOCALIZATION_FEATURES)} features)"
         )
     _seen: set[str] = set()
     _intrinsic_pool = [
@@ -2566,12 +2707,26 @@ def rescore(
     # --- Step 9: Rescoring ---
     logger.info(f"Step 8: Running rescoring (model='{model}')...")
 
-    if model in ("lda", "svm"):
-        # LDA and SVM are both linear, decision_function-based backends sharing the
-        # entire dispatch (winner selection, TDC, PEP, reweighting). Select the
-        # routine and tag the score columns / importance files by model name.
-        _linear = _rescore_svm if model == "svm" else _rescore_lda
-        _svm_kwargs = {"svm_c": svm_c} if model == "svm" else {}
+    if model in ("lda", "svm", "gbt", "rbf_svm"):
+        # LDA, SVM, GBT, and RBF-SVM all score via decision_function and share the
+        # entire dispatch (seed, pseudo-label iteration, winner selection, TDC, PEP,
+        # reweighting). LDA/SVM are linear; GBT is a nonlinear gradient-boosted-tree
+        # backend; RBF-SVM is a nonlinear kernel backend with continuous scores.
+        # Select the routine and tag the score columns / importance files by name.
+        _linear = {"svm": _rescore_svm, "gbt": _rescore_gbt,
+                   "rbf_svm": _rescore_rbf_svm}.get(model, _rescore_lda)
+        if model == "svm":
+            _svm_kwargs = {"svm_c": svm_c}
+        elif model == "gbt":
+            _svm_kwargs = {
+                "gbt_n_estimators": gbt_n_estimators,
+                "gbt_max_depth": gbt_max_depth,
+                "gbt_learning_rate": gbt_learning_rate,
+            }
+        elif model == "rbf_svm":
+            _svm_kwargs = {"rbf_svm_c": rbf_svm_c, "rbf_svm_gamma": rbf_svm_gamma}
+        else:
+            _svm_kwargs = {}
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
 
         # Fitted-pipeline capture for SHAP debug explanations (see debug_pfm_explanations).
@@ -2798,6 +2953,7 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct, single_round=single_round,
+                region_debug=region_coloc_debug,
             )
 
             # Per-PFM SHAP explanations on the fitted linear model. Use the R2
@@ -3014,6 +3170,7 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct, single_round=single_round,
+                region_debug=region_coloc_debug,
             )
 
         if entrapment:
@@ -3021,4 +3178,4 @@ def rescore(
         return psm_list, result_df, feature_names, features_df
 
     else:
-        raise ValueError(f"Unknown model '{model}'. Choose 'lda', 'qda', or 'svm'.")
+        raise ValueError(f"Unknown model '{model}'. Choose 'lda', 'qda', 'svm', 'gbt', or 'rbf_svm'.")

@@ -16,6 +16,7 @@ Fourteen subsystems:
  12. Score distributions       — target/decoy score histograms at R1, R2, and reweighted
  13. Pearson r distribution    — same-protein vs different-protein ion image Pearson r at 5% FDR
  14. Protein spatial coherence — per-protein peptide count vs mean ion image Pearson r at 5% FDR
+ 15. Region ion-image panels   — per-protein ion images + region overlay + profile bar (region-coloc debug folder)
 
 Entry point: save_debug_figures()
 """
@@ -1556,6 +1557,7 @@ _COLOC_COLS = [
     ("protein_colocalization_max",     "Protein coloc. (max r)"),
     ("protein_colocalization_median",  "Protein coloc. (median r)"),
     ("protein_colocalization_n_partners", "Protein coloc. (n partners)"),
+    ("protein_region_colocalization",  "Region coloc. (mean r)"),
 ]
 
 _GROUP_ORDER  = ["ID @ 1% FDR", "ID @ 5% FDR", "R1 winner (below FDR)", "Non-winner"]
@@ -1694,6 +1696,285 @@ def plot_protein_colocalization_by_group(
     )
     plt.tight_layout()
     _save_and_close(fig, os.path.join(out_dir, "protein_colocalization_by_group.png"))
+
+
+def plot_region_colocalization(
+    features_df: pd.DataFrame,
+    region_debug: dict,
+    ion_image_shape: tuple[int, int] | None = None,
+    out_dir: str = "debug",
+    n_proteins: int = 4,
+    max_target_rows: int = 8,
+    max_decoy_rows: int = 3,
+) -> None:
+    """Visualize *how* region-profile colocalization worked (opt-in ``--region-coloc``).
+
+    Two figures, from the ``region_debug`` dict populated by
+    ``compute_region_colocalization_features``:
+
+    1. ``region_segmentation.png`` — the k-means region map over the tissue
+       (off-tissue pixels greyed), so the discovered compartments are visible.
+    2. ``region_profiles.png`` — for the proteins with the largest target-vs-decoy
+       region-coloc delta, a heatmap of per-region composition with one row per
+       peptide (targets ``T``, decoys ``D``). Same-protein target peptides share a
+       region fingerprint; the decoy rows (relocated to foreign m/z) differ — the
+       visual analog of the target-r > decoy-r the feature scores.
+    """
+    import matplotlib as mpl
+
+    labels = region_debug.get("region_labels")
+    profiles = region_debug.get("region_profiles")
+    prof_mzs = region_debug.get("region_profile_mzs")
+    if labels is None or profiles is None or prof_mzs is None:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    profiles = np.asarray(profiles)
+
+    # ---- Figure 1: segmentation map ----
+    if ion_image_shape is not None:
+        H, W = ion_image_shape
+        seg = labels.reshape(H, W).astype(float)
+        seg[seg < 0] = np.nan
+        kmax = np.nanmax(seg)
+        k = int(kmax) + 1 if np.isfinite(kmax) else 1
+        fig, ax = plt.subplots(figsize=(6, 5))
+        cmap = mpl.colormaps["tab20"].resampled(max(k, 1))
+        cmap.set_bad("0.9")
+        im = ax.imshow(seg, cmap=cmap, interpolation="nearest")
+        ax.set_title(f"Region segmentation (k={k} regions; off-tissue grey)", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="region id")
+        _save_and_close(fig, os.path.join(out_dir, "region_segmentation.png"))
+
+    # ---- Figure 2: per-protein region-profile fingerprints ----
+    if (
+        "protein" not in features_df.columns
+        or "protein_region_colocalization" not in features_df.columns
+        or "is_decoy" not in features_df.columns
+    ):
+        return
+    mz_to_row = {float(m): i for i, m in enumerate(np.asarray(prof_mzs))}
+    base = features_df.assign(
+        base_protein=features_df["protein"]
+        .str.replace("DECOY_", "", regex=False)
+        .str.replace("ENTRAPMENT_", "", regex=False)
+    )
+    tgt = base[~base["is_decoy"]]
+    grp = base.groupby(["base_protein", "is_decoy"])["protein_region_colocalization"].mean().unstack()
+    npep = tgt.groupby("base_protein")["peptide"].nunique()
+
+    cand = []
+    for prot in grp.index:
+        if int(npep.get(prot, 0)) < 3:
+            continue
+        t = grp.loc[prot].get(False, np.nan)
+        d = grp.loc[prot].get(True, np.nan)
+        delta = (t - d) if (t == t and d == d) else (t if t == t else float("-inf"))
+        cand.append((prot, delta))
+    cand.sort(key=lambda x: (x[1] if x[1] == x[1] else float("-inf")), reverse=True)
+    prots = [p for p, _ in cand[:n_proteins]]
+    if not prots:
+        return
+
+    fig, axes = plt.subplots(len(prots), 1, figsize=(8, 2.4 * len(prots)), squeeze=False)
+    for ri, prot in enumerate(prots):
+        ax = axes[ri][0]
+        rows, ylabels = [], []
+        for _, r in tgt[tgt["base_protein"] == prot].drop_duplicates("peptide").head(max_target_rows).iterrows():
+            idx = mz_to_row.get(float(r["feature_mz"]))
+            if idx is not None:
+                rows.append(profiles[idx]); ylabels.append(f"T {str(r['peptide'])[:12]}")
+        decoy_rows = base[(base["is_decoy"]) & (base["base_protein"] == prot)]
+        for _, r in decoy_rows.drop_duplicates("peptide").head(max_decoy_rows).iterrows():
+            idx = mz_to_row.get(float(r["feature_mz"]))
+            if idx is not None:
+                rows.append(profiles[idx]); ylabels.append(f"D {str(r['peptide'])[:12]}")
+        if not rows:
+            ax.axis("off"); continue
+        M = np.asarray(rows)
+        im = ax.imshow(M, aspect="auto", cmap="viridis", interpolation="nearest")
+        ax.set_yticks(range(len(ylabels))); ax.set_yticklabels(ylabels, fontsize=6)
+        ax.set_xlabel("region id", fontsize=7)
+        ax.set_title(f"{prot}: per-region composition fingerprint (T=target, D=decoy)", fontsize=8)
+        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+    fig.suptitle(
+        "Region-profile fingerprints — same-protein targets share a pattern; decoys differ",
+        fontsize=10,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    _save_and_close(fig, os.path.join(out_dir, "region_profiles.png"))
+
+
+def plot_region_ion_images(
+    features_df: pd.DataFrame,
+    region_debug: dict,
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    out_dir: str = "debug/region_ion_images",
+    n_proteins: int = 6,
+    max_target_rows: int = 8,
+    max_decoy_rows: int = 3,
+) -> None:
+    """Per-protein ion-image panels with region overlay.
+
+    For the top ``n_proteins`` proteins by target-vs-decoy
+    ``protein_region_colocalization`` delta, writes one PNG per protein to
+    ``out_dir/<protein>.png``.  Each row in the figure is one peptide (target
+    rows first, then decoy rows).  Three columns per row:
+
+    * **Ion image** — raw spatial distribution (hot colourmap, γ=0.5).
+    * **Region overlay** — same ion image with the k-means region map blended
+      on top (tab20 per-region colours, semi-transparent).  Shows which tissue
+      compartments carry each peptide's signal.
+    * **Region profile** — horizontal bar chart of the per-region mean
+      intensity fingerprint (the vector that ``protein_region_colocalization``
+      correlates between peptides).  Same colours as the overlay.
+
+    Same-protein target peptides should share a similar profile; decoy rows
+    (at a foreign m/z) should diverge.
+    """
+    import matplotlib as mpl
+
+    labels = region_debug.get("region_labels")
+    profiles = region_debug.get("region_profiles")
+    prof_mzs = region_debug.get("region_profile_mzs")
+    if labels is None or profiles is None or prof_mzs is None:
+        return
+    if (
+        "protein" not in features_df.columns
+        or "protein_region_colocalization" not in features_df.columns
+        or "is_decoy" not in features_df.columns
+    ):
+        return
+
+    profiles = np.asarray(profiles)
+    ion_image_mzs_arr = np.asarray(ion_image_mzs)
+    H, W = ion_images.shape[1], ion_images.shape[2]
+    seg = labels.reshape(H, W)
+    n_regions = int(np.max(seg[seg >= 0])) + 1 if (seg >= 0).any() else 1
+    cmap_tab = mpl.colormaps["tab20"].resampled(max(n_regions, 2))
+
+    # Build semi-transparent region RGBA overlay (off-tissue fully transparent)
+    overlay_rgba = np.zeros((H, W, 4), dtype=np.float32)
+    for k in range(n_regions):
+        r, g, b, _ = cmap_tab(k / max(n_regions - 1, 1))
+        overlay_rgba[seg == k] = [r, g, b, 0.55]
+
+    mz_to_prof_row = {float(m): i for i, m in enumerate(np.asarray(prof_mzs))}
+
+    def _find_img_idx(mz, ppm=20.0):
+        idx = int(np.searchsorted(ion_image_mzs_arr, mz))
+        for c in (idx, idx - 1):
+            if 0 <= c < len(ion_image_mzs_arr):
+                if abs(ion_image_mzs_arr[c] - mz) / mz * 1e6 < ppm:
+                    return c
+        return None
+
+    base = features_df.assign(
+        base_protein=features_df["protein"]
+        .str.replace("DECOY_", "", regex=False)
+        .str.replace("ENTRAPMENT_", "", regex=False)
+    )
+    tgt = base[~base["is_decoy"]]
+    grp = base.groupby(["base_protein", "is_decoy"])["protein_region_colocalization"].mean().unstack()
+    npep = tgt.groupby("base_protein")["peptide"].nunique()
+
+    cand = []
+    for prot in grp.index:
+        if int(npep.get(prot, 0)) < 2:
+            continue
+        t = grp.loc[prot].get(False, np.nan)
+        d = grp.loc[prot].get(True, np.nan)
+        if t == t and d == d:
+            delta = t - d
+        elif t == t:
+            delta = t
+        else:
+            delta = float("-inf")
+        cand.append((prot, delta, float(t) if t == t else float("nan"), float(d) if d == d else float("nan")))
+    cand.sort(key=lambda x: x[1] if x[1] == x[1] else float("-inf"), reverse=True)
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    for prot, delta, t_mean, d_mean in cand[:n_proteins]:
+        t_rows = (
+            tgt[tgt["base_protein"] == prot]
+            .drop_duplicates("peptide")
+            .head(max_target_rows)
+        )
+        d_rows = (
+            base[(base["is_decoy"]) & (base["base_protein"] == prot)]
+            .drop_duplicates("peptide")
+            .head(max_decoy_rows)
+        )
+        all_rows = [(r, False) for r in t_rows.itertuples()] + [(r, True) for r in d_rows.itertuples()]
+        if not all_rows:
+            continue
+
+        n_rows = len(all_rows)
+        fig, axes = plt.subplots(
+            n_rows, 3, figsize=(9.0, 2.2 * n_rows),
+            gridspec_kw={"width_ratios": [1, 1, 1.2]},
+        )
+        if n_rows == 1:
+            axes = axes[np.newaxis, :]
+
+        axes[0, 0].set_title("ion image", fontsize=8)
+        axes[0, 1].set_title("region overlay", fontsize=8)
+        axes[0, 2].set_title("region profile", fontsize=8)
+
+        for ri, (row, is_d) in enumerate(all_rows):
+            mz = float(row.feature_mz)
+            img_idx = _find_img_idx(mz)
+            prof_idx = mz_to_prof_row.get(mz)
+            rc_val = getattr(row, "protein_region_colocalization", float("nan"))
+            rc_str = f"r={rc_val:.2f}" if rc_val == rc_val else ""
+            label = f"{'D' if is_d else 'T'} {str(row.peptide)[:16]} {rc_str}"
+
+            ax0, ax1, ax2 = axes[ri, 0], axes[ri, 1], axes[ri, 2]
+
+            def _show_img(ax, img_idx, cmap="hot"):
+                if img_idx is not None:
+                    img = ion_images[img_idx].astype(float)
+                    pos = img[img > 0]
+                    vmax = float(np.percentile(pos, 99)) if len(pos) else 1.0
+                    norm = np.clip(img / max(vmax, 1e-9), 0.0, 1.0) ** 0.5
+                    ax.imshow(norm, cmap=cmap, interpolation="nearest")
+                else:
+                    ax.imshow(np.zeros((H, W)), cmap=cmap, interpolation="nearest")
+                    ax.text(W / 2, H / 2, "no image", ha="center", va="center", fontsize=6, color="white")
+                ax.set_xticks([]); ax.set_yticks([])
+
+            _show_img(ax0, img_idx, cmap="hot")
+            ax0.set_title(label, fontsize=6.5, loc="left", pad=2)
+
+            # region overlay: grey base + coloured region alpha
+            _show_img(ax1, img_idx, cmap="gray")
+            ax1.imshow(overlay_rgba, interpolation="nearest")
+            ax1.set_xticks([]); ax1.set_yticks([])
+
+            # region profile bar
+            if prof_idx is not None:
+                prof = profiles[prof_idx]
+                colors = [cmap_tab(k / max(n_regions - 1, 1)) for k in range(len(prof))]
+                ax2.barh(range(len(prof)), prof, color=colors, height=0.8)
+                ax2.invert_yaxis()
+                ax2.set_yticks(range(n_regions))
+                ax2.set_yticklabels([str(k) for k in range(n_regions)], fontsize=5)
+                ax2.tick_params(axis="x", labelsize=5)
+            else:
+                ax2.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax2.transAxes, fontsize=7)
+                ax2.axis("off")
+
+        t_str = f"{t_mean:.3f}" if t_mean == t_mean else "n/a"
+        d_str = f"{d_mean:.3f}" if d_mean == d_mean else "n/a"
+        fig.suptitle(
+            f"{prot}  (target region_coloc={t_str}, decoy={d_str})",
+            fontsize=9,
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in prot)[:60]
+        _save_and_close(fig, os.path.join(out_dir, f"{safe}.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -3239,6 +3520,96 @@ def debug_pfm_explanations(
 
 
 # ---------------------------------------------------------------------------
+# Target / decoy 3D scatter: m/z × ion mobility × intensity
+# ---------------------------------------------------------------------------
+
+def plot_mz_mobility_intensity_scatter(
+    features_df: pd.DataFrame,
+    out_dir: str,
+    filename: str = "mz_mobility_intensity_scatter.png",
+) -> None:
+    """
+    Scatter plot of candidates in (m/z, observed CCS, log-intensity) space.
+
+    x: ``feature_mz``; y: ``im2deep_observed_ccs`` (falls back to
+    ``im2deep_predicted_ccs``); colour: log10(``feature_intensity_p90`` + 1)
+    mapped to a diverging colormap; marker shape: target (circle) vs decoy
+    (cross). Silently skips when neither CCS column is present.
+
+    Saved to ``{out_dir}/{filename}``.
+    """
+    ccs_col = None
+    for c in ("im2deep_observed_ccs", "im2deep_predicted_ccs"):
+        if c in features_df.columns:
+            ccs_col = c
+            break
+    if ccs_col is None or "feature_mz" not in features_df.columns:
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    feat = features_df.reset_index(drop=True)
+    fmz = pd.to_numeric(feat["feature_mz"], errors="coerce").values
+    ccs = pd.to_numeric(feat[ccs_col], errors="coerce").values
+    is_decoy = feat.get("is_decoy", pd.Series(False, index=feat.index)).fillna(False).astype(bool).values
+
+    # intensity column: p90 preferred, then raw, then ones
+    int_col = next(
+        (c for c in ("feature_intensity_p90", "feature_intensity") if c in feat.columns),
+        None,
+    )
+    if int_col is not None:
+        raw_int = pd.to_numeric(feat[int_col], errors="coerce").values
+        raw_int = np.where(np.isfinite(raw_int) & (raw_int >= 0), raw_int, 0.0)
+    else:
+        raw_int = np.ones(len(feat), dtype=float)
+    log_int = np.log10(raw_int + 1.0)
+
+    valid = np.isfinite(fmz) & np.isfinite(ccs)
+    if not valid.any():
+        return
+
+    fmz_v, ccs_v, li_v, dec_v = fmz[valid], ccs[valid], log_int[valid], is_decoy[valid]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    vmin, vmax = float(np.percentile(li_v, 5)), float(np.percentile(li_v, 95))
+    if vmin >= vmax:
+        vmin, vmax = 0.0, max(1.0, float(li_v.max()))
+
+    for mask, marker, label in [
+        (~dec_v, "o", "Target"),
+        (dec_v,  "x", "Decoy"),
+    ]:
+        if not mask.any():
+            continue
+        sc = ax.scatter(
+            fmz_v[mask], ccs_v[mask],
+            c=li_v[mask], cmap="viridis",
+            vmin=vmin, vmax=vmax,
+            s=6 if marker == "o" else 8,
+            alpha=0.4 if marker == "o" else 0.6,
+            marker=marker,
+            linewidths=0.5,
+            label=label,
+        )
+
+    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    cbar.set_label(f"log₁₀({int_col or 'intensity'} + 1)", fontsize=9)
+
+    ccs_label = "Observed CCS (Å²)" if ccs_col == "im2deep_observed_ccs" else "Predicted CCS (Å²)"
+    ax.set_xlabel("Feature m/z (Da)", fontsize=10)
+    ax.set_ylabel(ccs_label, fontsize=10)
+    ax.set_title("Target vs decoy: m/z × ion mobility × intensity", fontsize=11)
+    ax.legend(markerscale=2, fontsize=8, loc="upper left")
+    ax.tick_params(labelsize=8)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, filename), dpi=150)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -3267,6 +3638,7 @@ def save_debug_figures(
     storey_pi0_val: float | None = None,
     ccs_tol_pct: float | None = None,
     single_round: bool = False,
+    region_debug: dict | None = None,
 ) -> None:
     """
     Generate all debug figures and save them under ``debug_dir``.
@@ -3504,6 +3876,17 @@ def save_debug_figures(
         logger.warning("CCS scatter failed: %s", exc)
 
     try:
+        plot_mz_mobility_intensity_scatter(features_df, out_dir=debug_dir)
+        ccs_present = any(c in features_df.columns for c in ("im2deep_observed_ccs", "im2deep_predicted_ccs"))
+        if ccs_present:
+            logger.info(
+                "m/z × mobility × intensity scatter saved to %s/mz_mobility_intensity_scatter.png",
+                debug_dir,
+            )
+    except Exception as exc:
+        logger.warning("m/z × mobility × intensity scatter failed: %s", exc)
+
+    try:
         plot_ids_vs_fdr(result_df, out_dir=debug_dir, pi0=storey_pi0_val)
         logger.info("IDs vs FDR curve saved to %s/ids_vs_fdr.png", debug_dir)
     except Exception as exc:
@@ -3521,6 +3904,32 @@ def save_debug_figures(
             )
     except Exception as exc:
         logger.warning("Protein colocalization by group plot failed: %s", exc)
+
+    if region_debug:
+        try:
+            plot_region_colocalization(
+                features_df, region_debug,
+                ion_image_shape=(ion_images.shape[1], ion_images.shape[2]) if ion_images is not None else None,
+                out_dir=debug_dir,
+            )
+            logger.info(
+                "Region colocalization viz saved to %s/region_segmentation.png + region_profiles.png",
+                debug_dir,
+            )
+        except Exception as exc:
+            logger.warning("Region colocalization plot failed: %s", exc)
+        if ion_images is not None and ion_image_mzs is not None:
+            try:
+                plot_region_ion_images(
+                    features_df, region_debug, ion_images, ion_image_mzs,
+                    out_dir=os.path.join(debug_dir, "region_ion_images"),
+                )
+                logger.info(
+                    "Region ion-image panels saved to %s/region_ion_images/",
+                    debug_dir,
+                )
+            except Exception as exc:
+                logger.warning("Region ion-image panels failed: %s", exc)
 
     try:
         plot_target_decoy_mz_distribution(
