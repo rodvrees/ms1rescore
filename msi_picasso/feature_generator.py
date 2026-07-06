@@ -103,6 +103,11 @@ PROTEIN_LEVEL_FEATURES = [
     # protein consistency (from compute_protein_consistency_features)
     "protein_n_features", "log_protein_n_features", "protein_coverage",
     "protein_rank", "protein_best_ratio",
+    # structural indicator: 1.0 when the protein has a single observed peptide, so
+    # within-protein colocalization is undefined (median-imputed) and
+    # log_protein_n_features is at its floor.  Lets the ranker treat these peptides
+    # as a separate group and rely on their intrinsic evidence (see O8).
+    "is_single_peptide_protein",
     # protein co-localization (from compute_colocalization_features; requires ion_images)
     "protein_colocalization", "protein_colocalization_max",
     "protein_colocalization_median", "protein_colocalization_n_partners",

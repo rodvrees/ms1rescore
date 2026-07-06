@@ -116,6 +116,32 @@ def _observed_ccs_by_feature_idx(
     return ccs_map or None
 
 
+def _mob_hist_by_feature_idx(
+    candidates: pd.DataFrame,
+    maldi_mzs: np.ndarray,
+    mob_k0_hist: np.ndarray | None,
+) -> dict | None:
+    """Build a ``mob_k0_hist_by_feature`` dict keyed by candidate ``feature_idx``.
+
+    ``mob_k0_hist`` is a ``(len(maldi_mzs), n_bins)`` array aligned with the queried
+    m/z grid.  Bridged to candidate ``feature_idx`` via ``feature_mz`` exactly like
+    :func:`_observed_ccs_by_feature_idx` (each value is the candidate's 1/K0
+    histogram row).  Returns ``None`` when ``mob_k0_hist`` is absent.
+    """
+    if mob_k0_hist is None:
+        return None
+    maldi_mzs = np.asarray(maldi_mzs)
+    mz_to_row = {float(m): i for i, m in enumerate(maldi_mzs)}
+    hist_map = {
+        int(fi): mob_k0_hist[mz_to_row[float(mz)]]
+        for fi, mz in candidates[["feature_idx", "feature_mz"]]
+        .drop_duplicates()
+        .itertuples(index=False)
+        if float(mz) in mz_to_row
+    }
+    return hist_map or None
+
+
 def _recompute_ppm_from_centroids(
     feature_mz: np.ndarray,
     maldi_mzs: np.ndarray,

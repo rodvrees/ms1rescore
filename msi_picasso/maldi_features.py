@@ -7,6 +7,7 @@ All functions are symmetric — no is_decoy branching in feature computation.
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -94,6 +95,18 @@ def compute_protein_consistency_features(df: pd.DataFrame) -> pd.DataFrame:
     protein_n_peptides = df.groupby("protein")["peptide"].nunique()
     df["protein_n_peptides"] = df["protein"].map(protein_n_peptides).fillna(0).astype(int)
     df["protein_coverage"] = (df["protein_n_peptides"] / total_peps).clip(upper=1.0)
+
+    # ``is_single_peptide_protein``: 1.0 when the candidate's protein has exactly one
+    # observed peptide, 0.0 otherwise.  A structural indicator (independent of MALDI
+    # signal / image validity, unlike ``has_coloc``): single-peptide proteins have no
+    # within-protein colocalization partner, so all protein-colocalization features are
+    # undefined for them and get median-imputed by the ranker — an average coloc value
+    # they did not earn, while ``log_protein_n_features`` simultaneously buries them.
+    # Exposing the indicator lets a (nonlinear) ranker apply a separate offset to this
+    # group and lean on the peptide's own intrinsic evidence (ppm / CCS / isotope)
+    # instead of the imputed coloc.  Symmetric under all decoy methods (a protein and
+    # its DECOY_/ENTRAPMENT_ namespace share the same peptide set), so it cannot leak.
+    df["is_single_peptide_protein"] = (df["protein_n_peptides"] == 1).astype(np.float32)
 
     df["protein_rank"] = df.groupby("feature_mz")["protein_n_features"].rank(
         ascending=False, method="min"
@@ -1681,6 +1694,25 @@ def _pearson_r_images(a: np.ndarray, b: np.ndarray) -> float:
     return float((af * bf).sum() / denom)
 
 
+def _log_progress(prefix: str, n_done: int, n_total: int, t_start: float, every: int) -> None:
+    """Emit a throttled '<prefix>: k/n (p%) elapsed As, ETA Bs' progress line.
+
+    Logs on every ``every``-th item (and always on the last), so long loops with
+    no other per-item logging (mobility image rebuild, protein-pairwise coloc,
+    the pure-Python mob-coloc fallback) show where time is actually going instead
+    of a single silent multi-hour gap between phase-boundary log lines.
+    """
+    if n_total <= 0 or (n_done % every != 0 and n_done != n_total):
+        return
+    elapsed = time.perf_counter() - t_start
+    rate = n_done / elapsed if elapsed > 0 else 0.0
+    eta = (n_total - n_done) / rate if rate > 0 else float("nan")
+    logger.debug(
+        f"{prefix}: {n_done}/{n_total} ({100.0 * n_done / n_total:.0f}%) "
+        f"elapsed {elapsed:.0f}s, ETA {eta:.0f}s"
+    )
+
+
 def compute_mobility_colocalization_features(
     df: pd.DataFrame,
     tdf_path: str,
@@ -1711,6 +1743,8 @@ def compute_mobility_colocalization_features(
     """
     import sqlite3
     from pathlib import Path
+
+    _t_func_start = time.perf_counter()
 
     NEW_COLS = [
         "isotope_colocalization_m1_mob", "isotope_colocalization_m2_mob",
@@ -1783,7 +1817,9 @@ def compute_mobility_colocalization_features(
         return df
 
     logger.info(f"Mobility colocalization: loading TDF from {tdf_path}")
+    _t0 = time.perf_counter()
     tims = atb.TimsTOF(str(tdf_path))
+    logger.info(f"Mobility colocalization: TDF loaded in {time.perf_counter() - _t0:.0f}s")
 
     with sqlite3.connect(str(tdf_path / "analysis.tdf")) as conn:
         frames_meta = pd.read_sql(
@@ -1818,6 +1854,10 @@ def compute_mobility_colocalization_features(
         _use_rust = True
     except ImportError:
         _use_rust = False
+    logger.info(
+        f"Mobility colocalization: {len(groups)} feature groups, "
+        f"{len(df)} candidates; backend={'Rust' if _use_rust else 'pure-Python fallback (slow)'}"
+    )
 
     # Per-candidate M0 images collected by whichever path runs; used below for
     # protein-level pairwise r.
@@ -1860,6 +1900,7 @@ def compute_mobility_colocalization_features(
 
         # Build TOF-bin filter mask: mark every bin that falls inside at least
         # one of the 6 extraction windows for any feature.
+        _t0 = time.perf_counter()
         ppm_factor   = extraction_ppm * 1e-6
         relevant_tof = np.zeros(tof_max_idx, dtype=np.bool_)
         for _, grp in groups:
@@ -1872,20 +1913,24 @@ def compute_mobility_colocalization_features(
                     relevant_tof[lo:hi] = True
 
         n_rel = int(relevant_tof.sum())
-        logger.info(
-            f"Mobility colocalization: {n_pixels} pixels, "
+        logger.debug(
+            f"Mobility colocalization: TOF-bin mask built in "
+            f"{time.perf_counter() - _t0:.0f}s — {n_pixels} pixels, "
             f"{n_rel}/{tof_max_idx} TOF bins in extraction windows "
             f"({100.0 * n_rel / max(tof_max_idx, 1):.1f}%); loading filtered peaks…"
         )
 
         # Process pixels in batches of _BATCH to bound peak memory per iteration
+        _t0 = time.perf_counter()
         _BATCH = 5000
+        _n_batches = (n_pixels + _BATCH - 1) // _BATCH
         all_pix:   list[np.ndarray] = []
         all_mzs_l: list[np.ndarray] = []
         all_scn_l: list[np.ndarray] = []
         all_int_l: list[np.ndarray] = []
 
-        for b0 in range(0, n_pixels, _BATCH):
+        for _bi, b0 in enumerate(range(0, n_pixels, _BATCH), start=1):
+            _log_progress("Mobility colocalization: loading filtered peaks", _bi, _n_batches, _t0, every=max(1, _n_batches // 20))
             b1        = min(b0 + _BATCH, n_pixels)
             b_starts  = peak_starts_pp[b0:b1]
             b_counts  = peak_counts_pp[b0:b1]
@@ -1933,10 +1978,12 @@ def compute_mobility_colocalization_features(
         total_all      = int(peak_counts_pp.sum())
         n_workers = min(os.cpu_count() or 1, 16)
         logger.info(
-            f"Mobility colocalization: {total_filtered:,} relevant peaks "
+            f"Mobility colocalization: peak loading done in "
+            f"{time.perf_counter() - _t0:.0f}s — {total_filtered:,} relevant peaks "
             f"({100.0 * total_filtered / max(total_all, 1):.1f}% of {total_all:,} total); "
             f"sorting per-pixel m/z across {n_workers} threads…"
         )
+        _t0 = time.perf_counter()
 
         # Rust binary-searches per-pixel m/z windows, so peaks must be ordered by
         # (pixel_id, mz). pix_ids is ALREADY globally non-decreasing here: the batch
@@ -1966,6 +2013,7 @@ def compute_mobility_colocalization_features(
             with ThreadPoolExecutor(max_workers=n_workers) as _ex:
                 list(_ex.map(_sort_pixel_slices,
                              np.array_split(np.arange(n_pixels), n_workers * 4)))
+        logger.info(f"Mobility colocalization: per-pixel sort done in {time.perf_counter() - _t0:.0f}s")
 
         # CSR offsets: pixel_offsets[px] … pixel_offsets[px+1] = peak range for pixel px
         pixel_offsets = pixel_offsets_arr.astype(np.uint64).tolist()
@@ -1984,6 +2032,7 @@ def compute_mobility_colocalization_features(
         feature_mz_windows = np.empty(n_features * 6 * 2, dtype=np.float32)
 
         # Build candidate CSR arrays
+        _t0 = time.perf_counter()
         cand_ptr: list[int] = [0]
         cand_k0_lo_list: list[float] = []
         cand_k0_hi_list: list[float] = []
@@ -2010,9 +2059,11 @@ def compute_mobility_colocalization_features(
                     cand_k0_hi_list.append(float(pred_k0) + k0_half_win)
 
         logger.info(
-            f"Mobility colocalization: processing {n_features} feature groups "
+            f"Mobility colocalization: candidate CSR built in "
+            f"{time.perf_counter() - _t0:.0f}s — processing {n_features} feature groups "
             f"({len(cand_df_indices)} candidates) via Rust…"
         )
+        _t0 = time.perf_counter()
         raw = _rs_mob_coloc(
             flat_mzs,
             flat_scans,
@@ -2028,6 +2079,7 @@ def compute_mobility_colocalization_features(
             max_x,
             max_y,
         )
+        logger.info(f"Mobility colocalization: Rust kernel done in {time.perf_counter() - _t0:.0f}s")
         raw_mat = np.asarray(raw, dtype=np.float64).reshape(len(cand_df_indices), 10)
 
         for col_i, col in enumerate(NEW_COLS):
@@ -2053,16 +2105,30 @@ def compute_mobility_colocalization_features(
             pixel_xi_arr = np.array(pixel_xi_list, dtype=np.int32)
             pixel_yi_arr = np.array(pixel_yi_list, dtype=np.int32)
             _n_pix_total = max_y * max_x
-            for _, grp in groups:
+            _pred_inv_k0_map = df["_pred_inv_k0"].to_dict()
+
+            def _build_group_images(grp):
                 cands_needed = [i for i in grp.index if i in _needs_img]
                 if not cands_needed:
-                    continue
+                    return []
                 feat_mz = float(grp["feature_mz"].iloc[0])
                 mz_lo = feat_mz * (1.0 - ppm_factor)
                 mz_hi = feat_mz * (1.0 + ppm_factor)
+                # NB: this is a full O(len(mzs_all)) scan (mzs_all is sorted
+                # per-pixel, not globally, so no binary search shortcut here) —
+                # ~2-3 billion elements on a whole-tissue section. Dispatched
+                # across threads below because numpy's comparison/logical-and
+                # ufuncs release the GIL for arrays past a small internal
+                # threshold, so concurrent calls genuinely run on separate
+                # cores. This was previously the dominant single-threaded cost
+                # of mobility colocalization (hours on a dense whole section).
+                # ponytail: still O(N) per feature; a global mz-sort + binary
+                # search per feature would cut this further, at the cost of a
+                # full extra sorted copy of mzs_all/pix_ids/scan_ids/ints_all.
+                # Revisit if threading alone isn't enough headroom.
                 mz_mask = (mzs_all >= mz_lo) & (mzs_all <= mz_hi)
                 if not mz_mask.any():
-                    continue
+                    return []
                 sub_pix  = pix_ids[mz_mask]
                 sub_mob  = mob_arr[scan_ids[mz_mask]]
                 # bincount requires float64 weights
@@ -2071,8 +2137,9 @@ def compute_mobility_colocalization_features(
                     pixel_yi_arr[sub_pix].astype(np.int64) * max_x
                     + pixel_xi_arr[sub_pix].astype(np.int64)
                 )
+                out = []
                 for idx in cands_needed:
-                    pred_k0 = df.at[idx, "_pred_inv_k0"]
+                    pred_k0 = _pred_inv_k0_map[idx]
                     k0_mask = (
                         (sub_mob >= pred_k0 - k0_half_win)
                         & (sub_mob <= pred_k0 + k0_half_win)
@@ -2085,7 +2152,31 @@ def compute_mobility_colocalization_features(
                         ).astype(np.float32)
                     else:
                         img_flat = np.zeros(_n_pix_total, dtype=np.float32)
-                    _cand_m0_images[idx] = img_flat.reshape(max_y, max_x)
+                    out.append((idx, img_flat.reshape(max_y, max_x)))
+                return out
+
+            _needed_groups = [grp for _, grp in groups if any(i in _needs_img for i in grp.index)]
+            _n_groups_needed = len(_needed_groups)
+            _n_workers = min(os.cpu_count() or 1, 64)
+            logger.info(
+                f"Mobility colocalization: rebuilding per-candidate M0 images for "
+                f"{_n_groups_needed} feature groups across {_n_workers} threads "
+                f"(this is the O(N) full-array-scan step — watch the progress line below "
+                f"for how it's tracking)…"
+            )
+            _t0 = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=_n_workers) as _ex:
+                for _gi, _group_results in enumerate(_ex.map(_build_group_images, _needed_groups), start=1):
+                    _log_progress(
+                        "Mobility colocalization: M0 image rebuild",
+                        _gi, _n_groups_needed, _t0, every=max(1, _n_groups_needed // 20),
+                    )
+                    for idx, img in _group_results:
+                        _cand_m0_images[idx] = img
+            logger.info(
+                f"Mobility colocalization: M0 image rebuild done in "
+                f"{time.perf_counter() - _t0:.0f}s ({len(_cand_m0_images)} images)"
+            )
 
     else:
         # ------------------------------------------------------------------ #
@@ -2107,9 +2198,20 @@ def compute_mobility_colocalization_features(
         ppm_factor = extraction_ppm * 1e-6
         result_rows: dict = {}
 
-        logger.info(f"Mobility colocalization: processing {len(groups)} feature groups…")
+        _n_groups_fallback = len(groups)
+        logger.info(
+            f"Mobility colocalization: processing {_n_groups_fallback} feature groups "
+            f"via the pure-Python fallback (no Rust extension found — this re-reads "
+            f"the TDF per pixel per feature and is far slower; install/build "
+            f"ms1rescore_rs for the Rust path)…"
+        )
+        _t0 = time.perf_counter()
 
-        for feat_key, grp in groups:
+        for _fi, (feat_key, grp) in enumerate(groups, start=1):
+            _log_progress(
+                "Mobility colocalization: fallback loop",
+                _fi, _n_groups_fallback, _t0, every=max(1, _n_groups_fallback // 20),
+            )
             feat_mz = float(grp["feature_mz"].iloc[0])
             cand_indices = grp.index.tolist()
 
@@ -2177,6 +2279,7 @@ def compute_mobility_colocalization_features(
                     "spatial_morans_i_mob":     float(morans_val[0]),
                 }
 
+        logger.info(f"Mobility colocalization: fallback loop done in {time.perf_counter() - _t0:.0f}s")
         result_df = pd.DataFrame.from_dict(result_rows, orient="index")
         for col in NEW_COLS:
             df[col] = result_df[col]
@@ -2199,7 +2302,15 @@ def compute_mobility_colocalization_features(
             df[col] = np.nan
 
     if protein_coloc and "protein" in df.columns and _cand_m0_images:
-        for _prot, _grp in df.groupby("protein"):
+        _prot_groups = list(df.groupby("protein"))
+        _n_prots = len(_prot_groups)
+        _t0 = time.perf_counter()
+        logger.info(f"Mobility colocalization: protein-pairwise coloc for {_n_prots} proteins…")
+        for _pi, (_prot, _grp) in enumerate(_prot_groups, start=1):
+            _log_progress(
+                "Mobility colocalization: protein-pairwise coloc",
+                _pi, _n_prots, _t0, every=max(1, _n_prots // 20),
+            )
             valid_idx = [i for i in _grp.index if i in _cand_m0_images]
             n = len(valid_idx)
             if n == 0:
@@ -2232,11 +2343,13 @@ def compute_mobility_colocalization_features(
         df["protein_colocalization_mob_n_partners"] = (
             df["protein_colocalization_mob_n_partners"].fillna(0.0)
         )
+        logger.info(f"Mobility colocalization: protein-pairwise coloc done in {time.perf_counter() - _t0:.0f}s")
 
     df = df.drop(columns=["_pred_inv_k0"])
     logger.info(
         f"Mobility colocalization: computed 10 per-candidate + 3 protein-level "
-        f"features for {len(df)} candidates across {len(groups)} features."
+        f"features for {len(df)} candidates across {len(groups)} features "
+        f"in {time.perf_counter() - _t_func_start:.0f}s total."
     )
     return df
 
