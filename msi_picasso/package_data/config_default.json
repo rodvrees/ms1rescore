@@ -64,6 +64,7 @@
     "coloc_tic_quantile": 0.0,
     "region_coloc": false,
     "region_coloc_k": 20,
+    "within_region_coloc": false,
     "coloc_tic_normalize": false,
     "coloc_common_mode": false,
     "drop_zero_signal": false,

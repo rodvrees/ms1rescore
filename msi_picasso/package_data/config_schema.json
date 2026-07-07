@@ -129,6 +129,7 @@
         "coloc_tic_quantile":     {"type": ["number", "null"], "minimum": 0, "exclusiveMaximum": 1},
         "region_coloc":           {"type": ["boolean", "null"]},
         "region_coloc_k":         {"type": ["integer", "null"], "minimum": 2},
+        "within_region_coloc":    {"type": ["boolean", "null"]},
         "coloc_tic_normalize":    {"type": ["boolean", "null"]},
         "coloc_common_mode":      {"type": ["boolean", "null"]},
         "drop_zero_signal":       {"type": ["boolean", "null"]},

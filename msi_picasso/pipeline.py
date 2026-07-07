@@ -24,6 +24,7 @@ from msi_picasso.feature_generator import (
     MAIN_FEATURES,
     MALDI_INTRINSIC_FEATURES,
     REGION_COLOCALIZATION_FEATURES,
+    WITHIN_REGION_COLOCALIZATION_FEATURES,
     PROTEIN_LEVEL_FEATURES,
     SPATIAL_PRIOR_FEATURES,
     SPATIAL_RANKER_FEATURES,
@@ -195,6 +196,8 @@ def _recompute_ppm_from_centroids(
 _PROTEIN_COLOC_WORST_PREFIXES = (
     "protein_colocalization",
     "protein_region_colocalization",
+    "protein_within_region_colocalization",
+    "protein_dominant_region_colocalization",
 )
 
 
@@ -459,6 +462,11 @@ def _find_best_feature_labels(
     tried. The composite score that yields the most targets is used if it beats
     the single-feature result.
 
+    When the pairwise result is *still* below ``min_seed_positives``, a shallow
+    decision tree (depth 3, target vs. decoy) is fit on all eligible features at
+    once, so weakly-correlated evidence can combine beyond what raw sums/pairs
+    reach. Its leaf-probability score is used if it beats the pairwise result.
+
     Columns whose names appear in _BEST_FEAT_SKIP are excluded — they measure
     amino acid composition rather than spectral quality and can yield spurious
     pseudo-positives due to composition differences between shuffled decoys and
@@ -511,12 +519,18 @@ def _find_best_feature_labels(
                 best_asc = ascending
                 best_q = q.copy()
 
+    result: tuple[np.ndarray, str, int] | None = None
+    if best_j >= 0:
+        assert best_q is not None
+        result = (_encode_labels(is_decoy, best_q <= init_fdr), feature_names[best_j], best_n)
+
+    eligible = [
+        j for j, fname in enumerate(feature_names)
+        if fname not in _BEST_FEAT_SKIP and X_imp[:, j].std() > 0
+    ]
+
     # --- Pairwise sweep when single-feature result is weak ---
-    if best_n < min_seed_positives:
-        eligible = [
-            j for j, fname in enumerate(feature_names)
-            if fname not in _BEST_FEAT_SKIP and X_imp[:, j].std() > 0
-        ]
+    if best_n < min_seed_positives and eligible:
         # Scale to zero mean, unit variance so both features contribute equally.
         col_means = X_imp[:, eligible].mean(axis=0)
         col_stds = X_imp[:, eligible].std(axis=0)
@@ -526,9 +540,6 @@ def _find_best_feature_labels(
             X_sc[:, k] = (X_imp[:, j] - col_means[k]) / col_stds[k]
 
         pair_best_n = best_n
-        pair_best_labels: np.ndarray | None = None
-        pair_best_name: str | None = None
-
         for ii in range(len(eligible)):
             for jj in range(ii + 1, len(eligible)):
                 gi, gj = eligible[ii], eligible[jj]
@@ -540,25 +551,43 @@ def _find_best_feature_labels(
                         n_pass = int(((~is_decoy) & (q <= init_fdr)).sum())
                         if n_pass > pair_best_n:
                             pair_best_n = n_pass
-                            pair_best_labels = _encode_labels(is_decoy, q <= init_fdr)
                             sign_str = "+" if sign == +1 else "-"
                             pair_best_name = (
                                 f"{feature_names[gi]} {sign_str} {feature_names[gj]}"
                             )
+                            result = (_encode_labels(is_decoy, q <= init_fdr), pair_best_name, n_pass)
 
-        if pair_best_labels is not None:
+        if pair_best_n > best_n:
             logger.info(
                 "  Selected pair (%s) with %d PSMs at q<=%g",
-                pair_best_name, pair_best_n, init_fdr,
+                result[1], pair_best_n, init_fdr,
             )
-            return pair_best_labels, pair_best_name, pair_best_n
+            best_n = pair_best_n
 
-    if best_n == 0 or best_j < 0:
+    # --- Shallow-tree sweep when the pairwise result is still weak ---
+    # A depth-3 tree on all eligible spectral-quality features at once lets
+    # weakly-correlated evidence combine beyond what raw sums/pairs reach.
+    if best_n < min_seed_positives and eligible:
+        from sklearn.tree import DecisionTreeClassifier
+
+        is_target = ~is_decoy
+        tree = DecisionTreeClassifier(max_depth=3, min_samples_leaf=20, random_state=0)
+        tree.fit(X_imp[:, eligible], is_target.astype(int))
+        scores = tree.predict_proba(X_imp[:, eligible])[:, 1] + tiebreak
+        q = _tdc_qvalues(scores, is_decoy)
+        n_pass = int((is_target & (q <= init_fdr)).sum())
+        if n_pass > best_n:
+            tree_name = f"tree(depth=3, n_features={len(eligible)})"
+            logger.info(
+                "  Selected shallow-tree seed (%s) with %d PSMs at q<=%g",
+                tree_name, n_pass, init_fdr,
+            )
+            result = (_encode_labels(is_decoy, q <= init_fdr), tree_name, n_pass)
+            best_n = n_pass
+
+    if result is None or result[2] == 0:
         return None
-
-    assert best_q is not None
-    labels = _encode_labels(is_decoy, best_q <= init_fdr)
-    return labels, feature_names[best_j], best_n
+    return result
 
 
 def _make_fold_ids(is_decoy: np.ndarray, cv_folds: int) -> np.ndarray | None:
@@ -1568,6 +1597,7 @@ def rescore(
     coloc_common_mode: bool = False,
     region_coloc: bool = False,
     region_coloc_k: int = 20,
+    within_region_coloc: bool = False,
     drop_zero_signal: bool = False,
     entrapment: bool = False,
     substitution_n_residues: int = 1,
@@ -2511,6 +2541,7 @@ def rescore(
         region_coloc=region_coloc,
         region_coloc_k=region_coloc_k,
         region_coloc_debug=region_coloc_debug,
+        within_region_coloc=within_region_coloc,
     )
     # Worst-case fill of protein-colocalization NaNs for zero-signal candidates, so a
     # feature with no MALDI signal is penalised rather than median-imputed to an average
@@ -2679,6 +2710,12 @@ def rescore(
         _pool += REGION_COLOCALIZATION_FEATURES
         logger.info(
             f"  Region colocalization features enabled ({len(REGION_COLOCALIZATION_FEATURES)} features)"
+        )
+    if within_region_coloc:
+        _pool += WITHIN_REGION_COLOCALIZATION_FEATURES
+        logger.info(
+            f"  Within-region colocalization features enabled "
+            f"({len(WITHIN_REGION_COLOCALIZATION_FEATURES)} features, experimental — O3)"
         )
     _seen: set[str] = set()
     _intrinsic_pool = [

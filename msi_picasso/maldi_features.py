@@ -535,6 +535,75 @@ _REGION_COLOC_COLS = [
     "protein_region_colocalization_median",
 ]
 
+# O3 (FLAWS_AND_OPPORTUNITIES.md): within-region and dominant-region Pearson-r
+# colocalization column families — see compute_within_region_colocalization_features.
+_WITHIN_REGION_COLOC_COLS = [
+    "protein_within_region_colocalization",
+    "protein_within_region_colocalization_max",
+    "protein_within_region_colocalization_median",
+]
+_DOMINANT_REGION_COLOC_COLS = [
+    "protein_dominant_region_colocalization",
+    "protein_dominant_region_colocalization_max",
+    "protein_dominant_region_colocalization_median",
+]
+
+
+def _aggregate_protein_pairwise_corr(
+    df: pd.DataFrame,
+    corr_matrix: np.ndarray,
+    valid_mz_arr: np.ndarray,
+    mz_to_idx: dict,
+    col_prefix: str,
+    fill_value: float = 0.0,
+) -> pd.DataFrame:
+    """Within-protein self-join + mean/max/median aggregation of a precomputed
+    pairwise correlation matrix.
+
+    Shared by ``compute_region_colocalization_features`` and the within-region /
+    dominant-region variants (``compute_within_region_colocalization_features``)
+    — only the correlation matrix and the resulting column names differ.
+    Produces ``col_prefix``, ``{col_prefix}_max``, ``{col_prefix}_median``,
+    filled with ``fill_value`` where undefined (no same-protein partner with a
+    valid image, or no pair cleared whatever floor produced ``corr_matrix``).
+    Blind to ``is_decoy``.
+    """
+    cols = [col_prefix, f"{col_prefix}_max", f"{col_prefix}_median"]
+    base = (
+        df[["feature_mz", "protein"]]
+        .drop_duplicates()
+        .assign(corr_idx=lambda d: d["feature_mz"].map(lambda m: mz_to_idx.get(float(m))))
+    )
+    base = base[base["corr_idx"].notna()].copy()
+    base["corr_idx"] = base["corr_idx"].astype(int)
+
+    pairs = base.merge(
+        base.rename(columns={"feature_mz": "partner_mz", "corr_idx": "partner_idx"}),
+        on="protein",
+    )
+    pairs = pairs[pairs["feature_mz"] != pairs["partner_mz"]]
+
+    if len(pairs) > 0:
+        pairs = pairs.copy()
+        pairs["c"] = corr_matrix[
+            pairs["corr_idx"].to_numpy(dtype=int),
+            pairs["partner_idx"].to_numpy(dtype=int),
+        ]
+        agg = (
+            pairs.groupby(["feature_mz", "protein"])["c"]
+            .agg(["mean", "max", "median"])
+            .rename(columns={"mean": cols[0], "max": cols[1], "median": cols[2]})
+            .reset_index()
+        )
+        df = df.merge(agg, on=["feature_mz", "protein"], how="left")
+    else:
+        for col in cols:
+            df[col] = fill_value
+
+    for col in cols:
+        df[col] = df[col].fillna(fill_value)
+    return df
+
 
 def _region_profile_corr_matrix(
     ion_images: np.ndarray,
@@ -670,42 +739,195 @@ def compute_region_colocalization_features(
         debug["region_profiles"] = profiles
         debug["region_profile_mzs"] = valid_mz_arr
 
-    base = (
-        df[["feature_mz", "protein"]]
-        .drop_duplicates()
-        .assign(corr_idx=lambda d: d["feature_mz"].map(lambda m: mz_to_idx.get(float(m))))
+    return _aggregate_protein_pairwise_corr(
+        df, corr_matrix, valid_mz_arr, mz_to_idx, "protein_region_colocalization",
     )
-    base = base[base["corr_idx"].notna()].copy()
-    base["corr_idx"] = base["corr_idx"].astype(int)
 
-    pairs = base.merge(
-        base.rename(columns={"feature_mz": "partner_mz", "corr_idx": "partner_idx"}),
-        on="protein",
+
+def _within_region_corr_matrices(
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+    n_regions: int = 20,
+    random_state: int = 42,
+    min_region_pixels: int = 30,
+    tic_normalize: bool = False,
+    common_mode_removal: bool = False,
+    _global_corr_cache: tuple | None = None,
+    debug: dict | None = None,
+) -> dict:
+    """
+    Segment on-tissue pixels into ``n_regions`` regions using the identical
+    recipe as ``_region_profile_corr_matrix`` (per-pixel TIC-normalised log1p
+    composition, MiniBatchKMeans), then compute the RAW pixel Pearson r (via
+    ``_pearson_r_matrix``, restricted to each region's own pixels) instead of
+    the per-region MEAN fingerprint that ``_region_profile_corr_matrix`` uses.
+
+    This asks whether same-protein peptides co-vary pixel-to-pixel *inside* a
+    shared tissue region — a question the fingerprint metric cannot answer,
+    since it only compares per-region averages and is blind to within-region
+    pixel covariance (O3, FLAWS_AND_OPPORTUNITIES.md).
+
+    Returns a dict with two ``(corr_matrix, valid_mz_arr, mz_to_idx)`` triples
+    — the same contract as ``_pearson_r_matrix`` — so both plug directly into
+    ``_aggregate_protein_pairwise_corr``:
+
+    - ``"weighted"``: pixel-count-weighted mean of each region's own Pearson r,
+      over regions with >= ``min_region_pixels`` on-tissue pixels, expressed in
+      the canonical (full on-tissue) valid-image index space. Any image that
+      is non-constant within some region subset is necessarily non-constant
+      over the full on-tissue mask too, so every region's valid image set is
+      guaranteed to be a subset of the canonical one.
+    - ``"dominant"``: the single largest region's own Pearson r, verbatim (its
+      own, possibly smaller, index space) — not subject to ``min_region_pixels``.
+
+    ``tic_normalize``/``common_mode_removal`` are forwarded to every
+    ``_pearson_r_matrix`` call (region-level and canonical) so this uses the
+    same preprocessing recipe as the best-performing global colocalization
+    metric (O2, FLAWS_AND_OPPORTUNITIES.md) rather than raw pixels.
+
+    When ``debug`` is a dict it is populated with ``region_labels`` (per-pixel
+    region id, ``(H*W,)`` int32, -1 off-mask), ``region_pixel_counts``, and
+    ``dominant_region_id``.
+    """
+    from sklearn.cluster import MiniBatchKMeans
+
+    mz_arr = np.asarray(ion_image_mzs, dtype=np.float64)
+    n_feat = len(mz_arr)
+    H, W = ion_images.shape[1], ion_images.shape[2]
+    mask = (
+        np.asarray(pixel_mask, dtype=bool) if pixel_mask is not None
+        else np.ones(H * W, dtype=bool)
     )
-    pairs = pairs[pairs["feature_mz"] != pairs["partner_mz"]]
+    flat = ion_images.reshape(n_feat, H * W)
+    on = flat[:, mask].astype(np.float32, copy=True)  # (n_feat, n_on)
+    n_on = on.shape[1]
 
-    if len(pairs) > 0:
-        pairs = pairs.copy()
-        pairs["c"] = corr_matrix[
-            pairs["corr_idx"].to_numpy(dtype=int),
-            pairs["partner_idx"].to_numpy(dtype=int),
-        ]
-        agg = (
-            pairs.groupby(["feature_mz", "protein"])["c"]
-            .agg(
-                protein_region_colocalization="mean",
-                protein_region_colocalization_max="max",
-                protein_region_colocalization_median="median",
-            )
-            .reset_index()
-        )
-        df = df.merge(agg, on=["feature_mz", "protein"], how="left")
+    empty = (np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float64), {})
+    if n_on < 2:
+        logger.warning("Within-region colocalization: %d on-tissue pixels — skipping (need >= 2).", n_on)
+        if debug is not None:
+            debug["region_labels"] = np.full(H * W, -1, dtype=np.int32)
+            debug["region_pixel_counts"] = np.empty(0, dtype=np.int64)
+            debug["dominant_region_id"] = -1
+        return {"weighted": empty, "dominant": empty}
+
+    # Segmentation feature matrix — identical recipe to _region_profile_corr_matrix.
+    # Duplicated rather than shared: this is an experimental, likely-to-be-reverted
+    # feature (see FLAWS_AND_OPPORTUNITIES.md O3), so the tested/shipping function is
+    # left untouched.
+    col_tic = on.sum(axis=0, keepdims=True)
+    comp = np.divide(on, col_tic, out=np.zeros_like(on), where=col_tic > 0)
+    seg_feat = np.log1p(comp).T  # (n_on, n_feat) — pixels are samples
+
+    k = int(min(n_regions, max(2, n_on - 1)))
+    km = MiniBatchKMeans(n_clusters=k, random_state=random_state, n_init=3)
+    labels = km.fit_predict(seg_feat)  # (n_on,)
+
+    region_labels_full = np.full(H * W, -1, dtype=np.int32)
+    region_labels_full[mask] = labels
+    region_pixel_counts = np.bincount(labels, minlength=k)
+    dominant_region_id = int(np.argmax(region_pixel_counts))
+
+    if debug is not None:
+        debug["region_labels"] = region_labels_full
+        debug["region_pixel_counts"] = region_pixel_counts
+        debug["dominant_region_id"] = dominant_region_id
+
+    if _global_corr_cache is not None:
+        _canon_corr, canon_mz, canon_idx = _global_corr_cache
     else:
-        for col in _REGION_COLOC_COLS:
-            df[col] = 0.0
+        _canon_corr, canon_mz, canon_idx = _pearson_r_matrix(
+            ion_images, ion_image_mzs, pixel_mask=mask,
+            tic_normalize=tic_normalize, common_mode_removal=common_mode_removal,
+        )
+    n_canon = len(canon_mz)
+    sum_wr = np.zeros((n_canon, n_canon), dtype=np.float64)
+    sum_w = np.zeros((n_canon, n_canon), dtype=np.float64)
+    dominant_triple = empty
 
-    for col in _REGION_COLOC_COLS:
-        df[col] = df[col].fillna(0.0)
+    for r in range(k):
+        n_r = int(region_pixel_counts[r])
+        if n_r < 2:
+            continue
+        region_mask_r = region_labels_full == r
+        corr_r, mz_r, idx_r = _pearson_r_matrix(
+            ion_images, ion_image_mzs, pixel_mask=region_mask_r,
+            tic_normalize=tic_normalize, common_mode_removal=common_mode_removal,
+        )
+        if r == dominant_region_id:
+            dominant_triple = (corr_r, mz_r, idx_r)
+        if n_r >= min_region_pixels and n_canon > 0 and len(mz_r) > 0:
+            pos = np.fromiter((canon_idx[float(mz)] for mz in mz_r), dtype=int, count=len(mz_r))
+            ix = np.ix_(pos, pos)
+            sum_wr[ix] += n_r * corr_r
+            sum_w[ix] += n_r
+
+    weighted_matrix = np.divide(
+        sum_wr, sum_w, out=np.full((n_canon, n_canon), np.nan), where=sum_w > 0
+    ).astype(np.float32)
+
+    logger.info(
+        f"Within-region colocalization: K={k}, dominant region has "
+        f"{region_pixel_counts[dominant_region_id]}/{n_on} on-tissue pixels, "
+        f"{int((region_pixel_counts >= min_region_pixels).sum())}/{k} regions "
+        f"clear min_region_pixels={min_region_pixels}"
+    )
+    return {
+        "weighted": (weighted_matrix, canon_mz, canon_idx),
+        "dominant": dominant_triple,
+    }
+
+
+def compute_within_region_colocalization_features(
+    df: pd.DataFrame,
+    ion_images: np.ndarray,
+    ion_image_mzs: np.ndarray,
+    pixel_mask: np.ndarray | None = None,
+    n_regions: int = 20,
+    random_state: int = 42,
+    min_region_pixels: int = 30,
+    tic_normalize: bool = False,
+    common_mode_removal: bool = False,
+    _global_corr_cache: tuple | None = None,
+    debug: dict | None = None,
+) -> pd.DataFrame:
+    """O3 (FLAWS_AND_OPPORTUNITIES.md): within-region and dominant-region
+    Pearson-r colocalization (opt-in, ``--within-region-coloc``; experimental /
+    unvalidated — see O3 for the validation protocol before trusting this in
+    the ranker).
+
+    Segments on-tissue pixels the same way as
+    ``compute_region_colocalization_features`` but correlates RAW pixel
+    intensities restricted to each region (not the per-region mean
+    fingerprint), asking whether same-protein peptides co-vary pixel-to-pixel
+    *inside* a shared tissue region rather than merely sharing a region
+    average — a question ``compute_region_colocalization_features`` is blind
+    to. Adds:
+
+    - ``protein_within_region_colocalization`` (+ ``_max``, ``_median``): the
+      pixel-count-weighted mean of each region's own within-protein Pearson r
+      across regions with >= ``min_region_pixels`` on-tissue pixels.
+    - ``protein_dominant_region_colocalization`` (+ ``_max``, ``_median``):
+      within-protein Pearson r restricted to just the single largest region.
+
+    Both blind to ``is_decoy``; decoys occupy a separate protein namespace
+    exactly as for ``compute_region_colocalization_features``.
+    """
+    mats = _within_region_corr_matrices(
+        ion_images, ion_image_mzs, pixel_mask=pixel_mask, n_regions=n_regions,
+        random_state=random_state, min_region_pixels=min_region_pixels,
+        tic_normalize=tic_normalize, common_mode_removal=common_mode_removal,
+        _global_corr_cache=_global_corr_cache, debug=debug,
+    )
+    corr_w, mz_w, idx_w = mats["weighted"]
+    corr_d, mz_d, idx_d = mats["dominant"]
+    df = _aggregate_protein_pairwise_corr(
+        df, corr_w, mz_w, idx_w, "protein_within_region_colocalization",
+    )
+    df = _aggregate_protein_pairwise_corr(
+        df, corr_d, mz_d, idx_d, "protein_dominant_region_colocalization",
+    )
     return df
 
 

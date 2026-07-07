@@ -17,6 +17,7 @@ from msi_picasso.maldi_features import (
     _pearson_r_matrix,
     compute_tissue_mask,
     compute_region_colocalization_features,
+    compute_within_region_colocalization_features,
     compute_adduct_colocalization,
     compute_calibrated_ppm_features,
     compute_candidate_ambiguity_features,
@@ -131,6 +132,18 @@ PROTEIN_LEVEL_FEATURES = [
 # Appended to the ranker pool at runtime in pipeline.py when the flag is set.
 REGION_COLOCALIZATION_FEATURES = [
     "protein_region_colocalization",
+]
+
+# Within-region and dominant-region Pearson-r colocalization (opt-in via
+# --within-region-coloc, requires ion_images). O3 (FLAWS_AND_OPPORTUNITIES.md):
+# unlike REGION_COLOCALIZATION_FEATURES (per-region MEAN fingerprint), these
+# correlate RAW pixel intensities restricted to a region, asking whether
+# same-protein peptides co-vary pixel-to-pixel inside a shared region rather
+# than merely sharing a region average. Experimental / unvalidated — see O3's
+# validation protocol before removing these from features-exclude in any config.
+WITHIN_REGION_COLOCALIZATION_FEATURES = [
+    "protein_within_region_colocalization",
+    "protein_dominant_region_colocalization",
 ]
 
 # LC-MS/MS prior features: NOT passed to the ranker/SVM — doing so would cause
@@ -375,6 +388,8 @@ def compute_all_features(
     region_coloc: bool = False,
     region_coloc_k: int = 20,
     region_coloc_debug: dict | None = None,
+    within_region_coloc: bool = False,
+    within_region_coloc_debug: dict | None = None,
 ) -> pd.DataFrame:
     """
     Compute all features on the candidate DataFrame.
@@ -528,6 +543,17 @@ def compute_all_features(
             df = compute_region_colocalization_features(
                 df, ion_images, ion_image_mzs, pixel_mask=pixel_mask,
                 n_regions=region_coloc_k, debug=region_coloc_debug,
+            )
+        if within_region_coloc:
+            # Reuse protein_corr_cache's preprocessing recipe (coloc_tic_normalize /
+            # coloc_common_mode) so the per-region correlation uses the same
+            # best-performing recipe as compute_colocalization_features (O2,
+            # FLAWS_AND_OPPORTUNITIES.md) rather than raw pixels.
+            df = compute_within_region_colocalization_features(
+                df, ion_images, ion_image_mzs, pixel_mask=pixel_mask,
+                n_regions=region_coloc_k, tic_normalize=coloc_tic_normalize,
+                common_mode_removal=coloc_common_mode,
+                _global_corr_cache=protein_corr_cache, debug=within_region_coloc_debug,
             )
 
     return df

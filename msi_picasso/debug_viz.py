@@ -3887,22 +3887,6 @@ def save_debug_figures(
         logger.warning("m/z × mobility × intensity scatter failed: %s", exc)
 
     try:
-        plot_mobility_match(features_df, result_df, out_dir=debug_dir)
-        if "mob_purity" in features_df.columns:
-            logger.info("mobility-match diagnostic saved to %s/mobility_match.png", debug_dir)
-    except Exception as exc:
-        logger.warning("mobility-match diagnostic failed: %s", exc)
-
-    try:
-        plot_mobility_intensity_split(features_df, out_dir=debug_dir)
-        if "mob_in_tol_intensity" in features_df.columns:
-            logger.info(
-                "mobility intensity split saved to %s/mobility_intensity_split.png", debug_dir
-            )
-    except Exception as exc:
-        logger.warning("mobility intensity split failed: %s", exc)
-
-    try:
         plot_ids_vs_fdr(result_df, out_dir=debug_dir, pi0=storey_pi0_val)
         logger.info("IDs vs FDR curve saved to %s/ids_vs_fdr.png", debug_dir)
     except Exception as exc:

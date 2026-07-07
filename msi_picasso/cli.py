@@ -1222,6 +1222,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of tissue regions (k-means clusters) for --region-coloc. Default 20.",
     )
     rescore_grp.add_argument(
+        "--within-region-coloc",
+        action="store_true",
+        default=None,
+        help=(
+            "Compute within-region Pearson r colocalization "
+            "(protein_within_region_colocalization*, protein_dominant_region_colocalization*; "
+            "O3). Segments on-tissue pixels the same way as --region-coloc (reuses "
+            "--region-coloc-k for resolution), then correlates RAW pixel intensities "
+            "restricted to each region (not the per-region mean fingerprint), asking "
+            "whether same-protein peptides co-vary pixel-to-pixel inside a shared region "
+            "rather than merely sharing a region average. Also emits a dominant-region-"
+            "only variant (colocalization restricted to the single largest region). "
+            "Experimental / unvalidated — see FLAWS_AND_OPPORTUNITIES.md O3. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
         "--coloc-tic-normalize",
         action="store_true",
         default=None,
@@ -1412,7 +1428,7 @@ def main() -> None:
         "only_main_features", "use_protein_level_feats", "match_ccs",
         "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc", "mob_protein_coloc",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
-        "region_coloc", "coloc_tic_normalize", "coloc_common_mode",
+        "region_coloc", "within_region_coloc", "coloc_tic_normalize", "coloc_common_mode",
         "substitution_no_collision_filter",
     })
 
@@ -1438,7 +1454,7 @@ def main() -> None:
         "matching_ppm", "fragment_tol_da", "winner_percentile",
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
         "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
-        "coloc_tic_quantile", "region_coloc", "region_coloc_k",
+        "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
         "coloc_tic_normalize", "coloc_common_mode",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
@@ -1908,6 +1924,7 @@ def main() -> None:
         coloc_common_mode=bool(_ms1cfg.get("coloc_common_mode", False)),
         region_coloc=bool(_ms1cfg.get("region_coloc", False)),
         region_coloc_k=_ms1cfg["region_coloc_k"],
+        within_region_coloc=bool(_ms1cfg.get("within_region_coloc", False)),
         drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
         entrapment=bool(_ms1cfg.get("entrapment", False)),
         substitution_n_residues=_ms1cfg["substitution_n_residues"],
