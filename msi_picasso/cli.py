@@ -1175,6 +1175,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--mob-quality-mz-window-ppm",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Raw-query only: outer m/z half-window (ppm) for the intrinsic 2D peak-quality "
+            "features (mob_2d_concentration, mob_k0_spread, mob_mz_spread_ppm, mob_peak_snr). "
+            "Effectively bounded by --extraction-ppm (peaks are collected there). Default 25.0."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--mob-quality-k0-tol",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Raw-query only: 1/K0 half-width (V·s/cm²) of the peak band / concentration box "
+            "for the intrinsic 2D peak-quality features. Default 0.02."
+        ),
+    )
+    rescore_grp.add_argument(
         "--coloc-tic-quantile",
         type=float,
         default=None,
@@ -1454,6 +1475,7 @@ def main() -> None:
         "matching_ppm", "fragment_tol_da", "winner_percentile",
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
         "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
+        "mob_quality_mz_window_ppm", "mob_quality_k0_tol",
         "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
         "coloc_tic_normalize", "coloc_common_mode",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
@@ -1918,6 +1940,8 @@ def main() -> None:
         mob_coloc=bool(_ms1cfg.get("mob_coloc", False)),
         mob_protein_coloc=bool(_ms1cfg.get("mob_protein_coloc", False)),
         mob_window_multiplier=_ms1cfg["mob_window_multiplier"],
+        mob_quality_mz_window_ppm=_ms1cfg["mob_quality_mz_window_ppm"],
+        mob_quality_k0_tol=_ms1cfg["mob_quality_k0_tol"],
         coloc_tic_quantile=_ms1cfg["coloc_tic_quantile"],
         coloc_measured_pixel_mask=_measured_pixel_mask,
         coloc_tic_normalize=bool(_ms1cfg.get("coloc_tic_normalize", False)),

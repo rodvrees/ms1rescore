@@ -23,6 +23,7 @@ from msi_picasso.feature_generator import (
     LCMS_PRIOR_FEATURES,
     MAIN_FEATURES,
     MALDI_INTRINSIC_FEATURES,
+    MOB_QUALITY_FEATURES,
     REGION_COLOCALIZATION_FEATURES,
     WITHIN_REGION_COLOCALIZATION_FEATURES,
     PROTEIN_LEVEL_FEATURES,
@@ -50,6 +51,15 @@ _SPATIAL_INVERT_FEATURES = frozenset(["spatial_gearys_c"])
 # Decoy methods whose decoys land on real MALDI features, giving spatial ranker
 # features a symmetric null.  shuffle/balanced_shuffle/paired_shuffle do not.
 _SPATIAL_RANKER_OK_DECOYS = frozenset(["entrapment", "mz_shift", "mz_shuffle", "substitution"])
+
+# Decoy methods for which the intrinsic 2D peak-quality features (MOB_QUALITY_FEATURES)
+# enter the ranker by default. For substitution the decoy sits at a distinct (often
+# empty/noisy) m/z, so feature-level peak quality discriminates. For mz_shuffle the
+# co-located target+decoy share the feature, so these columns are exactly symmetric
+# (AUC ~= 0.5) — a harmless default and a built-in leak-safety check. No m/z-baseline
+# leak (they use only the observed peak, no prediction), so unlike the im2deep_* CCS
+# scalars they are NOT in _MZ_SHUFFLE_CCS_LEAK_FEATURES.
+_MOB_QUALITY_DEFAULT_DECOYS = frozenset(["substitution", "mz_shuffle"])
 
 # Features that use the candidate's PREDICTED CCS/mobility to gate or compare against
 # the observed feature. For mz_shuffle (peptide relocated far in mass; CCS/1-K0 ∝ m/z)
@@ -1524,6 +1534,8 @@ def rescore(
     maldi_d_path: str | None = None,
     raw_query_cache: dict | None = None,
     extraction_ppm: float = 25.0,
+    mob_quality_mz_window_ppm: float = 25.0,
+    mob_quality_k0_tol: float = 0.02,
     msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
     init_fdr: float = 0.2,
@@ -2263,6 +2275,7 @@ def rescore(
             maldi_envelopes = raw_query_cache["maldi_envelopes"]
             _ccs_arr = raw_query_cache["ccs_arr"]
             _centroid_arr = raw_query_cache["centroid_arr"]
+            _peak_quality = raw_query_cache.get("peak_quality")
             ion_image_mzs = maldi_mzs
             logger.info(
                 "Raw-query mode: reusing cached extraction (%d grid ion images) "
@@ -2279,8 +2292,10 @@ def rescore(
             ion_image_mzs = maldi_mzs
             # Observed peak centroids + CCS from the raw .d (alphatims). imzy exposes
             # neither, so the .d is opened a second time here.
-            _ccs_arr, _centroid_arr = extract_observed_feature_stats_raw(
-                maldi_d_path, maldi_mzs, extraction_ppm=extraction_ppm
+            _ccs_arr, _centroid_arr, _peak_quality = extract_observed_feature_stats_raw(
+                maldi_d_path, maldi_mzs, extraction_ppm=extraction_ppm,
+                mob_quality_window_ppm=mob_quality_mz_window_ppm,
+                mob_quality_k0_tol=mob_quality_k0_tol,
             )
             logger.info(
                 "Raw-query mode: extracted %d ion images; %d features with M0 envelope signal.",
@@ -2291,6 +2306,7 @@ def rescore(
                     maldi_mzs=maldi_mzs, ion_images=ion_images,
                     extra_ion_images=extra_ion_images, spatial_features=spatial_features,
                     maldi_envelopes=maldi_envelopes, ccs_arr=_ccs_arr, centroid_arr=_centroid_arr,
+                    peak_quality=_peak_quality,
                 )
 
         # Attach per-feature intensities (mapped by m/z) onto the candidate rows.
@@ -2300,6 +2316,18 @@ def rescore(
         candidates["feature_intensity_p90"] = candidates["feature_mz"].map(_p90)
         candidates["feature_intensity_sum"] = candidates["feature_mz"].map(_sum)
         candidates["feature_intensity"] = candidates["feature_mz"].map(_mean)
+
+        # Attach intrinsic 2D peak-quality columns (feature-level, mapped by m/z) when
+        # ion mobility was extracted.  Aligned with maldi_mzs; bridged via feature_mz
+        # exactly like the intensity maps above.  Absent for TSF/no-mobility data.
+        if _peak_quality is not None:
+            for _col, _vals in _peak_quality.items():
+                _qmap = {
+                    float(m): float(v)
+                    for m, v in zip(np.asarray(maldi_mzs), np.asarray(_vals))
+                    if np.isfinite(v)
+                }
+                candidates[_col] = candidates["feature_mz"].map(_qmap)
 
         # Recompute ppm_error symmetrically from the observed peak centroid in each
         # candidate's own window. In raw-query, candidates are matched against the
@@ -2722,6 +2750,18 @@ def rescore(
         logger.info(
             f"  Within-region colocalization features enabled "
             f"({len(WITHIN_REGION_COLOCALIZATION_FEATURES)} features, experimental — O3)"
+        )
+    # Intrinsic 2D peak-quality features: default-on for the decoy methods where they
+    # are valid/safe (see _MOB_QUALITY_DEFAULT_DECOYS).  Only present when extracted
+    # (raw-query + ion mobility); the intrinsic_present intersection below drops them
+    # otherwise.  Drop explicitly via features_exclude if unwanted.
+    if decoy_method in _MOB_QUALITY_DEFAULT_DECOYS and any(
+        f in features_df.columns for f in MOB_QUALITY_FEATURES
+    ):
+        _pool += MOB_QUALITY_FEATURES
+        logger.info(
+            f"  2D peak-quality features enabled ({len(MOB_QUALITY_FEATURES)} features) "
+            f"with decoy_method='{decoy_method}'"
         )
     _seen: set[str] = set()
     _intrinsic_pool = [

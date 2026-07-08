@@ -221,6 +221,19 @@ SPATIAL_RANKER_FEATURES = [
     "protein_colocalization_n_partners",
 ]
 
+# Intrinsic 2D peak-quality features (m/z × intensity × 1/K0), computed per MALDI
+# feature from the observed peaks in raw-query mode (maldi_query._peak_quality_in_windows).
+# Feature-level and observation-only (no prediction → no m/z-baseline leak).  Kept OUT of
+# MALDI_INTRINSIC_FEATURES so they are not a global default for every decoy method; the
+# pipeline appends them to the ranker pool only for decoy methods in
+# _MOB_QUALITY_DEFAULT_DECOYS (substitution, mz_shuffle).
+MOB_QUALITY_FEATURES = [
+    "mob_2d_concentration",
+    "mob_k0_spread",
+    "mob_mz_spread_ppm",
+    "mob_peak_snr",
+]
+
 # Alias kept separate so LDA-specific feature selection can diverge later.
 LDA_FEATURES = MALDI_INTRINSIC_FEATURES
 
@@ -274,6 +287,12 @@ FEATURE_NAN_FILL: dict[str, float | str] = {
     # No LC-MS/MS envelope match → worst ratio deviation (largest observed error)
     "log_isotope_m1_ratio_diff": "col_max",
     "log_isotope_m2_ratio_diff": "col_max",
+    # 2D peak quality: a candidate whose m/z window has no observed peak (e.g. a
+    # substitution/mz_shift decoy in empty m/z) gets the worst-case, not the median.
+    "mob_2d_concentration": 0.0,      # no peak → zero concentration
+    "mob_peak_snr": "col_min",        # no peak → lowest observed signal contrast
+    "mob_k0_spread": "col_max",       # no peak → widest (worst) mobility spread
+    "mob_mz_spread_ppm": "col_max",   # no peak → widest (worst) m/z spread
 }
 
 # ---------------------------------------------------------------------------

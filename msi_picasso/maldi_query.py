@@ -87,13 +87,122 @@ def _weighted_mean_inv_k0(peak_mzs, peak_ints, peak_mob, query_mzs, ppm):
     return _weighted_mean_in_windows(peak_mzs, peak_ints, peak_mob, query_mzs, ppm)
 
 
+_MOB_QUALITY_COLS = (
+    "mob_2d_concentration",
+    "mob_k0_spread",
+    "mob_mz_spread_ppm",
+    "mob_peak_snr",
+)
+
+
+def _peak_quality_in_windows(
+    peak_mzs: np.ndarray,
+    peak_ints: np.ndarray,
+    peak_mob: np.ndarray,
+    query_mzs: np.ndarray,
+    window_ppm: float,
+    k0_tol: float,
+    core_ppm: float = 5.0,
+) -> dict[str, np.ndarray]:
+    """Intrinsic peak-quality descriptors in the joint (m/z, intensity, 1/K0) space.
+
+    For each query m/z ``q`` the outer window is ``[q*(1-window_ppm), q*(1+window_ppm)]``.
+    From the intensity-weighted peaks inside it, four per-window descriptors of "how
+    clean / compact / intense is the observed ion here" are computed (all
+    intensity-weighted, so the intensity axis enters as the weight):
+
+    - ``mob_2d_concentration`` — Σintensity inside a tight box (±``core_ppm`` in m/z,
+      ±``k0_tol`` in 1/K0) around the intensity-weighted (m/z, 1/K0) centroid, divided
+      by the total in-window intensity.  ∈ [0, 1]; high = one compact 2D blob.
+    - ``mob_k0_spread`` — intensity-weighted std of 1/K0 (V·s/cm²); low = a single tight
+      mobility species rather than a smear of co-eluting ions.
+    - ``mob_mz_spread_ppm`` — intensity-weighted std of m/z, in ppm; low = sharp peak.
+    - ``mob_peak_snr`` — ``log10(band / off-band)`` where ``band`` is the intensity within
+      ±``k0_tol`` of the 1/K0 centroid and ``off-band`` is the rest of the window; high =
+      the mobility peak dominates the chemical background at this m/z.
+
+    Returns a dict of arrays aligned 1:1 with ``query_mzs``; windows with no signal are
+    ``NaN`` (left for the worst-case ``FEATURE_NAN_FILL`` at scoring).  Note the peak pool
+    is collected at ``extraction_ppm`` upstream, so an effective window wider than that
+    sees only the extracted peaks.  Pure / vectorised — unit-testable without alphatims.
+    """
+    query_mzs = np.asarray(query_mzs, dtype=np.float64)
+    n = len(query_mzs)
+    out = {c: np.full(n, np.nan) for c in _MOB_QUALITY_COLS}
+    if len(peak_mzs) == 0 or n == 0:
+        return out
+
+    peak_mzs = np.asarray(peak_mzs, dtype=np.float64)
+    peak_ints = np.asarray(peak_ints, dtype=np.float64)
+    peak_mob = np.asarray(peak_mob, dtype=np.float64)
+    ppm_f = window_ppm * 1e-6
+
+    # Same peak→window expansion as _weighted_mean_in_windows.
+    lo = np.searchsorted(query_mzs, peak_mzs / (1.0 + ppm_f), side="left")
+    hi = np.searchsorted(query_mzs, peak_mzs / (1.0 - ppm_f), side="right")
+    counts = np.clip(hi - lo, 0, None).astype(np.int64)
+    total = int(counts.sum())
+    if total == 0:
+        return out
+
+    peak_rep = np.repeat(np.arange(len(peak_mzs)), counts)
+    starts = np.cumsum(counts) - counts
+    within = np.arange(total) - np.repeat(starts, counts)
+    qidx = np.repeat(lo, counts) + within
+
+    w = peak_ints[peak_rep]
+    mz = peak_mzs[peak_rep]
+    k0 = peak_mob[peak_rep]
+
+    isum = np.zeros(n)
+    s_mz = np.zeros(n)
+    s_mz2 = np.zeros(n)
+    s_k0 = np.zeros(n)
+    s_k02 = np.zeros(n)
+    np.add.at(isum, qidx, w)
+    np.add.at(s_mz, qidx, w * mz)
+    np.add.at(s_mz2, qidx, w * mz * mz)
+    np.add.at(s_k0, qidx, w * k0)
+    np.add.at(s_k02, qidx, w * k0 * k0)
+
+    nz = isum > 0
+    mz_mean = np.full(n, np.nan)
+    k0_mean = np.full(n, np.nan)
+    mz_mean[nz] = s_mz[nz] / isum[nz]
+    k0_mean[nz] = s_k0[nz] / isum[nz]
+    # variance = E[x²] − E[x]²  (clip tiny negatives from float rounding)
+    mz_var = np.clip(s_mz2[nz] / isum[nz] - mz_mean[nz] ** 2, 0.0, None)
+    k0_var = np.clip(s_k02[nz] / isum[nz] - k0_mean[nz] ** 2, 0.0, None)
+    out["mob_mz_spread_ppm"][nz] = np.sqrt(mz_var) / mz_mean[nz] * 1e6
+    out["mob_k0_spread"][nz] = np.sqrt(k0_var)
+
+    # Per-pair membership around the intensity-weighted centroid.  qidx only indexes
+    # windows that received peaks, so mz_mean[qidx]/k0_mean[qidx] are finite.
+    in_k0_band = np.abs(k0 - k0_mean[qidx]) <= k0_tol
+    in_mz_core = np.abs(mz - mz_mean[qidx]) <= mz_mean[qidx] * core_ppm * 1e-6
+    in_core = in_k0_band & in_mz_core
+
+    band = np.zeros(n)
+    core = np.zeros(n)
+    np.add.at(band, qidx, w * in_k0_band)
+    np.add.at(core, qidx, w * in_core)
+
+    _eps = 1e-12
+    out["mob_2d_concentration"][nz] = core[nz] / isum[nz]
+    off = isum - band
+    out["mob_peak_snr"][nz] = np.log10((band[nz] + _eps) / (off[nz] + _eps))
+    return out
+
+
 def extract_observed_feature_stats_raw(
     d_path: str,
     query_mzs: np.ndarray,
     extraction_ppm: float = 25.0,
     charge: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Observed per-candidate ``(CCS, peak-centroid m/z)`` from the raw Bruker ``.d``.
+    mob_quality_window_ppm: float = 25.0,
+    mob_quality_k0_tol: float = 0.02,
+) -> tuple[np.ndarray, np.ndarray, dict | None]:
+    """Observed per-candidate ``(CCS, peak-centroid m/z, peak_quality)`` from the raw ``.d``.
 
     A single ``alphatims`` pass collects every peak inside a ``query_mzs`` window
     (±``extraction_ppm``) across all MALDI pixels, then computes two
@@ -106,15 +215,20 @@ def extract_observed_feature_stats_raw(
       ``maldi_imzml.one_over_k0_to_ccs`` (N2 drift gas, charge 1 for [M+H]+).
       ``NaN`` when the dataset has no ion-mobility dimension.
 
-    Returns ``(ccs, centroid_mz)``, each aligned 1:1 with ``query_mzs`` with
-    ``NaN`` where no signal.  Both are all-``NaN`` (with a warning) when
+    Additionally, when the dataset has ion mobility, ``peak_quality`` is a dict of four
+    intrinsic joint-space peak-quality descriptors (see :func:`_peak_quality_in_windows`),
+    each aligned 1:1 with ``query_mzs``; it is ``None`` without a TIMS dimension or when
     ``alphatims`` is unavailable.
+
+    Returns ``(ccs, centroid_mz, peak_quality)``, the arrays aligned 1:1 with ``query_mzs``
+    with ``NaN`` where no signal.  ``ccs``/``centroid_mz`` are all-``NaN`` (with a warning)
+    when ``alphatims`` is unavailable.
     """
     query_mzs = np.asarray(query_mzs, dtype=np.float64)
     n = len(query_mzs)
     nan_result = np.full(n, np.nan)
     if n == 0:
-        return nan_result, nan_result
+        return nan_result, nan_result, None
 
     try:
         import alphatims.bruker as atb
@@ -125,7 +239,7 @@ def extract_observed_feature_stats_raw(
             "Install with: pip install alphatims",
             d_path,
         )
-        return nan_result, nan_result
+        return nan_result, nan_result, None
 
     logger.info("Extracting observed peak centroids + CCS from raw .d via alphatims: %s", d_path)
     tims = atb.TimsTOF(str(d_path))
@@ -181,7 +295,7 @@ def extract_observed_feature_stats_raw(
             "observed CCS and peak centroids all-NaN.",
             d_path,
         )
-        return nan_result, nan_result
+        return nan_result, nan_result, None
 
     peak_mzs = np.concatenate(coll_mz)
     peak_ints = np.concatenate(coll_int)
@@ -191,6 +305,7 @@ def extract_observed_feature_stats_raw(
         peak_mzs, peak_ints, peak_mzs, query_mzs, extraction_ppm
     )
 
+    peak_quality = None
     if has_mobility:
         peak_mob = mob_arr[np.concatenate(coll_scan)]
         mean_inv_k0 = _weighted_mean_in_windows(
@@ -201,6 +316,11 @@ def extract_observed_feature_stats_raw(
         ccs = np.asarray(
             one_over_k0_to_ccs(mean_inv_k0, query_mzs, charge=charge), dtype=np.float64
         )
+        # Intrinsic joint (m/z, intensity, 1/K0) peak-quality descriptors.
+        peak_quality = _peak_quality_in_windows(
+            peak_mzs, peak_ints, peak_mob, query_mzs,
+            window_ppm=mob_quality_window_ppm, k0_tol=mob_quality_k0_tol,
+        )
     else:
         ccs = nan_result
 
@@ -208,7 +328,7 @@ def extract_observed_feature_stats_raw(
         "  Observed peak centroid for %d/%d features; observed CCS for %d/%d.",
         int(np.isfinite(centroid_mz).sum()), n, int(np.isfinite(ccs).sum()), n,
     )
-    return ccs, centroid_mz
+    return ccs, centroid_mz, peak_quality
 
 
 def query_raw_maldi(
