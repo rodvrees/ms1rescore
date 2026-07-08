@@ -720,7 +720,9 @@ For each feature column and each ranking direction (ascending / descending), TDC
 
 If the best single-feature result is below `min_pair_threshold` (default 10) targets, all pairwise sums and differences of eligible features are tried on standardised columns. The composite score beating the single-feature result is used if one exists.
 
-Columns in `_BEST_FEAT_SKIP` are excluded from both the single-feature and pairwise sweeps because they measure amino acid composition rather than spectral quality and can produce spurious pseudo-positives when shuffled decoys have a different residue composition than targets:
+If the pairwise result is *still* below that threshold, a depth-3 `DecisionTreeClassifier` (`min_samples_leaf=20`) is fit on all eligible columns at once (target vs. decoy), and candidates are ranked by leaf target-probability. This is the O6 seeding tier: single features and pairwise sums/differences are both linear-direction rankings, so a pattern like "target iff (feature A high AND feature B high) OR (feature A low AND feature B low)" — two disjoint target-rich regions with no shared sign — cannot be captured by either; a tree with two leaves can. Only runs when both classes are present (skipped for degenerate all-target/all-decoy inputs, e.g. the R2 seed call).
+
+Columns in `_BEST_FEAT_SKIP` are excluded from the single-feature, pairwise, and tree sweeps because they measure amino acid composition rather than spectral quality and can produce spurious pseudo-positives when shuffled decoys have a different residue composition than targets:
 
 ```python
 _BEST_FEAT_SKIP = {

@@ -187,6 +187,33 @@ class TestFindBestFeatureLabels:
 
         assert result is None
 
+    def test_shallow_tree_tier_combines_two_weak_features(self):
+        """Neither single-feature nor pairwise-sum/diff can separate an XOR-style
+        pattern (targets cluster in two opposite quadrants, decoys at the
+        origin): any one linear direction only ever catches one quadrant. A
+        depth-3 tree can isolate both quadrants as separate leaves and should
+        clear ``min_seed_positives`` where the earlier tiers cannot.
+        """
+        rng = np.random.default_rng(1)
+        n_a, n_b, n_dec = 150, 150, 300
+        f1 = np.concatenate([
+            rng.normal(5, 0.3, n_a), rng.normal(-5, 0.3, n_b), rng.normal(0, 1, n_dec),
+        ])
+        f2 = np.concatenate([
+            rng.normal(5, 0.3, n_a), rng.normal(-5, 0.3, n_b), rng.normal(0, 1, n_dec),
+        ])
+        is_decoy = np.array([False] * (n_a + n_b) + [True] * n_dec)
+        X = np.column_stack([f1, f2])
+
+        result = _find_best_feature_labels(
+            X, is_decoy, ["f1", "f2"], init_fdr=0.05, min_seed_positives=200,
+        )
+
+        assert result is not None
+        _, best_name, n_passing = result
+        assert best_name.startswith("tree(")
+        assert n_passing > 150  # beats what any single feature/pair tier reaches
+
     def test_handles_nan_in_features(self):
         """NaN in a feature column must not crash; column median used for ranking."""
         df = _make_clean_df()

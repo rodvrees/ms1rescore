@@ -567,10 +567,10 @@ def _find_best_feature_labels(
     # --- Shallow-tree sweep when the pairwise result is still weak ---
     # A depth-3 tree on all eligible spectral-quality features at once lets
     # weakly-correlated evidence combine beyond what raw sums/pairs reach.
-    if best_n < min_seed_positives and eligible:
+    is_target = ~is_decoy
+    if best_n < min_seed_positives and eligible and is_decoy.any() and is_target.any():
         from sklearn.tree import DecisionTreeClassifier
 
-        is_target = ~is_decoy
         tree = DecisionTreeClassifier(max_depth=3, min_samples_leaf=20, random_state=0)
         tree.fit(X_imp[:, eligible], is_target.astype(int))
         scores = tree.predict_proba(X_imp[:, eligible])[:, 1] + tiebreak
@@ -584,6 +584,12 @@ def _find_best_feature_labels(
             )
             result = (_encode_labels(is_decoy, q <= init_fdr), tree_name, n_pass)
             best_n = n_pass
+        else:
+            logger.info(
+                "  Shallow-tree seed (depth=3, %d features) gave %d PSMs at q<=%g — "
+                "did not beat pairwise result (%d), keeping pairwise",
+                len(eligible), n_pass, init_fdr, best_n,
+            )
 
     if result is None or result[2] == 0:
         return None
