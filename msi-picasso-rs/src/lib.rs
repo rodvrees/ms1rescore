@@ -217,7 +217,7 @@ fn accumulate_profile_chunk<'py>(
     lo_indices: Vec<usize>,
     hi_indices: Vec<usize>,
 ) -> pyo3::PyResult<pyo3::Bound<'py, numpy::PyArray1<f32>>> {
-    use numpy::IntoPyArray;
+    use numpy::{IntoPyArray, PyUntypedArrayMethods};
 
     let shape = pixel_matrix.shape();
     let n_mz = shape[1];

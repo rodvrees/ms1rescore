@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from msi_picasso.candidates import (
+    generate_substitution_candidates,
     digest_fasta,
     digest_identified_proteins,
     generate_balanced_shuffle_candidates,
@@ -22,7 +23,9 @@ from msi_picasso.feature_generator import (
     LCMS_PRIOR_FEATURES,
     MAIN_FEATURES,
     MALDI_INTRINSIC_FEATURES,
-    NMF_COLOCALIZATION_FEATURES,
+    MOB_QUALITY_FEATURES,
+    REGION_COLOCALIZATION_FEATURES,
+    WITHIN_REGION_COLOCALIZATION_FEATURES,
     PROTEIN_LEVEL_FEATURES,
     SPATIAL_PRIOR_FEATURES,
     SPATIAL_RANKER_FEATURES,
@@ -47,7 +50,16 @@ _SPATIAL_INVERT_FEATURES = frozenset(["spatial_gearys_c"])
 
 # Decoy methods whose decoys land on real MALDI features, giving spatial ranker
 # features a symmetric null.  shuffle/balanced_shuffle/paired_shuffle do not.
-_SPATIAL_RANKER_OK_DECOYS = frozenset(["entrapment", "mz_shift", "mz_shuffle"])
+_SPATIAL_RANKER_OK_DECOYS = frozenset(["entrapment", "mz_shift", "mz_shuffle", "substitution"])
+
+# Decoy methods for which the intrinsic 2D peak-quality features (MOB_QUALITY_FEATURES)
+# enter the ranker by default. For substitution the decoy sits at a distinct (often
+# empty/noisy) m/z, so feature-level peak quality discriminates. For mz_shuffle the
+# co-located target+decoy share the feature, so these columns are exactly symmetric
+# (AUC ~= 0.5) — a harmless default and a built-in leak-safety check. No m/z-baseline
+# leak (they use only the observed peak, no prediction), so unlike the im2deep_* CCS
+# scalars they are NOT in _MZ_SHUFFLE_CCS_LEAK_FEATURES.
+_MOB_QUALITY_DEFAULT_DECOYS = frozenset(["substitution", "mz_shuffle"])
 
 # Features that use the candidate's PREDICTED CCS/mobility to gate or compare against
 # the observed feature. For mz_shuffle (peptide relocated far in mass; CCS/1-K0 ∝ m/z)
@@ -115,6 +127,32 @@ def _observed_ccs_by_feature_idx(
     return ccs_map or None
 
 
+def _mob_hist_by_feature_idx(
+    candidates: pd.DataFrame,
+    maldi_mzs: np.ndarray,
+    mob_k0_hist: np.ndarray | None,
+) -> dict | None:
+    """Build a ``mob_k0_hist_by_feature`` dict keyed by candidate ``feature_idx``.
+
+    ``mob_k0_hist`` is a ``(len(maldi_mzs), n_bins)`` array aligned with the queried
+    m/z grid.  Bridged to candidate ``feature_idx`` via ``feature_mz`` exactly like
+    :func:`_observed_ccs_by_feature_idx` (each value is the candidate's 1/K0
+    histogram row).  Returns ``None`` when ``mob_k0_hist`` is absent.
+    """
+    if mob_k0_hist is None:
+        return None
+    maldi_mzs = np.asarray(maldi_mzs)
+    mz_to_row = {float(m): i for i, m in enumerate(maldi_mzs)}
+    hist_map = {
+        int(fi): mob_k0_hist[mz_to_row[float(mz)]]
+        for fi, mz in candidates[["feature_idx", "feature_mz"]]
+        .drop_duplicates()
+        .itertuples(index=False)
+        if float(mz) in mz_to_row
+    }
+    return hist_map or None
+
+
 def _recompute_ppm_from_centroids(
     feature_mz: np.ndarray,
     maldi_mzs: np.ndarray,
@@ -167,8 +205,9 @@ def _recompute_ppm_from_centroids(
 # no-signal candidate is penalised on coloc rather than imputed up to average.
 _PROTEIN_COLOC_WORST_PREFIXES = (
     "protein_colocalization",
-    "protein_patch_colocalization",
-    "protein_nmf_colocalization",
+    "protein_region_colocalization",
+    "protein_within_region_colocalization",
+    "protein_dominant_region_colocalization",
 )
 
 
@@ -420,6 +459,7 @@ def _find_best_feature_labels(
     feature_names: list[str],
     init_fdr: float = 0.2,
     min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
 ) -> tuple[np.ndarray, str, int] | None:
     """
     Mokapot-style best-feature seed initialization.
@@ -433,10 +473,23 @@ def _find_best_feature_labels(
     tried. The composite score that yields the most targets is used if it beats
     the single-feature result.
 
+    When the pairwise result is *still* below ``min_seed_positives``, a shallow
+    decision tree (depth 3, target vs. decoy) is fit on all eligible features at
+    once, so weakly-correlated evidence can combine beyond what raw sums/pairs
+    reach. Its leaf-probability score is used if it beats the pairwise result.
+
     Columns whose names appear in _BEST_FEAT_SKIP are excluded — they measure
     amino acid composition rather than spectral quality and can yield spurious
     pseudo-positives due to composition differences between shuffled decoys and
     targets.
+
+    When ``seed_features`` is a non-empty list, the single-feature, pairwise, and
+    tree sweeps are restricted to *only* those feature names (still intersected
+    with the _BEST_FEAT_SKIP guard). This lets a run seed from a chosen,
+    tissue-independent subset (e.g. CCS-error / ppm / isotope features) instead of
+    whatever scores marginally highest — useful when the otherwise-dominant
+    colocalization features are non-discriminative (heterogeneous tissue). ``None``
+    or ``[]`` (default) uses every eligible feature, i.e. unchanged behaviour.
 
     NaN values in X are filled with the column median before ranking.
 
@@ -449,6 +502,24 @@ def _find_best_feature_labels(
              0  — excluded: target at q > init_fdr
     """
     is_decoy = np.asarray(is_decoy, dtype=bool)
+
+    # Optional allowlist: restrict seeding to a chosen feature subset (R2).
+    _seed_allow = set(seed_features) if seed_features else None
+    if _seed_allow is not None:
+        _matched = [f for f in feature_names if f in _seed_allow and f not in _BEST_FEAT_SKIP]
+        if _matched:
+            logger.info("  Seed restricted to %d feature(s): %s", len(_matched), ", ".join(_matched))
+        else:
+            logger.warning(
+                "  seed_features matched no eligible ranker features (%s); "
+                "falling back to unrestricted seeding.", ", ".join(sorted(_seed_allow)),
+            )
+            _seed_allow = None
+
+    def _seed_eligible(fname: str) -> bool:
+        if fname in _BEST_FEAT_SKIP:
+            return False
+        return _seed_allow is None or fname in _seed_allow
 
     X_imp = X.copy()
     for j in range(X_imp.shape[1]):
@@ -470,7 +541,7 @@ def _find_best_feature_labels(
     best_q: np.ndarray | None = None
 
     for j, fname in enumerate(feature_names):
-        if fname in _BEST_FEAT_SKIP:
+        if not _seed_eligible(fname):
             continue
         col = X_imp[:, j]
         if col.std() == 0.0:
@@ -485,12 +556,18 @@ def _find_best_feature_labels(
                 best_asc = ascending
                 best_q = q.copy()
 
+    result: tuple[np.ndarray, str, int] | None = None
+    if best_j >= 0:
+        assert best_q is not None
+        result = (_encode_labels(is_decoy, best_q <= init_fdr), feature_names[best_j], best_n)
+
+    eligible = [
+        j for j, fname in enumerate(feature_names)
+        if _seed_eligible(fname) and X_imp[:, j].std() > 0
+    ]
+
     # --- Pairwise sweep when single-feature result is weak ---
-    if best_n < min_seed_positives:
-        eligible = [
-            j for j, fname in enumerate(feature_names)
-            if fname not in _BEST_FEAT_SKIP and X_imp[:, j].std() > 0
-        ]
+    if best_n < min_seed_positives and eligible:
         # Scale to zero mean, unit variance so both features contribute equally.
         col_means = X_imp[:, eligible].mean(axis=0)
         col_stds = X_imp[:, eligible].std(axis=0)
@@ -500,9 +577,6 @@ def _find_best_feature_labels(
             X_sc[:, k] = (X_imp[:, j] - col_means[k]) / col_stds[k]
 
         pair_best_n = best_n
-        pair_best_labels: np.ndarray | None = None
-        pair_best_name: str | None = None
-
         for ii in range(len(eligible)):
             for jj in range(ii + 1, len(eligible)):
                 gi, gj = eligible[ii], eligible[jj]
@@ -514,25 +588,49 @@ def _find_best_feature_labels(
                         n_pass = int(((~is_decoy) & (q <= init_fdr)).sum())
                         if n_pass > pair_best_n:
                             pair_best_n = n_pass
-                            pair_best_labels = _encode_labels(is_decoy, q <= init_fdr)
                             sign_str = "+" if sign == +1 else "-"
                             pair_best_name = (
                                 f"{feature_names[gi]} {sign_str} {feature_names[gj]}"
                             )
+                            result = (_encode_labels(is_decoy, q <= init_fdr), pair_best_name, n_pass)
 
-        if pair_best_labels is not None:
+        if pair_best_n > best_n:
             logger.info(
                 "  Selected pair (%s) with %d PSMs at q<=%g",
-                pair_best_name, pair_best_n, init_fdr,
+                result[1], pair_best_n, init_fdr,
             )
-            return pair_best_labels, pair_best_name, pair_best_n
+            best_n = pair_best_n
 
-    if best_n == 0 or best_j < 0:
+    # --- Shallow-tree sweep when the pairwise result is still weak ---
+    # A depth-3 tree on all eligible spectral-quality features at once lets
+    # weakly-correlated evidence combine beyond what raw sums/pairs reach.
+    is_target = ~is_decoy
+    if best_n < min_seed_positives and eligible and is_decoy.any() and is_target.any():
+        from sklearn.tree import DecisionTreeClassifier
+
+        tree = DecisionTreeClassifier(max_depth=3, min_samples_leaf=20, random_state=0)
+        tree.fit(X_imp[:, eligible], is_target.astype(int))
+        scores = tree.predict_proba(X_imp[:, eligible])[:, 1] + tiebreak
+        q = _tdc_qvalues(scores, is_decoy)
+        n_pass = int((is_target & (q <= init_fdr)).sum())
+        if n_pass > best_n:
+            tree_name = f"tree(depth=3, n_features={len(eligible)})"
+            logger.info(
+                "  Selected shallow-tree seed (%s) with %d PSMs at q<=%g",
+                tree_name, n_pass, init_fdr,
+            )
+            result = (_encode_labels(is_decoy, q <= init_fdr), tree_name, n_pass)
+            best_n = n_pass
+        else:
+            logger.info(
+                "  Shallow-tree seed (depth=3, %d features) gave %d PSMs at q<=%g — "
+                "did not beat pairwise result (%d), keeping pairwise",
+                len(eligible), n_pass, init_fdr, best_n,
+            )
+
+    if result is None or result[2] == 0:
         return None
-
-    assert best_q is not None
-    labels = _encode_labels(is_decoy, best_q <= init_fdr)
-    return labels, feature_names[best_j], best_n
+    return result
 
 
 def _make_fold_ids(is_decoy: np.ndarray, cv_folds: int) -> np.ndarray | None:
@@ -606,6 +704,7 @@ def _rescore_linear(
     max_iter: int = 5,
     r1_seed_percentile: float = 0.10,
     min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
     cv_folds: int = 3,
     make_clf=None,
     clf_name: str = "lda",
@@ -701,7 +800,8 @@ def _rescore_linear(
 
     if seed_mask is None:
         bf_result = _find_best_feature_labels(
-            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives
+            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives,
+            seed_features=seed_features
         )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
@@ -820,8 +920,15 @@ def _rescore_linear(
     feature_names_out = present
     if pipe is not None:
         try:
-            importances = pipe[clf_name].coef_[0]
-            if use_poly:
+            est = pipe[clf_name]
+            if hasattr(est, "coef_"):
+                importances = est.coef_[0]
+            elif hasattr(est, "feature_importances_"):
+                # Tree ensembles (e.g. the gbt backend) expose impurity-based
+                # feature_importances_ instead of coef_. Same reporting slot; the
+                # FDR scores are always the decision_function values, never these.
+                importances = est.feature_importances_
+            if importances is not None and use_poly:
                 feature_names_out = expanded_names
         except Exception:
             pass
@@ -838,6 +945,13 @@ def _rescore_linear(
             struct_coefs = np.nan_to_num(struct_coefs, nan=0.0)
         except Exception:
             pass
+        # Kernel models (e.g. the rbf_svm backend) expose neither coef_ nor
+        # feature_importances_ — the decision function lives in kernel space, not
+        # per-feature. Fall back to |structure coefficient| so the importance TSV
+        # stays populated and sortable. Only valid when not using poly expansion
+        # (struct_coefs align with `present`, the un-expanded feature list).
+        if importances is None and struct_coefs is not None and not use_poly:
+            importances = np.abs(struct_coefs)
     # Expose the fitted pipeline + raw feature matrix for downstream SHAP debug
     # explanations (populated only when the caller passes a mutable dict).
     if fitted_out is not None and pipe is not None:
@@ -874,6 +988,92 @@ def _rescore_svm(features_df, intrinsic_feature_names, init_ppm_threshold, svm_c
     )
 
 
+def _rescore_gbt(
+    features_df, intrinsic_feature_names, init_ppm_threshold,
+    gbt_n_estimators: int = 200,
+    gbt_max_depth: int = 3,
+    gbt_learning_rate: float = 0.1,
+    gbt_subsample: float = 0.7,
+    **kwargs,
+):
+    """Semi-supervised gradient-boosted-tree backend (nonlinear).
+
+    Uses ``sklearn.ensemble.GradientBoostingClassifier`` as the final pipeline
+    step. It exposes ``decision_function()`` (consumed by the out-of-fold CV
+    scorer) and ``feature_importances_`` (impurity-based, written to the
+    importance TSV), so it slots into the exact same ``_rescore_linear`` machinery
+    as LDA/SVM — seed selection, pseudo-label iteration, per-feature winner
+    selection, TDC, PEP-from-scores, and reweighting are all unchanged; only the
+    final estimator differs. Score columns are tagged ``gbt_score_r1/r2`` and the
+    importance TSV ``17_debug_gbt_importances_r{1,2}.tsv``.
+
+    Unlike the linear backends, gbt can fit nonlinear feature interactions (e.g.
+    colocalization only discriminating where MALDI signal is present), which is
+    where it materially outperforms LDA/SVM on heterogeneous samples.
+    ``subsample<1`` (stochastic gradient boosting) regularises against overfitting
+    the target/decoy null, complementing the out-of-fold CV. The median imputer
+    is kept (GradientBoostingClassifier rejects NaN); the StandardScaler is a
+    harmless no-op for trees (monotone transforms do not change split points)."""
+    from sklearn.ensemble import GradientBoostingClassifier
+
+    def make_clf():
+        return GradientBoostingClassifier(
+            n_estimators=gbt_n_estimators,
+            max_depth=gbt_max_depth,
+            learning_rate=gbt_learning_rate,
+            subsample=gbt_subsample,
+            random_state=0,
+        )
+
+    return _rescore_linear(
+        features_df, intrinsic_feature_names, init_ppm_threshold,
+        clf_name="gbt", make_clf=make_clf, **kwargs,
+    )
+
+
+def _rescore_rbf_svm(
+    features_df, intrinsic_feature_names, init_ppm_threshold,
+    rbf_svm_c: float = 1.0,
+    rbf_svm_gamma="scale",
+    **kwargs,
+):
+    """Semi-supervised RBF-kernel SVM backend (nonlinear, continuous scores).
+
+    Uses ``sklearn.svm.SVC(kernel="rbf")`` as the final pipeline step. Unlike the
+    ``gbt`` (tree) backend, a kernel SVM's ``decision_function`` is a smooth,
+    continuous function of the inputs, so the score distribution stays continuous
+    and bimodal-looking (no discrete leaf-value spikes) even with a small
+    semi-supervised seed set. This is the nonlinear analog of the linear ``svm``
+    backend and reuses the exact same ``_rescore_linear`` machinery — seed,
+    pseudo-label iteration, out-of-fold CV, winner selection, TDC, PEP,
+    reweighting — via ``decision_function``. Score columns are tagged
+    ``rbf_svm_score_r1/r2``.
+
+    A kernel SVM has no ``coef_``/``feature_importances_`` (its weights live in
+    kernel space), so ``_rescore_linear`` reports per-feature importances as
+    ``|structure coefficient|`` (correlation of each feature with the score).
+
+    ``rbf_svm_gamma`` accepts ``"scale"``/``"auto"`` or a float. On standardized
+    features, gamma ≈ 0.01-0.03 with ``rbf_svm_c`` ≈ 5-10 typically outperforms
+    the ``"scale"`` default; tune via ``--rbf-svm-gamma`` / ``--rbf-svm-c``. The
+    median imputer + StandardScaler are kept (SVC rejects NaN and is scale-
+    sensitive). Note SVC training is ~O(N^2); fine at MALDI candidate scale
+    (~5-10 K rows) but slower than the linear backends."""
+    from sklearn.svm import SVC
+
+    gamma = rbf_svm_gamma
+    if isinstance(gamma, str) and gamma not in ("scale", "auto"):
+        gamma = float(gamma)
+
+    def make_clf():
+        return SVC(kernel="rbf", C=rbf_svm_c, gamma=gamma)
+
+    return _rescore_linear(
+        features_df, intrinsic_feature_names, init_ppm_threshold,
+        clf_name="rbf_svm", make_clf=make_clf, **kwargs,
+    )
+
+
 def _rescore_qda(
     features_df: pd.DataFrame,
     intrinsic_feature_names: list[str],
@@ -884,6 +1084,7 @@ def _rescore_qda(
     max_iter: int = 5,
     r1_seed_percentile: float = 0.10,
     min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
     cv_folds: int = 3,
 ) -> np.ndarray:
     """
@@ -919,7 +1120,8 @@ def _rescore_qda(
 
     if seed_mask is None:
         bf_result = _find_best_feature_labels(
-            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives
+            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives,
+            seed_features=seed_features
         )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
@@ -1363,6 +1565,8 @@ def rescore(
     maldi_d_path: str | None = None,
     raw_query_cache: dict | None = None,
     extraction_ppm: float = 25.0,
+    mob_quality_mz_window_ppm: float = 25.0,
+    mob_quality_k0_tol: float = 0.02,
     msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
     init_fdr: float = 0.2,
@@ -1372,6 +1576,11 @@ def rescore(
     max_length: int = 30,
     model: str = "lda",
     svm_c: float = 1.0,
+    gbt_n_estimators: int = 200,
+    gbt_max_depth: int = 3,
+    gbt_learning_rate: float = 0.1,
+    rbf_svm_c: float = 1.0,
+    rbf_svm_gamma: str = "scale",
     single_round: bool = False,
     init_ppm_threshold: float = 5.0,
     init_isotope_threshold: float = 0.7,
@@ -1414,6 +1623,7 @@ def rescore(
     r2_seed_percentile: float = 0.20,
     max_iter: int = 5,
     min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
     im2deep_kwargs: dict | None = None,
     deeplc_finetune_epochs: int = 40,
     deeplc_finetune_lr: float = 0.001,
@@ -1429,16 +1639,21 @@ def rescore(
     ccs_window_multiplier: float = 2.0,
     tdf_path: str | None = None,
     mob_coloc: bool = False,
+    mob_protein_coloc: bool = False,
     mob_window_multiplier: float = 2.0,
     coloc_tic_quantile: float = 0.0,
     coloc_measured_pixel_mask: "np.ndarray | None" = None,
-    nmf_coloc: bool = False,
-    nmf_n_components: int = 12,
-    patch_coloc: bool = False,
-    patch_size: int = 10,
-    patch_coloc_threshold: float = 0.5,
+    coloc_tic_normalize: bool = False,
+    coloc_common_mode: bool = False,
+    region_coloc: bool = False,
+    region_coloc_k: int = 20,
+    within_region_coloc: bool = False,
     drop_zero_signal: bool = False,
     entrapment: bool = False,
+    substitution_n_residues: int = 1,
+    substitution_seed: int = 42,
+    substitution_collision_filter: bool = True,
+    substitution_mass_shift_min_da: float | None = None,
 ):
     """
     End-to-end symmetric MALDI-MSI rescoring pipeline.
@@ -1491,9 +1706,13 @@ def rescore(
     max_length
         Maximum peptide length (residues) after digest filtering.
     model
-        Rescoring backend: ``"lda"`` (default, LinearDiscriminantAnalysis) or
-        ``"qda"`` (QuadraticDiscriminantAnalysis, reg_param=0.1). Both train on
-        ``MALDI_INTRINSIC_FEATURES`` only; LC-MS/MS evidence is applied as an
+        Rescoring backend: ``"lda"`` (default, LinearDiscriminantAnalysis),
+        ``"qda"`` (QuadraticDiscriminantAnalysis, reg_param=0.1), ``"svm"``
+        (LinearSVC, C=``svm_c``), ``"gbt"`` (GradientBoostingClassifier,
+        nonlinear; tuned by ``gbt_n_estimators`` / ``gbt_max_depth`` /
+        ``gbt_learning_rate``), or ``"rbf_svm"`` (RBF-kernel SVC, nonlinear with
+        continuous scores; tuned by ``rbf_svm_c`` / ``rbf_svm_gamma``). All train
+        on ``MALDI_INTRINSIC_FEATURES`` only; LC-MS/MS evidence is applied as an
         additive log-prior after scoring.
     init_ppm_threshold
         ppm_error_abs threshold for the initial positive seed in the LDA/QDA
@@ -1985,6 +2204,26 @@ def rescore(
             max_length=max_length,
             selection_mode=_selection_mode,
         )
+    elif decoy_method == "substitution":
+        target_db = peptide_db[~peptide_db["is_decoy"].astype(bool)].reset_index(drop=True)
+        logger.info(
+            "Step 1c: Generating substitution decoys "
+            "(n_residues=%d, seed=%d, collision_filter=%s)...",
+            substitution_n_residues, substitution_seed, substitution_collision_filter,
+        )
+        candidates = generate_substitution_candidates(
+            target_db,
+            maldi_mzs,
+            matching_ppm=matching_ppm,
+            n_residues=substitution_n_residues,
+            random_seed=substitution_seed,
+            mass_shift_min_da=substitution_mass_shift_min_da,
+            collision_filter=substitution_collision_filter,
+            snap_to_features=not maldi_query_raw,
+            maldi_intensities=_maldi_intensities_arr,
+            maldi_intensities_p90=maldi_intensities_p90,
+            maldi_intensities_sum=maldi_intensities_sum,
+        )
     else:
         candidates = match_to_maldi_features(
             maldi_mzs,
@@ -2068,6 +2307,7 @@ def rescore(
             maldi_envelopes = raw_query_cache["maldi_envelopes"]
             _ccs_arr = raw_query_cache["ccs_arr"]
             _centroid_arr = raw_query_cache["centroid_arr"]
+            _peak_quality = raw_query_cache.get("peak_quality")
             ion_image_mzs = maldi_mzs
             logger.info(
                 "Raw-query mode: reusing cached extraction (%d grid ion images) "
@@ -2084,8 +2324,10 @@ def rescore(
             ion_image_mzs = maldi_mzs
             # Observed peak centroids + CCS from the raw .d (alphatims). imzy exposes
             # neither, so the .d is opened a second time here.
-            _ccs_arr, _centroid_arr = extract_observed_feature_stats_raw(
-                maldi_d_path, maldi_mzs, extraction_ppm=extraction_ppm
+            _ccs_arr, _centroid_arr, _peak_quality = extract_observed_feature_stats_raw(
+                maldi_d_path, maldi_mzs, extraction_ppm=extraction_ppm,
+                mob_quality_window_ppm=mob_quality_mz_window_ppm,
+                mob_quality_k0_tol=mob_quality_k0_tol,
             )
             logger.info(
                 "Raw-query mode: extracted %d ion images; %d features with M0 envelope signal.",
@@ -2096,6 +2338,7 @@ def rescore(
                     maldi_mzs=maldi_mzs, ion_images=ion_images,
                     extra_ion_images=extra_ion_images, spatial_features=spatial_features,
                     maldi_envelopes=maldi_envelopes, ccs_arr=_ccs_arr, centroid_arr=_centroid_arr,
+                    peak_quality=_peak_quality,
                 )
 
         # Attach per-feature intensities (mapped by m/z) onto the candidate rows.
@@ -2105,6 +2348,18 @@ def rescore(
         candidates["feature_intensity_p90"] = candidates["feature_mz"].map(_p90)
         candidates["feature_intensity_sum"] = candidates["feature_mz"].map(_sum)
         candidates["feature_intensity"] = candidates["feature_mz"].map(_mean)
+
+        # Attach intrinsic 2D peak-quality columns (feature-level, mapped by m/z) when
+        # ion mobility was extracted.  Aligned with maldi_mzs; bridged via feature_mz
+        # exactly like the intensity maps above.  Absent for TSF/no-mobility data.
+        if _peak_quality is not None:
+            for _col, _vals in _peak_quality.items():
+                _qmap = {
+                    float(m): float(v)
+                    for m, v in zip(np.asarray(maldi_mzs), np.asarray(_vals))
+                    if np.isfinite(v)
+                }
+                candidates[_col] = candidates["feature_mz"].map(_qmap)
 
         # Recompute ppm_error symmetrically from the observed peak centroid in each
         # candidate's own window. In raw-query, candidates are matched against the
@@ -2171,10 +2426,10 @@ def rescore(
         f"candidates (top {calibration_percentile:.0%} by low ppm + high isotope cosine)"
     )
 
-    # --- Steps 2–5: LC-MS/MS data (skipped entirely when no mzML is provided) ---
+    # --- Steps 2–5: LC-MS/MS data (skipped when no mzML or prior weight is 0) ---
     lcms_evidence = {}
 
-    if mzml_paths:
+    if mzml_paths and lcms_prior_weight > 0:
         # --- Step 2: Load LC-MS/MS data ---
         logger.info("Step 2: Loading LC-MS/MS data...")
         lcms_data = load_lcms_data(mzml_paths)
@@ -2305,7 +2560,10 @@ def rescore(
             )
 
     else:
-        logger.info("Steps 2–5: No mzML files provided — skipping LC-MS/MS evidence.")
+        if not mzml_paths:
+            logger.info("Steps 2–5: No mzML files provided — skipping LC-MS/MS evidence.")
+        else:
+            logger.info("Steps 2–5: lcms_prior_weight=0 — skipping DeepLC / MS2PIP / LC-MS/MS evidence.")
 
     # --- Override protein_tryptic_count with the true full-digest count ---
     # Replaces the candidate-pool count (= observed peptides, which makes
@@ -2328,6 +2586,9 @@ def rescore(
 
     # --- Step 6: Compute all features ---
     logger.info("Step 6: Computing all features...")
+    # When region colocalization is on and debug figures are requested, collect the
+    # segmentation map + region fingerprints so save_debug_figures can visualize them.
+    region_coloc_debug = {} if (region_coloc and debug_dir is not None) else None
     features_df = compute_all_features(
         candidates,
         lcms_evidence=lcms_evidence,
@@ -2341,11 +2602,12 @@ def rescore(
         im2deep_kwargs=im2deep_kwargs,
         coloc_tic_quantile=coloc_tic_quantile,
         coloc_measured_pixel_mask=coloc_measured_pixel_mask,
-        nmf_coloc=nmf_coloc,
-        nmf_n_components=nmf_n_components,
-        patch_coloc=patch_coloc,
-        patch_size=patch_size,
-        patch_coloc_threshold=patch_coloc_threshold,
+        coloc_tic_normalize=coloc_tic_normalize,
+        coloc_common_mode=coloc_common_mode,
+        region_coloc=region_coloc,
+        region_coloc_k=region_coloc_k,
+        region_coloc_debug=region_coloc_debug,
+        within_region_coloc=within_region_coloc,
     )
     # Worst-case fill of protein-colocalization NaNs for zero-signal candidates, so a
     # feature with no MALDI signal is penalised rather than median-imputed to an average
@@ -2391,11 +2653,6 @@ def rescore(
         _exclude_set |= _ccs_mz_leak_feats
     if _exclude_set:
         logger.info(f"  Excluding {len(_exclude_set)} features: {sorted(_exclude_set)}")
-
-    if verbose:
-        logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
-        _debug_cols = [c for c in features_df.columns if c not in _exclude_set]
-        features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
     # --- CCS-based candidate filtering (optional) ---
     # IM2Deep finetuning (inside compute_all_features) uses the calibration-peptide
@@ -2460,10 +2717,17 @@ def rescore(
                 tdf_path,
                 mob_window_multiplier=mob_window_multiplier,
                 extraction_ppm=ppm_tolerance,
+                protein_coloc=mob_protein_coloc,
+                tic_normalize=coloc_tic_normalize,
             )
             _has_mob_coloc = True
         except Exception as exc:
             logger.warning(f"Per-candidate mobility colocalization failed: {exc}. Skipping.")
+
+    if verbose:
+        logger.debug(f"Writing computed features to {output_dir}/13_debug_features.tsv")
+        _debug_cols = [c for c in features_df.columns if c not in _exclude_set]
+        features_df[_debug_cols].to_csv(f"{output_dir}/13_debug_features.tsv", sep="\t", index=False)
 
     feature_names = get_feature_names(
         has_spatial=spatial_features is not None,
@@ -2493,8 +2757,8 @@ def rescore(
     )
 
     # _exclude_set (features_exclude + the mz_shuffle CCS/mobility leak features) was
-    # resolved earlier, before the 13_debug_features.tsv write, so the debug table and
-    # the ranker apply identical exclusions. See that block for the mz_shuffle rationale.
+    # resolved earlier (and 13_debug_features.tsv written after mob_coloc), so the debug
+    # table and the ranker apply identical exclusions. See that block for the mz_shuffle rationale.
     # Assemble the intrinsic feature pool: base + optional protein-level + optional
     # spatial-ranker.  protein_colocalization_* appear in both PROTEIN_LEVEL_FEATURES
     # and SPATIAL_RANKER_FEATURES; the order-preserving dedup below prevents
@@ -2508,10 +2772,28 @@ def rescore(
             f"  Spatial ranker features enabled ({len(SPATIAL_RANKER_FEATURES)} features) "
             f"with decoy_method='{decoy_method}'"
         )
-    if nmf_coloc:
-        _pool += NMF_COLOCALIZATION_FEATURES
+    if region_coloc:
+        _pool += REGION_COLOCALIZATION_FEATURES
         logger.info(
-            f"  NMF colocalization features enabled ({len(NMF_COLOCALIZATION_FEATURES)} features)"
+            f"  Region colocalization features enabled ({len(REGION_COLOCALIZATION_FEATURES)} features)"
+        )
+    if within_region_coloc:
+        _pool += WITHIN_REGION_COLOCALIZATION_FEATURES
+        logger.info(
+            f"  Within-region colocalization features enabled "
+            f"({len(WITHIN_REGION_COLOCALIZATION_FEATURES)} features, experimental — O3)"
+        )
+    # Intrinsic 2D peak-quality features: default-on for the decoy methods where they
+    # are valid/safe (see _MOB_QUALITY_DEFAULT_DECOYS).  Only present when extracted
+    # (raw-query + ion mobility); the intrinsic_present intersection below drops them
+    # otherwise.  Drop explicitly via features_exclude if unwanted.
+    if decoy_method in _MOB_QUALITY_DEFAULT_DECOYS and any(
+        f in features_df.columns for f in MOB_QUALITY_FEATURES
+    ):
+        _pool += MOB_QUALITY_FEATURES
+        logger.info(
+            f"  2D peak-quality features enabled ({len(MOB_QUALITY_FEATURES)} features) "
+            f"with decoy_method='{decoy_method}'"
         )
     _seen: set[str] = set()
     _intrinsic_pool = [
@@ -2566,12 +2848,26 @@ def rescore(
     # --- Step 9: Rescoring ---
     logger.info(f"Step 8: Running rescoring (model='{model}')...")
 
-    if model in ("lda", "svm"):
-        # LDA and SVM are both linear, decision_function-based backends sharing the
-        # entire dispatch (winner selection, TDC, PEP, reweighting). Select the
-        # routine and tag the score columns / importance files by model name.
-        _linear = _rescore_svm if model == "svm" else _rescore_lda
-        _svm_kwargs = {"svm_c": svm_c} if model == "svm" else {}
+    if model in ("lda", "svm", "gbt", "rbf_svm"):
+        # LDA, SVM, GBT, and RBF-SVM all score via decision_function and share the
+        # entire dispatch (seed, pseudo-label iteration, winner selection, TDC, PEP,
+        # reweighting). LDA/SVM are linear; GBT is a nonlinear gradient-boosted-tree
+        # backend; RBF-SVM is a nonlinear kernel backend with continuous scores.
+        # Select the routine and tag the score columns / importance files by name.
+        _linear = {"svm": _rescore_svm, "gbt": _rescore_gbt,
+                   "rbf_svm": _rescore_rbf_svm}.get(model, _rescore_lda)
+        if model == "svm":
+            _svm_kwargs = {"svm_c": svm_c}
+        elif model == "gbt":
+            _svm_kwargs = {
+                "gbt_n_estimators": gbt_n_estimators,
+                "gbt_max_depth": gbt_max_depth,
+                "gbt_learning_rate": gbt_learning_rate,
+            }
+        elif model == "rbf_svm":
+            _svm_kwargs = {"rbf_svm_c": rbf_svm_c, "rbf_svm_gamma": rbf_svm_gamma}
+        else:
+            _svm_kwargs = {}
         feature_col = "feature_idx" if "feature_idx" in features_df.columns else "feature_mz"
 
         # Fitted-pipeline capture for SHAP debug explanations (see debug_pfm_explanations).
@@ -2588,6 +2884,7 @@ def rescore(
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
             min_seed_positives=min_seed_positives,
+            seed_features=seed_features,
             fitted_out=_r1_fitted,
             **_svm_kwargs,
         )
@@ -2798,6 +3095,7 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct, single_round=single_round,
+                region_debug=region_coloc_debug,
             )
 
             # Per-PFM SHAP explanations on the fitted linear model. Use the R2
@@ -2844,6 +3142,7 @@ def rescore(
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
             min_seed_positives=min_seed_positives,
+            seed_features=seed_features,
         )
         if verbose:
             with open(f"{output_dir}/17_debug_qda_scores_r1.pkl", "wb") as f:
@@ -3014,6 +3313,7 @@ def rescore(
                 debug_dir=debug_dir, n_subset=n_debug, seed=debug_seed,
                 gt_peptides=gt_peptides, storey_pi0_val=_pi0,
                 ccs_tol_pct=_ccs_tol_pct, single_round=single_round,
+                region_debug=region_coloc_debug,
             )
 
         if entrapment:
@@ -3021,4 +3321,4 @@ def rescore(
         return psm_list, result_df, feature_names, features_df
 
     else:
-        raise ValueError(f"Unknown model '{model}'. Choose 'lda', 'qda', or 'svm'.")
+        raise ValueError(f"Unknown model '{model}'. Choose 'lda', 'qda', 'svm', 'gbt', or 'rbf_svm'.")

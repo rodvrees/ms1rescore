@@ -15,9 +15,14 @@
 
         "model": {
           "type": ["string", "null"],
-          "enum": ["lda", "qda", "svm", null]
+          "enum": ["lda", "qda", "svm", "gbt", "rbf_svm", null]
         },
         "svm_c":                  {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "gbt_n_estimators":       {"type": ["integer", "null"], "minimum": 1},
+        "gbt_max_depth":          {"type": ["integer", "null"], "minimum": 1},
+        "gbt_learning_rate":      {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "rbf_svm_c":              {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "rbf_svm_gamma":          {"type": ["string", "number", "null"]},
         "single_round":           {"type": ["boolean", "null"]},
         "init_fdr":               {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "train_fdr":              {"type": ["number", "null"], "minimum": 0, "maximum": 1},
@@ -38,6 +43,10 @@
           "type": ["array", "null"],
           "items": {"type": "string"}
         },
+        "seed_features": {
+          "type": ["array", "null"],
+          "items": {"type": "string"}
+        },
 
         "pseudo_label_max_iter":  {"type": ["integer", "null"], "minimum": 1},
         "pseudo_label_fdr":       {"type": ["number", "null"], "minimum": 0, "maximum": 1},
@@ -55,13 +64,17 @@
 
         "decoy_method": {
           "type": ["string", "null"],
-          "enum": ["shuffle", "mz_shift", "mz_shuffle", "entrapment", "balanced_shuffle", "paired_shuffle", null]
+          "enum": ["shuffle", "mz_shift", "mz_shuffle", "entrapment", "balanced_shuffle", "paired_shuffle", "substitution", null]
         },
         "mz_shift_delta_min":          {"type": ["number", "null"], "minimum": 0},
         "mz_shift_delta_max":          {"type": ["number", "null"], "minimum": 0},
         "mz_shift_snap_tolerance_ppm": {"type": ["number", "null"], "minimum": 0},
         "max_shuffle_rounds":          {"type": ["integer", "null"], "minimum": 1},
         "decoy_target_ratio":          {"type": ["number", "null"], "minimum": 0},
+        "substitution_n_residues":          {"type": ["integer", "null"], "minimum": 1},
+        "substitution_seed":                {"type": ["integer", "null"]},
+        "substitution_no_collision_filter": {"type": ["boolean", "null"]},
+        "substitution_mass_shift_min_da":   {"type": ["number",  "null"], "minimum": 0},
 
         "protein_fdr": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "peptide_fdr": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
@@ -115,13 +128,16 @@
         "ccs_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
         "maldi_query_raw":        {"type": ["boolean", "null"]},
         "mob_coloc":              {"type": ["boolean", "null"]},
+        "mob_protein_coloc":      {"type": ["boolean", "null"]},
         "mob_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
+        "mob_quality_mz_window_ppm": {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "mob_quality_k0_tol":     {"type": ["number", "null"], "exclusiveMinimum": 0},
         "coloc_tic_quantile":     {"type": ["number", "null"], "minimum": 0, "exclusiveMaximum": 1},
-        "nmf_coloc":              {"type": ["boolean", "null"]},
-        "nmf_n_components":       {"type": ["integer", "null"], "minimum": 2},
-        "patch_coloc":            {"type": ["boolean", "null"]},
-        "patch_size":             {"type": ["integer", "null"], "minimum": 1},
-        "patch_coloc_threshold":  {"type": ["number", "null"], "minimum": -1, "maximum": 1},
+        "region_coloc":           {"type": ["boolean", "null"]},
+        "region_coloc_k":         {"type": ["integer", "null"], "minimum": 2},
+        "within_region_coloc":    {"type": ["boolean", "null"]},
+        "coloc_tic_normalize":    {"type": ["boolean", "null"]},
+        "coloc_common_mode":      {"type": ["boolean", "null"]},
         "drop_zero_signal":       {"type": ["boolean", "null"]},
         "entrapment":             {"type": ["boolean", "null"]},
         "coloc_measured_mask":    {"type": ["boolean", "null"]},

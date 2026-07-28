@@ -198,15 +198,92 @@ class TestExtractObservedFeatureStatsGraceful:
         # Setting the submodule to None makes `import alphatims.bruker` raise ImportError.
         monkeypatch.setitem(sys.modules, "alphatims.bruker", None)
         query = np.array([800.0, 900.0, 1000.0], dtype=np.float64)
-        ccs, centroid = maldi_query.extract_observed_feature_stats_raw("nonexistent.d", query)
+        ccs, centroid, peak_quality = maldi_query.extract_observed_feature_stats_raw(
+            "nonexistent.d", query
+        )
         assert ccs.shape == (3,) and centroid.shape == (3,)
         assert np.all(np.isnan(ccs)) and np.all(np.isnan(centroid))
+        assert peak_quality is None
 
     def test_empty_query_returns_empty(self):
-        ccs, centroid = maldi_query.extract_observed_feature_stats_raw(
+        ccs, centroid, peak_quality = maldi_query.extract_observed_feature_stats_raw(
             "nonexistent.d", np.array([])
         )
         assert ccs.shape == (0,) and centroid.shape == (0,)
+        assert peak_quality is None
+
+
+class TestPeakQualityInWindows:
+    """Intrinsic 2D (m/z, intensity, 1/K0) peak-quality descriptors."""
+
+    def test_tight_blob_is_high_quality(self):
+        # A single compact, intense ion: all peaks at ~1000.000 m/z and ~0.90 1/K0.
+        query = np.array([1000.0], dtype=np.float64)
+        peak_mzs = np.array([1000.0, 1000.0005, 999.9995])
+        peak_ints = np.array([10.0, 8.0, 9.0])
+        peak_mob = np.array([0.900, 0.902, 0.898])
+        out = maldi_query._peak_quality_in_windows(
+            peak_mzs, peak_ints, peak_mob, query, window_ppm=25.0, k0_tol=0.02
+        )
+        assert out["mob_2d_concentration"][0] == pytest.approx(1.0)
+        assert out["mob_k0_spread"][0] < 0.01
+        assert out["mob_mz_spread_ppm"][0] < 2.0
+        # All intensity in the mobility band, none off-band -> large positive SNR.
+        assert out["mob_peak_snr"][0] > 5.0
+
+    def test_mobility_smear_lowers_quality(self):
+        # Same m/z (a real peak in m/z) but a broad/bimodal mobility distribution:
+        # co-eluting ions spread across 1/K0. Concentration drops, k0 spread rises,
+        # and off-band intensity pulls SNR down.
+        query = np.array([1000.0], dtype=np.float64)
+        peak_mzs = np.array([1000.0, 1000.0, 1000.0, 1000.0])
+        peak_ints = np.array([5.0, 5.0, 5.0, 5.0])
+        peak_mob = np.array([0.80, 0.90, 1.20, 1.40])  # centroid ~1.075, wide
+        out = maldi_query._peak_quality_in_windows(
+            peak_mzs, peak_ints, peak_mob, query, window_ppm=25.0, k0_tol=0.02
+        )
+        assert out["mob_2d_concentration"][0] < 0.5
+        assert out["mob_k0_spread"][0] > 0.1
+        # More intensity off-band than in the narrow band -> negative SNR.
+        assert out["mob_peak_snr"][0] < 0.0
+
+    def test_empty_window_is_nan(self):
+        # Second query has no in-window peak -> all descriptors NaN (worst-case fill
+        # is applied later by FEATURE_NAN_FILL at scoring).
+        query = np.array([1000.0, 1500.0], dtype=np.float64)
+        peak_mzs = np.array([1000.0])
+        peak_ints = np.array([3.0])
+        peak_mob = np.array([0.95])
+        out = maldi_query._peak_quality_in_windows(
+            peak_mzs, peak_ints, peak_mob, query, window_ppm=25.0, k0_tol=0.02
+        )
+        assert np.isfinite(out["mob_2d_concentration"][0])
+        for col in maldi_query._MOB_QUALITY_COLS:
+            assert np.isnan(out[col][1])
+
+    def test_no_peaks_all_nan(self):
+        query = np.array([800.0, 900.0], dtype=np.float64)
+        out = maldi_query._peak_quality_in_windows(
+            np.array([]), np.array([]), np.array([]), query, window_ppm=25.0, k0_tol=0.02
+        )
+        for col in maldi_query._MOB_QUALITY_COLS:
+            assert out[col].shape == (2,)
+            assert np.all(np.isnan(out[col]))
+
+    def test_concentration_in_unit_interval(self):
+        # A dominant on-mobility core (two strong peaks at 0.900) plus a weak
+        # off-mobility satellite (0.05 above): the weighted centroid stays inside the
+        # core, so concentration is the core fraction, strictly in (0, 1).
+        query = np.array([1000.0], dtype=np.float64)
+        peak_mzs = np.array([1000.0, 1000.0, 1000.0])
+        peak_ints = np.array([20.0, 20.0, 1.0])
+        peak_mob = np.array([0.900, 0.900, 1.200])
+        out = maldi_query._peak_quality_in_windows(
+            peak_mzs, peak_ints, peak_mob, query, window_ppm=25.0, k0_tol=0.02
+        )
+        c = out["mob_2d_concentration"][0]
+        assert 0.0 < c < 1.0
+        assert c == pytest.approx(40.0 / 41.0)
 
 
 class TestRecomputePpmFromCentroids:

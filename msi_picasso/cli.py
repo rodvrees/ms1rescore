@@ -14,6 +14,21 @@ from msi_picasso import __version__
 logger = logging.getLogger(__name__)
 
 
+class _Tee:
+    """Write to multiple streams at once (stdout/stderr -> terminal + log file)."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
 # ---------------------------------------------------------------------------
 # MALDI data loading
 # ---------------------------------------------------------------------------
@@ -681,7 +696,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cand.add_argument(
         "--decoy-method",
-        choices=("shuffle", "mz_shift", "mz_shuffle", "entrapment", "balanced_shuffle", "paired_shuffle"),
+        choices=("shuffle", "mz_shift", "mz_shuffle", "entrapment", "balanced_shuffle", "paired_shuffle", "substitution"),
         default=None,
         help=(
             "Decoy generation strategy. 'shuffle' (default): K/R-preserving protein "
@@ -751,6 +766,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     cand.add_argument(
+        "--substitution-n-residues",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="substitution only: number of interior residues to substitute per peptide (default 1).",
+    )
+    cand.add_argument(
+        "--substitution-seed",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="substitution only: random seed for per-peptide RNG (default 42).",
+    )
+    cand.add_argument(
+        "--substitution-no-collision-filter",
+        action="store_true",
+        default=None,
+        help=(
+            "substitution only: disable the collision filter that rejects decoys "
+            "whose [M+H]+ falls within matching_ppm of a target or an already-assigned "
+            "decoy. Enabled by default; pass this flag to disable."
+        ),
+    )
+    cand.add_argument(
+        "--substitution-mass-shift-min-da",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "substitution only: minimum absolute mass shift in Da. Default: auto "
+            "(matching_ppm × mh_mz / 1e6 per peptide). For single-residue substitution "
+            "this threshold is always satisfied automatically (N↔D minimum is ~0.96 Da)."
+        ),
+    )
+    cand.add_argument(
         "--decoy-target-ratio",
         type=float,
         default=None,
@@ -766,14 +816,17 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_grp = parser.add_argument_group("rescoring")
     rescore_grp.add_argument(
         "--model",
-        choices=("lda", "qda", "svm"),
+        choices=("lda", "qda", "svm", "gbt", "rbf_svm"),
         default=None,
         help=(
             "Rescoring backend. 'lda' (default): sklearn LinearDiscriminantAnalysis "
             "with median imputation and standardization; no extra dependencies. "
             "'qda': sklearn QuadraticDiscriminantAnalysis (reg_param=0.1); same "
             "semi-supervised structure as LDA. 'svm': sklearn LinearSVC "
-            "(penalty=l2, squared_hinge, C=--svm-c); same linear/CV machinery as LDA."
+            "(penalty=l2, squared_hinge, C=--svm-c); same linear/CV machinery as LDA. "
+            "'gbt': sklearn GradientBoostingClassifier (nonlinear, discrete scores); "
+            "tuned by --gbt-* flags. 'rbf_svm': sklearn SVC(kernel='rbf') (nonlinear "
+            "with continuous, bimodal-looking scores); tuned by --rbf-svm-* flags."
         ),
     )
     rescore_grp.add_argument(
@@ -782,6 +835,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FLOAT",
         help="Regularization strength C for the --model svm (LinearSVC) backend. Default 1.0.",
+    )
+    rescore_grp.add_argument(
+        "--gbt-n-estimators",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Number of boosting stages for the --model gbt backend. Default 200.",
+    )
+    rescore_grp.add_argument(
+        "--gbt-max-depth",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Max tree depth for the --model gbt backend. Default 3.",
+    )
+    rescore_grp.add_argument(
+        "--gbt-learning-rate",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Learning rate for the --model gbt backend. Default 0.1.",
+    )
+    rescore_grp.add_argument(
+        "--rbf-svm-c",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Regularization strength C for the --model rbf_svm backend. Default 1.0 "
+             "(C~5-10 often improves yield).",
+    )
+    rescore_grp.add_argument(
+        "--rbf-svm-gamma",
+        type=str,
+        default=None,
+        metavar="SCALE|AUTO|FLOAT",
+        help="RBF kernel gamma for the --model rbf_svm backend: 'scale' (default), "
+             "'auto', or a float (e.g. 0.01-0.03 on standardized features often "
+             "outperforms 'scale').",
     )
     rescore_grp.add_argument(
         "--single-round",
@@ -944,6 +1035,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--seed-features",
+        nargs="*",
+        default=None,
+        metavar="FEATURE",
+        help=(
+            "Restrict best-feature seed initialization to only these features "
+            "(single/pairwise/tree sweeps), still respecting the composition-leak "
+            "skip guard. Empty (default) seeds from all eligible features. Use to "
+            "seed from tissue-independent axes (e.g. --seed-features "
+            "im2deep_abs_delta_ccs_pct_resid ppm_error_pct) when colocalization is "
+            "non-discriminative."
+        ),
+    )
+    rescore_grp.add_argument(
         "--pseudo-label-max-iter",
         type=int,
         default=None,
@@ -1078,6 +1183,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--mob-protein-coloc",
+        action="store_true",
+        default=None,
+        help=(
+            "Additionally compute protein-level mobility-gated colocalization "
+            "(protein_colocalization_mob*). Requires --mob-coloc. Rebuilds per-candidate "
+            "M0 images from the raw TDF and computes within-protein pairwise Pearson r "
+            "on those images. Slow for large datasets; disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
         "--mob-window-multiplier",
         type=float,
         default=None,
@@ -1085,6 +1201,27 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Mobility-window half-width = multiplier × p95 |delta 1/K0| on the calibration "
             "set, for --mob-coloc. Default 2.0."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--mob-quality-mz-window-ppm",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Raw-query only: outer m/z half-window (ppm) for the intrinsic 2D peak-quality "
+            "features (mob_2d_concentration, mob_k0_spread, mob_mz_spread_ppm, mob_peak_snr). "
+            "Effectively bounded by --extraction-ppm (peaks are collected there). Default 25.0."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--mob-quality-k0-tol",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Raw-query only: 1/K0 half-width (V·s/cm²) of the peak band / concentration box "
+            "for the intrinsic 2D peak-quality features. Default 0.02."
         ),
     )
     rescore_grp.add_argument(
@@ -1113,51 +1250,62 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
-        "--nmf-coloc",
+        "--region-coloc",
         action="store_true",
         default=None,
         help=(
-            "Compute NMF substructure-sharing colocalization features "
-            "(protein_nmf_colocalization*). Factorises the on-tissue ion-image matrix into "
-            "spatial components and measures the within-protein cosine similarity of each "
-            "feature's component loadings, asking whether same-protein peptides occupy the "
-            "same tissue substructure (sharper than global ion-image Pearson r). Requires "
-            "ion images; protein-level, so decoys must occupy a separate protein namespace. "
+            "Compute region-profile within-protein colocalization features "
+            "(protein_region_colocalization*). Segments the on-tissue pixels into regions "
+            "(k-means on per-pixel TIC-normalized composition), reduces each ion image to a "
+            "per-region composition fingerprint, and measures the within-protein Pearson r of "
+            "those fingerprints, asking whether same-protein peptides occupy the same tissue "
+            "regions (sharper than global ion-image Pearson r, which is dominated by the shared "
+            "tissue envelope). Requires ion images; protein-level, so decoys must occupy a "
+            "separate protein namespace (also needs --use-protein-level-feats). Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--region-coloc-k",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Number of tissue regions (k-means clusters) for --region-coloc. Default 20.",
+    )
+    rescore_grp.add_argument(
+        "--within-region-coloc",
+        action="store_true",
+        default=None,
+        help=(
+            "Compute within-region Pearson r colocalization "
+            "(protein_within_region_colocalization*, protein_dominant_region_colocalization*; "
+            "O3). Segments on-tissue pixels the same way as --region-coloc (reuses "
+            "--region-coloc-k for resolution), then correlates RAW pixel intensities "
+            "restricted to each region (not the per-region mean fingerprint), asking "
+            "whether same-protein peptides co-vary pixel-to-pixel inside a shared region "
+            "rather than merely sharing a region average. Also emits a dominant-region-"
+            "only variant (colocalization restricted to the single largest region). "
+            "Experimental / unvalidated — see FLAWS_AND_OPPORTUNITIES.md O3. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--coloc-tic-normalize",
+        action="store_true",
+        default=None,
+        help=(
+            "Per-pixel TIC-normalize ion images before computing protein colocalization "
+            "(divide each pixel by its total signal across images), removing the shared "
+            "'more tissue = more of everything' brightness envelope. Disabled by default."
+        ),
+    )
+    rescore_grp.add_argument(
+        "--coloc-common-mode",
+        action="store_true",
+        default=None,
+        help=(
+            "Subtract the per-pixel mean image (the shared tissue outline) before computing "
+            "protein colocalization, so only the protein-specific residual is correlated. "
             "Disabled by default."
         ),
-    )
-    rescore_grp.add_argument(
-        "--nmf-n-components",
-        type=int,
-        default=None,
-        metavar="INT",
-        help="Number of NMF spatial components for --nmf-coloc. Default 12.",
-    )
-    rescore_grp.add_argument(
-        "--patch-coloc",
-        action="store_true",
-        default=None,
-        help=(
-            "Compute patch-level (local) within-protein colocalization features "
-            "(protein_patch_colocalization_mean/_max/_frac_above). Tiles the ion-image "
-            "grid into patches and computes per-pair Pearson r over each patch's on-tissue "
-            "pixels, aggregated across patches. Protein-level (also needs "
-            "--use-protein-level-feats). Disabled by default."
-        ),
-    )
-    rescore_grp.add_argument(
-        "--patch-size",
-        type=int,
-        default=None,
-        metavar="INT",
-        help="Patch edge length in pixels for --patch-coloc. Default 10.",
-    )
-    rescore_grp.add_argument(
-        "--patch-coloc-threshold",
-        type=float,
-        default=None,
-        metavar="FLOAT",
-        help="r threshold for the patch frac_above feature (--patch-coloc). Default 0.5.",
     )
     rescore_grp.add_argument(
         "--drop-zero-signal",
@@ -1328,30 +1476,37 @@ def main() -> None:
     _STORE_TRUE_ATTRS = frozenset({
         "verbose", "storey_pi0", "lda_r2_median_filter",
         "only_main_features", "use_protein_level_feats", "match_ccs",
-        "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc",
+        "maldi_query_raw", "use_spatial_ranker_features", "mob_coloc", "mob_protein_coloc",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
+        "region_coloc", "within_region_coloc", "coloc_tic_normalize", "coloc_common_mode",
+        "substitution_no_collision_filter",
     })
 
     # Only pass top-level configurable params (not file paths or extraction params)
     # through the cascade; extraction params are handled separately below.
     _TOP_LEVEL_ATTRS = (
-        "model", "svm_c", "single_round", "train_fdr", "n_interaction_features", "storey_pi0",
+        "model", "svm_c", "gbt_n_estimators", "gbt_max_depth", "gbt_learning_rate",
+        "rbf_svm_c", "rbf_svm_gamma",
+        "single_round", "train_fdr", "n_interaction_features", "storey_pi0",
         "lda_r2_median_filter", "only_main_features", "use_protein_level_feats",
         "use_spatial_ranker_features",
         "n_debug", "debug_seed", "verbose", "output_dir",
         "ppm_tolerance", "missed_cleavages", "min_length", "max_length",
         "decoy_method", "mz_shift_delta_min", "mz_shift_delta_max",
         "mz_shift_snap_tolerance_ppm", "max_shuffle_rounds", "decoy_target_ratio",
+        "substitution_n_residues", "substitution_seed", "substitution_no_collision_filter",
+        "substitution_mass_shift_min_da",
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
-        "features_preset", "features_exclude",
+        "features_preset", "features_exclude", "seed_features",
         "pseudo_label_max_iter", "pseudo_label_fdr", "r1_seed_percentile", "r2_seed_percentile",
         "max_iter", "init_fdr", "min_seed_positives",
         "matching_ppm", "fragment_tol_da", "winner_percentile",
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
-        "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_window_multiplier",
-        "coloc_tic_quantile", "nmf_coloc", "nmf_n_components",
-        "patch_coloc", "patch_size", "patch_coloc_threshold",
+        "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
+        "mob_quality_mz_window_ppm", "mob_quality_k0_tol",
+        "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
+        "coloc_tic_normalize", "coloc_common_mode",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
         "calibration_percentile", "maldi_query_raw",
@@ -1403,6 +1558,10 @@ def main() -> None:
     _Path(output_dir, ".full_config.json").write_text(
         _json.dumps({"MSI-PICASSO": _ms1cfg}, indent=2, default=str)
     )
+
+    _log_fh = open(_Path(output_dir, "run.log"), "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.stdout, _log_fh)
+    sys.stderr = _Tee(sys.stderr, _log_fh)
 
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -1750,6 +1909,11 @@ def main() -> None:
         max_length=max_length,
         model=_ms1cfg["model"],
         svm_c=_ms1cfg["svm_c"],
+        gbt_n_estimators=_ms1cfg["gbt_n_estimators"],
+        gbt_max_depth=_ms1cfg["gbt_max_depth"],
+        gbt_learning_rate=_ms1cfg["gbt_learning_rate"],
+        rbf_svm_c=_ms1cfg["rbf_svm_c"],
+        rbf_svm_gamma=_ms1cfg["rbf_svm_gamma"],
         single_round=bool(_ms1cfg.get("single_round", False)),
         init_ppm_threshold=_ms1cfg["init_ppm_threshold"],
         init_isotope_threshold=_ms1cfg["init_isotope_threshold"],
@@ -1791,6 +1955,7 @@ def main() -> None:
         target_ratio=_ms1cfg["decoy_target_ratio"],
         features_preset=_ms1cfg["features_preset"],
         features_exclude=_ms1cfg["features_exclude"],
+        seed_features=_ms1cfg["seed_features"],
         pseudo_label_max_iter=_ms1cfg["pseudo_label_max_iter"],
         pseudo_label_fdr=_ms1cfg["pseudo_label_fdr"],
         r1_seed_percentile=_ms1cfg["r1_seed_percentile"],
@@ -1807,16 +1972,23 @@ def main() -> None:
         ccs_window_multiplier=_ms1cfg["ccs_window_multiplier"],
         tdf_path=_maldi_raw_path,
         mob_coloc=bool(_ms1cfg.get("mob_coloc", False)),
+        mob_protein_coloc=bool(_ms1cfg.get("mob_protein_coloc", False)),
         mob_window_multiplier=_ms1cfg["mob_window_multiplier"],
+        mob_quality_mz_window_ppm=_ms1cfg["mob_quality_mz_window_ppm"],
+        mob_quality_k0_tol=_ms1cfg["mob_quality_k0_tol"],
         coloc_tic_quantile=_ms1cfg["coloc_tic_quantile"],
         coloc_measured_pixel_mask=_measured_pixel_mask,
-        nmf_coloc=_ms1cfg["nmf_coloc"],
-        nmf_n_components=_ms1cfg["nmf_n_components"],
-        patch_coloc=bool(_ms1cfg.get("patch_coloc", False)),
-        patch_size=_ms1cfg["patch_size"],
-        patch_coloc_threshold=_ms1cfg["patch_coloc_threshold"],
+        coloc_tic_normalize=bool(_ms1cfg.get("coloc_tic_normalize", False)),
+        coloc_common_mode=bool(_ms1cfg.get("coloc_common_mode", False)),
+        region_coloc=bool(_ms1cfg.get("region_coloc", False)),
+        region_coloc_k=_ms1cfg["region_coloc_k"],
+        within_region_coloc=bool(_ms1cfg.get("within_region_coloc", False)),
         drop_zero_signal=bool(_ms1cfg.get("drop_zero_signal", False)),
         entrapment=bool(_ms1cfg.get("entrapment", False)),
+        substitution_n_residues=_ms1cfg["substitution_n_residues"],
+        substitution_seed=_ms1cfg["substitution_seed"],
+        substitution_collision_filter=not bool(_ms1cfg.get("substitution_no_collision_filter", False)),
+        substitution_mass_shift_min_da=_ms1cfg.get("substitution_mass_shift_min_da"),
     )
 
     # --- Write results ---
