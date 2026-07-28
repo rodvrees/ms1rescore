@@ -459,6 +459,7 @@ def _find_best_feature_labels(
     feature_names: list[str],
     init_fdr: float = 0.2,
     min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
 ) -> tuple[np.ndarray, str, int] | None:
     """
     Mokapot-style best-feature seed initialization.
@@ -482,6 +483,14 @@ def _find_best_feature_labels(
     pseudo-positives due to composition differences between shuffled decoys and
     targets.
 
+    When ``seed_features`` is a non-empty list, the single-feature, pairwise, and
+    tree sweeps are restricted to *only* those feature names (still intersected
+    with the _BEST_FEAT_SKIP guard). This lets a run seed from a chosen,
+    tissue-independent subset (e.g. CCS-error / ppm / isotope features) instead of
+    whatever scores marginally highest — useful when the otherwise-dominant
+    colocalization features are non-discriminative (heterogeneous tissue). ``None``
+    or ``[]`` (default) uses every eligible feature, i.e. unchanged behaviour.
+
     NaN values in X are filled with the column median before ranking.
 
     Returns
@@ -493,6 +502,24 @@ def _find_best_feature_labels(
              0  — excluded: target at q > init_fdr
     """
     is_decoy = np.asarray(is_decoy, dtype=bool)
+
+    # Optional allowlist: restrict seeding to a chosen feature subset (R2).
+    _seed_allow = set(seed_features) if seed_features else None
+    if _seed_allow is not None:
+        _matched = [f for f in feature_names if f in _seed_allow and f not in _BEST_FEAT_SKIP]
+        if _matched:
+            logger.info("  Seed restricted to %d feature(s): %s", len(_matched), ", ".join(_matched))
+        else:
+            logger.warning(
+                "  seed_features matched no eligible ranker features (%s); "
+                "falling back to unrestricted seeding.", ", ".join(sorted(_seed_allow)),
+            )
+            _seed_allow = None
+
+    def _seed_eligible(fname: str) -> bool:
+        if fname in _BEST_FEAT_SKIP:
+            return False
+        return _seed_allow is None or fname in _seed_allow
 
     X_imp = X.copy()
     for j in range(X_imp.shape[1]):
@@ -514,7 +541,7 @@ def _find_best_feature_labels(
     best_q: np.ndarray | None = None
 
     for j, fname in enumerate(feature_names):
-        if fname in _BEST_FEAT_SKIP:
+        if not _seed_eligible(fname):
             continue
         col = X_imp[:, j]
         if col.std() == 0.0:
@@ -536,7 +563,7 @@ def _find_best_feature_labels(
 
     eligible = [
         j for j, fname in enumerate(feature_names)
-        if fname not in _BEST_FEAT_SKIP and X_imp[:, j].std() > 0
+        if _seed_eligible(fname) and X_imp[:, j].std() > 0
     ]
 
     # --- Pairwise sweep when single-feature result is weak ---
@@ -677,6 +704,7 @@ def _rescore_linear(
     max_iter: int = 5,
     r1_seed_percentile: float = 0.10,
     min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
     cv_folds: int = 3,
     make_clf=None,
     clf_name: str = "lda",
@@ -772,7 +800,8 @@ def _rescore_linear(
 
     if seed_mask is None:
         bf_result = _find_best_feature_labels(
-            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives
+            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives,
+            seed_features=seed_features
         )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
@@ -1055,6 +1084,7 @@ def _rescore_qda(
     max_iter: int = 5,
     r1_seed_percentile: float = 0.10,
     min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
     cv_folds: int = 3,
 ) -> np.ndarray:
     """
@@ -1090,7 +1120,8 @@ def _rescore_qda(
 
     if seed_mask is None:
         bf_result = _find_best_feature_labels(
-            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives
+            X, is_decoy, present, init_fdr, min_seed_positives=min_seed_positives,
+            seed_features=seed_features
         )
         if bf_result is not None:
             labels, _best_feat, _n_init = bf_result
@@ -1592,6 +1623,7 @@ def rescore(
     r2_seed_percentile: float = 0.20,
     max_iter: int = 5,
     min_seed_positives: int = 50,
+    seed_features: list[str] | None = None,
     im2deep_kwargs: dict | None = None,
     deeplc_finetune_epochs: int = 40,
     deeplc_finetune_lr: float = 0.001,
@@ -2852,6 +2884,7 @@ def rescore(
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
             min_seed_positives=min_seed_positives,
+            seed_features=seed_features,
             fitted_out=_r1_fitted,
             **_svm_kwargs,
         )
@@ -3109,6 +3142,7 @@ def rescore(
             max_iter=max_iter,
             r1_seed_percentile=r1_seed_percentile,
             min_seed_positives=min_seed_positives,
+            seed_features=seed_features,
         )
         if verbose:
             with open(f"{output_dir}/17_debug_qda_scores_r1.pkl", "wb") as f:

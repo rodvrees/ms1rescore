@@ -14,6 +14,21 @@ from msi_picasso import __version__
 logger = logging.getLogger(__name__)
 
 
+class _Tee:
+    """Write to multiple streams at once (stdout/stderr -> terminal + log file)."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
 # ---------------------------------------------------------------------------
 # MALDI data loading
 # ---------------------------------------------------------------------------
@@ -1020,6 +1035,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--seed-features",
+        nargs="*",
+        default=None,
+        metavar="FEATURE",
+        help=(
+            "Restrict best-feature seed initialization to only these features "
+            "(single/pairwise/tree sweeps), still respecting the composition-leak "
+            "skip guard. Empty (default) seeds from all eligible features. Use to "
+            "seed from tissue-independent axes (e.g. --seed-features "
+            "im2deep_abs_delta_ccs_pct_resid ppm_error_pct) when colocalization is "
+            "non-discriminative."
+        ),
+    )
+    rescore_grp.add_argument(
         "--pseudo-label-max-iter",
         type=int,
         default=None,
@@ -1469,7 +1498,7 @@ def main() -> None:
         "substitution_mass_shift_min_da",
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
-        "features_preset", "features_exclude",
+        "features_preset", "features_exclude", "seed_features",
         "pseudo_label_max_iter", "pseudo_label_fdr", "r1_seed_percentile", "r2_seed_percentile",
         "max_iter", "init_fdr", "min_seed_positives",
         "matching_ppm", "fragment_tol_da", "winner_percentile",
@@ -1529,6 +1558,10 @@ def main() -> None:
     _Path(output_dir, ".full_config.json").write_text(
         _json.dumps({"MSI-PICASSO": _ms1cfg}, indent=2, default=str)
     )
+
+    _log_fh = open(_Path(output_dir, "run.log"), "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.stdout, _log_fh)
+    sys.stderr = _Tee(sys.stderr, _log_fh)
 
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -1922,6 +1955,7 @@ def main() -> None:
         target_ratio=_ms1cfg["decoy_target_ratio"],
         features_preset=_ms1cfg["features_preset"],
         features_exclude=_ms1cfg["features_exclude"],
+        seed_features=_ms1cfg["seed_features"],
         pseudo_label_max_iter=_ms1cfg["pseudo_label_max_iter"],
         pseudo_label_fdr=_ms1cfg["pseudo_label_fdr"],
         r1_seed_percentile=_ms1cfg["r1_seed_percentile"],

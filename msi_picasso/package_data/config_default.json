@@ -37,6 +37,7 @@
     "peptide_fdr": 0.01,
     "features_preset": "all",
     "features_exclude": [],
+    "seed_features": [],
     "only_main_features": false,
     "use_protein_level_feats": false,
     "use_spatial_ranker_features": false,

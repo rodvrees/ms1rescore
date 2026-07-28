@@ -43,6 +43,10 @@
           "type": ["array", "null"],
           "items": {"type": "string"}
         },
+        "seed_features": {
+          "type": ["array", "null"],
+          "items": {"type": "string"}
+        },
 
         "pseudo_label_max_iter":  {"type": ["integer", "null"], "minimum": 1},
         "pseudo_label_fdr":       {"type": ["number", "null"], "minimum": 0, "maximum": 1},
