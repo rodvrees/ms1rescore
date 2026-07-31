@@ -1,3 +1,4 @@
 [console_scripts]
 msi-picasso = msi_picasso.cli:main
 picasso = msi_picasso.cli:main
+picasso-gui = msi_picasso.gui:main

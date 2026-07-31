@@ -27,10 +27,13 @@ timstof = ["alphatims>=1.0"]
 calibration = ["statsmodels>=0.14"]
 mobility = ["im2deep>=0.1"]
 explain = ["shap>=0.44"]
+gui = ["dash>=2.16", "plotly>=5", "tomli-w"]
+desktop = ["pywebview>=5"]
 
 [project.scripts]
 picasso = "msi_picasso.cli:main"
 msi-picasso = "msi_picasso.cli:main"
+picasso-gui = "msi_picasso.gui:main"
 
 [tool.pytest.ini_options]
 testpaths = ["msi_picasso/tests"]
@@ -39,4 +42,4 @@ testpaths = ["msi_picasso/tests"]
 where = ["."]
 
 [tool.setuptools.package-data]
-msi_picasso = ["package_data/*.json"]
+msi_picasso = ["package_data/*.json", "assets/*"]

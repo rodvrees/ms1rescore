@@ -25,3 +25,11 @@ Provides-Extra: calibration
 Requires-Dist: statsmodels>=0.14; extra == "calibration"
 Provides-Extra: mobility
 Requires-Dist: im2deep>=0.1; extra == "mobility"
+Provides-Extra: explain
+Requires-Dist: shap>=0.44; extra == "explain"
+Provides-Extra: gui
+Requires-Dist: dash>=2.16; extra == "gui"
+Requires-Dist: plotly>=5; extra == "gui"
+Requires-Dist: tomli-w; extra == "gui"
+Provides-Extra: desktop
+Requires-Dist: pywebview>=5; extra == "desktop"

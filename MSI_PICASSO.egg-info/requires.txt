@@ -15,6 +15,17 @@ statsmodels>=0.14
 [catboost]
 catboost>=1.2
 
+[desktop]
+pywebview>=5
+
+[explain]
+shap>=0.44
+
+[gui]
+dash>=2.16
+plotly>=5
+tomli-w
+
 [maldi]
 imzy
 pyimzml
