@@ -1535,6 +1535,105 @@ def compute_im2deep_features(
     return df
 
 
+def compute_isotope_ccs_consistency_features(
+    df: pd.DataFrame,
+    observed_envelope_ccs: dict | None = None,
+    isotope_ccs_min_peak_frac: float = 0.0,
+) -> pd.DataFrame:
+    """Isotope-envelope CCS consistency (the CCS analogue of IsoMobil's IPMV).
+
+    The dominant false-positive class in MALDI-MSI MS1 is isobaric mass
+    coincidence: the "isotope envelope" at a candidate's anchor m/z is in fact a
+    chimera of unrelated ions.  Real singly-charged isotopologues of one molecule
+    share a collisional cross-section; a chimeric envelope does not.  This function
+    turns the spread of the *observed* CCS across the M0/M+1/M+2 envelope into three
+    ranker features.
+
+    ``observed_envelope_ccs`` maps ``feature_idx`` → a 6-element record
+    ``(ccs_m0, ccs_m1, ccs_m2, int_m0, int_m1, int_m2)``, built by
+    ``pipeline._observed_envelope_ccs_by_feature_idx`` from the raw-query alphatims
+    pass.  If ``None``/empty the DataFrame is returned unchanged (feature-list mode,
+    TSF, or no TIMS dimension — exactly like the ``im2deep_*`` features).
+
+    A peak counts as present when it has nonzero integrated intensity, a finite CCS,
+    and (when M0 itself has signal) at least ``isotope_ccs_min_peak_frac`` of the M0
+    intensity.  Over the present peaks:
+
+    ``isotope_ccs_n_peaks``    0–3; how much envelope evidence exists (more = better)
+    ``isotope_ccs_spread``     max − min observed CCS (Å²), NaN when < 2 peaks (lower = better)
+    ``isotope_ccs_spread_rel`` spread / mean observed CCS, NaN when < 2 peaks (lower = better)
+
+    Four diagnostic (non-ranker) columns are added alongside: ``isotope_ccs_m0/m1/m2``
+    (the observed CCS of each present peak) and ``isotope_ccs_int_m0``.
+
+    A single-peak envelope is genuinely *unmeasurable* for spread and is common for
+    weak but real peptides, so the spread columns are left ``NaN`` for the pipeline's
+    median imputer rather than worst-case-filled — worst-casing would over-penalise
+    real IDs.  ``isotope_ccs_n_peaks`` is the companion signal that keeps the ranker
+    from being blind: it is a real, symmetric measurement (0 for a decoy at an empty
+    m/z, high for a well-formed envelope).
+
+    **Symmetry / leak safety.** No ``is_decoy`` parameter: the record is keyed by the
+    candidate's own feature and read identically for targets and decoys.  Only the
+    *observed* inter-peak CCS is used — never the candidate's predicted CCS or mass —
+    and the three windows lie within ~2 Da of each other, so the spread has negligible
+    dependence on absolute m/z.  There is therefore no m/z-baseline leak, which is why
+    these features are **not** in ``pipeline._MZ_SHUFFLE_CCS_LEAK_FEATURES``.
+    """
+    if not observed_envelope_ccs:
+        return df
+
+    n = len(df)
+    recs = df["feature_idx"].map(observed_envelope_ccs)
+    have = recs.notna().to_numpy()
+    arr = np.full((n, 6), np.nan, dtype=float)
+    if have.any():
+        arr[have] = np.vstack([np.asarray(r, dtype=float) for r in recs[have]])
+    ccs = arr[:, 0:3]
+    ints = arr[:, 3:6]
+
+    # Present peak: real signal, a finite CCS, and (when M0 has signal) at least
+    # `isotope_ccs_min_peak_frac` of the M0 intensity.  The M0-relative floor drops
+    # trace shoulders that would otherwise contribute a noise CCS to the spread.
+    i0 = ints[:, 0]
+    floor = np.where(i0 > 0, i0 * float(isotope_ccs_min_peak_frac), 0.0)[:, None]
+    present = (ints > 0) & np.isfinite(ccs) & (ints >= floor)
+
+    n_peaks = present.sum(axis=1).astype(float)
+    spread = np.full(n, np.nan)
+    spread_rel = np.full(n, np.nan)
+    ok = n_peaks >= 2
+    if ok.any():
+        avail = np.where(present[ok], ccs[ok], np.nan)
+        sp = np.nanmax(avail, axis=1) - np.nanmin(avail, axis=1)
+        mean = np.nanmean(avail, axis=1)
+        spread[ok] = sp
+        with np.errstate(invalid="ignore", divide="ignore"):
+            spread_rel[ok] = np.where(np.abs(mean) > 1e-12, sp / mean, np.nan)
+    # No record at all (feature not in the extraction grid) is "unknown", not "zero
+    # peaks" — leave every column NaN for the imputer.
+    n_peaks[~have] = np.nan
+
+    df = df.copy()
+    df["isotope_ccs_n_peaks"] = n_peaks
+    df["isotope_ccs_spread"] = spread
+    df["isotope_ccs_spread_rel"] = spread_rel
+    # Diagnostic columns (not ranker features): the per-isotopologue observed CCS that
+    # fed the spread, masked to the peaks that counted as present, plus the raw M0
+    # intensity.  Used by debug_viz.plot_isotope_ccs_consistency and written to
+    # 13_debug_features.tsv, exactly like im2deep_observed_ccs.
+    masked_ccs = np.where(present, ccs, np.nan)
+    for k in (0, 1, 2):
+        df[f"isotope_ccs_m{k}"] = masked_ccs[:, k]
+    df["isotope_ccs_int_m0"] = ints[:, 0]
+    logger.info(
+        "Isotope-envelope CCS consistency: %d/%d candidates with >=2 envelope peaks "
+        "(mean n_peaks %.2f)",
+        int(np.nansum(ok)), n, float(np.nanmean(n_peaks)) if have.any() else float("nan"),
+    )
+    return df
+
+
 def compute_lcms_ccs_features(
     df: pd.DataFrame,
     observed_ccs_per_feature: dict | None = None,

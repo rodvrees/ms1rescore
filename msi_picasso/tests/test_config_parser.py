@@ -111,3 +111,20 @@ def test_dict_source_overrides(tmp_path):
     config = parse_configurations([override])["MSI-PICASSO"]
     assert config["n_interaction_features"] == 3
     assert config["model"] == "lda"
+
+
+def test_isotope_ccs_min_peak_frac_default_and_override(tmp_path):
+    config = parse_configurations()["MSI-PICASSO"]
+    assert config["isotope_ccs_min_peak_frac"] == pytest.approx(0.0)
+
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("[MSI-PICASSO]\nisotope_ccs_min_peak_frac = 0.05\n")
+    config = parse_configurations([str(toml)])["MSI-PICASSO"]
+    assert config["isotope_ccs_min_peak_frac"] == pytest.approx(0.05)
+
+
+def test_negative_isotope_ccs_min_peak_frac_rejected(tmp_path):
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("[MSI-PICASSO]\nisotope_ccs_min_peak_frac = -0.1\n")
+    with pytest.raises(Exception):
+        parse_configurations([str(toml)])

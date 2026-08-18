@@ -24,6 +24,7 @@ from msi_picasso.maldi_features import (
     compute_chca_cluster_features,
     compute_colocalization_features,
     compute_im2deep_features,
+    compute_isotope_ccs_consistency_features,
     compute_lcms_ccs_features,
     compute_isotopologue_colocalization,
     compute_maldi_ionization_features,
@@ -84,6 +85,10 @@ MALDI_INTRINSIC_FEATURES = [
     # methods they supplement them.
     "im2deep_delta_ccs_resid", "im2deep_abs_delta_ccs_pct_resid",
     "im2deep_ccs_zscore_resid", "im2deep_ccs_rank_resid",
+    # isotope-envelope CCS consistency — optional, requires raw-query observed CCS at
+    # M0/M+1/M+2.  Observation-only (no predicted CCS), so no m/z-baseline leak; the
+    # CCS analogue of IsoMobil's IPMV against isobaric mass coincidence.
+    "isotope_ccs_n_peaks", "isotope_ccs_spread", "isotope_ccs_spread_rel",
     # --- isotopologue co-localization (E1) — optional, requires ion_images ---
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
     "isotope_image_colocalization_mean",
@@ -314,6 +319,12 @@ _CCS_FEATS = frozenset([
     "im2deep_delta_ccs_resid", "im2deep_abs_delta_ccs_pct_resid",
     "im2deep_ccs_zscore_resid", "im2deep_ccs_rank_resid",
 ])
+# Isotope-envelope CCS consistency: available exactly when observed CCS is (both come
+# from the same raw-query ion-mobility pass), so gated on has_ccs.  Deliberately a
+# separate set from _CCS_FEATS: these read only observed peaks, never a prediction.
+_ISOTOPE_CCS_FEATS = frozenset([
+    "isotope_ccs_n_peaks", "isotope_ccs_spread", "isotope_ccs_spread_rel",
+])
 _ISOTOPOLOGUE_COLOC_FEATS = frozenset([
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
     "isotope_image_colocalization_mean",
@@ -355,6 +366,7 @@ def get_feature_names(
         and (f not in _ADDUCT_COLOC_FEATS or has_ion_images)
         and (f not in _PIXEL_FEATS or has_pixel_coords)
         and (f not in _CCS_FEATS or has_ccs)
+        and (f not in _ISOTOPE_CCS_FEATS or has_ccs)
         and (f not in _MOB_COLOC_FEATS or has_mob_coloc)
     ]
     return intrinsic + LCMS_PRIOR_FEATURES
@@ -398,6 +410,8 @@ def compute_all_features(
     pixel_coords: np.ndarray | None = None,
     maldi_mzs: np.ndarray | None = None,
     observed_ccs_per_feature: dict | None = None,
+    observed_envelope_ccs: dict | None = None,
+    isotope_ccs_min_peak_frac: float = 0.0,
     im2deep_calibration: str = "linear",
     im2deep_kwargs: dict | None = None,
     coloc_tic_quantile: float = 0.0,
@@ -435,6 +449,9 @@ def compute_all_features(
         for A3 if pixel_coords is provided).
     observed_ccs_per_feature
         Dict mapping feature_idx → observed CCS value for IM2Deep features (optional).
+    observed_envelope_ccs
+        Dict mapping feature_idx → (ccs_m0, ccs_m1, ccs_m2, int_m0, int_m1, int_m2)
+        for the isotope-envelope CCS consistency features (optional, raw-query only).
 
     Returns
     -------
@@ -514,6 +531,15 @@ def compute_all_features(
             observed_ccs_per_feature=observed_ccs_per_feature,
             calibration_method=im2deep_calibration,
             im2deep_kwargs=im2deep_kwargs,
+        )
+
+    # --- Isotope-envelope CCS consistency (optional, raw-query + ion mobility) ---
+    if observed_envelope_ccs is not None:
+        logger.debug("Computing isotope-envelope CCS consistency features")
+        df = compute_isotope_ccs_consistency_features(
+            df,
+            observed_envelope_ccs=observed_envelope_ccs,
+            isotope_ccs_min_peak_frac=isotope_ccs_min_peak_frac,
         )
 
     # --- Spatial (optional) ---

@@ -198,19 +198,21 @@ class TestExtractObservedFeatureStatsGraceful:
         # Setting the submodule to None makes `import alphatims.bruker` raise ImportError.
         monkeypatch.setitem(sys.modules, "alphatims.bruker", None)
         query = np.array([800.0, 900.0, 1000.0], dtype=np.float64)
-        ccs, centroid, peak_quality = maldi_query.extract_observed_feature_stats_raw(
+        ccs, centroid, peak_quality, envelope = maldi_query.extract_observed_feature_stats_raw(
             "nonexistent.d", query
         )
         assert ccs.shape == (3,) and centroid.shape == (3,)
         assert np.all(np.isnan(ccs)) and np.all(np.isnan(centroid))
         assert peak_quality is None
+        assert envelope is None
 
     def test_empty_query_returns_empty(self):
-        ccs, centroid, peak_quality = maldi_query.extract_observed_feature_stats_raw(
+        ccs, centroid, peak_quality, envelope = maldi_query.extract_observed_feature_stats_raw(
             "nonexistent.d", np.array([])
         )
         assert ccs.shape == (0,) and centroid.shape == (0,)
         assert peak_quality is None
+        assert envelope is None
 
 
 class TestPeakQualityInWindows:

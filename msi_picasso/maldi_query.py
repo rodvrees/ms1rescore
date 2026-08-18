@@ -25,6 +25,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from msi_picasso.utils import NEUTRON
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,7 +36,8 @@ def _weighted_mean_in_windows(
     values: np.ndarray,
     query_mzs: np.ndarray,
     ppm: float,
-) -> np.ndarray:
+    return_weight: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Intensity-weighted mean of ``values`` per query m/z window.
 
     For each query m/z ``q`` the window is ``[q*(1-ppm), q*(1+ppm)]``; every peak
@@ -43,6 +46,11 @@ def _weighted_mean_in_windows(
     Used with ``values = mobility`` (mean 1/K0) and with ``values = peak m/z``
     (the intensity-weighted observed peak centroid m/z).  Returns an array
     aligned with ``query_mzs``; entries with no signal are ``NaN``.
+
+    With ``return_weight=True`` the total in-window intensity ``Σint`` is returned
+    alongside the mean as ``(mean, intensity_sum)`` — used by the isotope-envelope
+    CCS consistency feature, which needs both the observed CCS and the integrated
+    intensity of each envelope peak.
 
     Pure / vectorised — unit-testable without alphatims or a real ``.d``.  A peak
     may fall in more than one window when query m/z are closer than the ppm
@@ -53,7 +61,7 @@ def _weighted_mean_in_windows(
     wsum = np.zeros(n, dtype=np.float64)
     isum = np.zeros(n, dtype=np.float64)
     if len(peak_mzs) == 0 or n == 0:
-        return np.full(n, np.nan)
+        return (np.full(n, np.nan), isum) if return_weight else np.full(n, np.nan)
 
     peak_mzs = np.asarray(peak_mzs, dtype=np.float64)
     peak_ints = np.asarray(peak_ints, dtype=np.float64)
@@ -66,7 +74,7 @@ def _weighted_mean_in_windows(
     counts = np.clip(hi - lo, 0, None).astype(np.int64)
     total = int(counts.sum())
     if total == 0:
-        return np.full(n, np.nan)
+        return (np.full(n, np.nan), isum) if return_weight else np.full(n, np.nan)
 
     # Expand (peak, window) pairs without a Python loop.
     peak_rep = np.repeat(np.arange(len(peak_mzs)), counts)
@@ -79,7 +87,7 @@ def _weighted_mean_in_windows(
     out = np.full(n, np.nan)
     nz = isum > 0
     out[nz] = wsum[nz] / isum[nz]
-    return out
+    return (out, isum) if return_weight else out
 
 
 # Backwards-compatible alias: mean 1/K0 is just a weighted mean with values = mobility.
@@ -201,8 +209,8 @@ def extract_observed_feature_stats_raw(
     charge: int = 1,
     mob_quality_window_ppm: float = 25.0,
     mob_quality_k0_tol: float = 0.02,
-) -> tuple[np.ndarray, np.ndarray, dict | None]:
-    """Observed per-candidate ``(CCS, peak-centroid m/z, peak_quality)`` from the raw ``.d``.
+) -> tuple[np.ndarray, np.ndarray, dict | None, dict | None]:
+    """Observed per-candidate ``(CCS, peak-centroid m/z, peak_quality, envelope)`` from the raw ``.d``.
 
     A single ``alphatims`` pass collects every peak inside a ``query_mzs`` window
     (±``extraction_ppm``) across all MALDI pixels, then computes two
@@ -215,20 +223,30 @@ def extract_observed_feature_stats_raw(
       ``maldi_imzml.one_over_k0_to_ccs`` (N2 drift gas, charge 1 for [M+H]+).
       ``NaN`` when the dataset has no ion-mobility dimension.
 
-    Additionally, when the dataset has ion mobility, ``peak_quality`` is a dict of four
-    intrinsic joint-space peak-quality descriptors (see :func:`_peak_quality_in_windows`),
-    each aligned 1:1 with ``query_mzs``; it is ``None`` without a TIMS dimension or when
-    ``alphatims`` is unavailable.
+    Additionally, when the dataset has ion mobility:
 
-    Returns ``(ccs, centroid_mz, peak_quality)``, the arrays aligned 1:1 with ``query_mzs``
-    with ``NaN`` where no signal.  ``ccs``/``centroid_mz`` are all-``NaN`` (with a warning)
-    when ``alphatims`` is unavailable.
+    - ``peak_quality`` is a dict of four intrinsic joint-space peak-quality descriptors
+      (see :func:`_peak_quality_in_windows`), each aligned 1:1 with ``query_mzs``.
+    - ``envelope`` is a dict with keys ``ccs_m0``/``ccs_m1``/``ccs_m2`` and
+      ``int_m0``/``int_m1``/``int_m2``, holding the observed CCS and integrated
+      intensity of the three singly-charged isotopologue positions
+      ``query_mz + k * NEUTRON``.  Real isotopologues of one molecule share a CCS;
+      a chimeric envelope (isobaric mass coincidence) does not, so the spread of
+      these three CCS values is the isotope-envelope CCS-consistency feature (the
+      CCS analogue of IsoMobil's IPMV).  Uses only observed peaks — no predicted
+      CCS enters, so there is no m/z-baseline leak.
+
+    Both are ``None`` without a TIMS dimension or when ``alphatims`` is unavailable.
+
+    Returns ``(ccs, centroid_mz, peak_quality, envelope)``, the arrays aligned 1:1 with
+    ``query_mzs`` with ``NaN`` where no signal.  ``ccs``/``centroid_mz`` are all-``NaN``
+    (with a warning) when ``alphatims`` is unavailable.
     """
     query_mzs = np.asarray(query_mzs, dtype=np.float64)
     n = len(query_mzs)
     nan_result = np.full(n, np.nan)
     if n == 0:
-        return nan_result, nan_result, None
+        return nan_result, nan_result, None, None
 
     try:
         import alphatims.bruker as atb
@@ -239,7 +257,7 @@ def extract_observed_feature_stats_raw(
             "Install with: pip install alphatims",
             d_path,
         )
-        return nan_result, nan_result, None
+        return nan_result, nan_result, None, None
 
     logger.info("Extracting observed peak centroids + CCS from raw .d via alphatims: %s", d_path)
     tims = atb.TimsTOF(str(d_path))
@@ -260,14 +278,19 @@ def extract_observed_feature_stats_raw(
     mz_arr_np = np.asarray(tims.mz_values, dtype=np.float64)  # per-TOF-bin m/z
     tof_max_idx = int(tims.tof_max_index)
 
-    # Mark every TOF bin inside any query window (typically 1-3% of bins).
+    # Mark every TOF bin inside any query window (typically 1-3% of bins).  With ion
+    # mobility the M+1/M+2 isotopologue windows are marked too, so the same single pass
+    # feeds the isotope-envelope CCS consistency feature.  The windows are ppm-wide and
+    # ~1 Da apart, so they never overlap and the M0 statistics are unaffected.
     ppm_f = extraction_ppm * 1e-6
+    envelope_ks = (0, 1, 2) if has_mobility else (0,)
     relevant_tof = np.zeros(tof_max_idx, dtype=np.bool_)
-    for qmz in query_mzs:
-        lo = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 - ppm_f)), "left"))
-        hi = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 + ppm_f)), "right"))
-        if lo < hi:
-            relevant_tof[lo:hi] = True
+    for k in envelope_ks:
+        for qmz in query_mzs + k * NEUTRON:
+            lo = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 - ppm_f)), "left"))
+            hi = int(np.searchsorted(mz_arr_np, float(qmz * (1.0 + ppm_f)), "right"))
+            if lo < hi:
+                relevant_tof[lo:hi] = True
 
     n_peaks = len(tof_idx_np)
     coll_mz: list[np.ndarray] = []
@@ -295,7 +318,7 @@ def extract_observed_feature_stats_raw(
             "observed CCS and peak centroids all-NaN.",
             d_path,
         )
-        return nan_result, nan_result, None
+        return nan_result, nan_result, None, None
 
     peak_mzs = np.concatenate(coll_mz)
     peak_ints = np.concatenate(coll_int)
@@ -306,16 +329,24 @@ def extract_observed_feature_stats_raw(
     )
 
     peak_quality = None
+    envelope = None
     if has_mobility:
         peak_mob = mob_arr[np.concatenate(coll_scan)]
-        mean_inv_k0 = _weighted_mean_in_windows(
-            peak_mzs, peak_ints, peak_mob, query_mzs, extraction_ppm
-        )
         from msi_picasso.maldi_imzml import one_over_k0_to_ccs
 
-        ccs = np.asarray(
-            one_over_k0_to_ccs(mean_inv_k0, query_mzs, charge=charge), dtype=np.float64
-        )
+        # Observed CCS + integrated intensity at each singly-charged isotopologue
+        # position.  k == 0 is the M0 anchor, so `ccs` is just the k == 0 slice.
+        envelope = {}
+        for k in envelope_ks:
+            mz_k = query_mzs + k * NEUTRON
+            mean_inv_k0, int_k = _weighted_mean_in_windows(
+                peak_mzs, peak_ints, peak_mob, mz_k, extraction_ppm, return_weight=True
+            )
+            envelope[f"ccs_m{k}"] = np.asarray(
+                one_over_k0_to_ccs(mean_inv_k0, mz_k, charge=charge), dtype=np.float64
+            )
+            envelope[f"int_m{k}"] = int_k
+        ccs = envelope["ccs_m0"]
         # Intrinsic joint (m/z, intensity, 1/K0) peak-quality descriptors.
         peak_quality = _peak_quality_in_windows(
             peak_mzs, peak_ints, peak_mob, query_mzs,
@@ -328,7 +359,13 @@ def extract_observed_feature_stats_raw(
         "  Observed peak centroid for %d/%d features; observed CCS for %d/%d.",
         int(np.isfinite(centroid_mz).sum()), n, int(np.isfinite(ccs).sum()), n,
     )
-    return ccs, centroid_mz, peak_quality
+    if envelope is not None:
+        logger.info(
+            "  Isotope-envelope observed CCS: M0 %d/%d, M+1 %d/%d, M+2 %d/%d features.",
+            *[x for k in (0, 1, 2)
+              for x in (int(np.isfinite(envelope[f"ccs_m{k}"]).sum()), n)],
+        )
+    return ccs, centroid_mz, peak_quality, envelope
 
 
 def query_raw_maldi(

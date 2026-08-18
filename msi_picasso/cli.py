@@ -1225,6 +1225,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rescore_grp.add_argument(
+        "--isotope-ccs-min-peak-frac",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "Raw-query only: minimum M+1/M+2 integrated intensity, as a fraction of the "
+            "M0 intensity, for an isotopologue peak to count toward the isotope-envelope "
+            "CCS consistency features (isotope_ccs_n_peaks, isotope_ccs_spread, "
+            "isotope_ccs_spread_rel). Default 0.0 (any nonzero peak counts)."
+        ),
+    )
+    rescore_grp.add_argument(
         "--coloc-tic-quantile",
         type=float,
         default=None,
@@ -1505,6 +1517,7 @@ def main() -> None:
         "rt_window_multiplier", "lcms_prior_weight", "spatial_prior_weight",
         "match_ccs", "ccs_window_multiplier", "mob_coloc", "mob_protein_coloc", "mob_window_multiplier",
         "mob_quality_mz_window_ppm", "mob_quality_k0_tol",
+        "isotope_ccs_min_peak_frac",
         "coloc_tic_quantile", "region_coloc", "region_coloc_k", "within_region_coloc",
         "coloc_tic_normalize", "coloc_common_mode",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
@@ -1976,6 +1989,7 @@ def main() -> None:
         mob_window_multiplier=_ms1cfg["mob_window_multiplier"],
         mob_quality_mz_window_ppm=_ms1cfg["mob_quality_mz_window_ppm"],
         mob_quality_k0_tol=_ms1cfg["mob_quality_k0_tol"],
+        isotope_ccs_min_peak_frac=_ms1cfg["isotope_ccs_min_peak_frac"],
         coloc_tic_quantile=_ms1cfg["coloc_tic_quantile"],
         coloc_measured_pixel_mask=_measured_pixel_mask,
         coloc_tic_normalize=bool(_ms1cfg.get("coloc_tic_normalize", False)),

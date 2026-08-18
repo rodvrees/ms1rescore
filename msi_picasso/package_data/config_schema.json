@@ -132,6 +132,7 @@
         "mob_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
         "mob_quality_mz_window_ppm": {"type": ["number", "null"], "exclusiveMinimum": 0},
         "mob_quality_k0_tol":     {"type": ["number", "null"], "exclusiveMinimum": 0},
+        "isotope_ccs_min_peak_frac": {"type": ["number", "null"], "minimum": 0},
         "coloc_tic_quantile":     {"type": ["number", "null"], "minimum": 0, "exclusiveMaximum": 1},
         "region_coloc":           {"type": ["boolean", "null"]},
         "region_coloc_k":         {"type": ["integer", "null"], "minimum": 2},

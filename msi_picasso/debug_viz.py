@@ -17,6 +17,7 @@ Fourteen subsystems:
  13. Pearson r distribution    — same-protein vs different-protein ion image Pearson r at 5% FDR
  14. Protein spatial coherence — per-protein peptide count vs mean ion image Pearson r at 5% FDR
  15. Region ion-image panels   — per-protein ion images + region overlay + profile bar (region-coloc debug folder)
+ 16. Isotope-envelope CCS      — spread by class, per-feature CCS profiles, spread vs intensity, peak counts
 
 Entry point: save_debug_figures()
 """
@@ -3610,6 +3611,181 @@ def plot_mz_mobility_intensity_scatter(
 
 
 # ---------------------------------------------------------------------------
+# Subsystem 16: Isotope-envelope CCS consistency
+# ---------------------------------------------------------------------------
+
+
+def plot_isotope_ccs_consistency(
+    features_df: pd.DataFrame,
+    output_path: str,
+    n_profiles: int = 12,
+    seed: int = 42,
+) -> None:
+    """
+    Four-panel diagnostic for the isotope-envelope CCS consistency features.
+
+    Real singly-charged isotopologues of one molecule share a CCS; a chimeric
+    envelope (isobaric mass coincidence) does not.  ``isotope_ccs_spread`` is the
+    CCS analogue of IsoMobil's IPMV, and these panels show whether it separates
+    targets from decoys without being an intensity proxy.
+
+    A. Spread distribution by class (targets vs decoys, rows with >= 2 peaks),
+       titled with the target-vs-decoy AUC — the headline discrimination view.
+    B. Envelope CCS profiles for up to ``n_profiles`` features: observed CCS at
+       isotopologue index 0/1/2.  Flat = consistent envelope, sloped/jagged =
+       chimera.  A co-located decoy on the same feature is overlaid when present.
+    C. ``isotope_ccs_spread`` vs log10(I_0), coloured by class — the feature must
+       not be a mere intensity proxy.
+    D. ``isotope_ccs_n_peaks`` distribution (0-3) split by class.
+
+    Silently skips when the columns are absent (feature-list mode, TSF, or no TIMS
+    dimension).  Saved to ``output_path``.
+    """
+    if "isotope_ccs_spread" not in features_df.columns:
+        return
+    if "isotope_ccs_n_peaks" not in features_df.columns:
+        return
+
+    feat = features_df.reset_index(drop=True)
+    spread = pd.to_numeric(feat["isotope_ccs_spread"], errors="coerce").values
+    n_peaks = pd.to_numeric(feat["isotope_ccs_n_peaks"], errors="coerce").values
+    is_decoy = (
+        feat.get("is_decoy", pd.Series(False, index=feat.index))
+        .fillna(False).astype(bool).values
+    )
+    if not np.isfinite(spread).any():
+        logger.debug("plot_isotope_ccs_consistency: no finite spread values, skipping")
+        return
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    T_COLOR, D_COLOR = "steelblue", "tomato"
+
+    fig = plt.figure(figsize=(14, 10))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.25)
+
+    # ---- Panel A: spread distribution by class ----
+    ax = fig.add_subplot(gs[0, 0])
+    fin = np.isfinite(spread)
+    t_sp, d_sp = spread[fin & ~is_decoy], spread[fin & is_decoy]
+    auc = float("nan")
+    if len(t_sp) >= 5 and len(d_sp) >= 5:
+        from sklearn.metrics import roc_auc_score
+        auc = float(roc_auc_score(is_decoy[fin].astype(int), spread[fin]))
+    if fin.any():
+        hi = float(np.percentile(spread[fin], 99))
+        bins = np.linspace(0.0, max(hi, 1e-6), 50)
+        if len(t_sp):
+            ax.hist(t_sp, bins=bins, alpha=0.55, color=T_COLOR, density=True,
+                    label=f"Target (n={len(t_sp)})")
+        if len(d_sp):
+            ax.hist(d_sp, bins=bins, alpha=0.55, color=D_COLOR, density=True,
+                    label=f"Decoy (n={len(d_sp)})")
+    _auc_str = "n/a" if not np.isfinite(auc) else f"{auc:.3f}"
+    ax.set_xlabel("isotope_ccs_spread (Å²)", fontsize=10)
+    ax.set_ylabel("density", fontsize=10)
+    ax.set_title(
+        f"A. Envelope CCS spread by class (n_peaks ≥ 2)\ntarget-vs-decoy AUC = {_auc_str}",
+        fontsize=10,
+    )
+    ax.legend(fontsize=8)
+    ax.tick_params(labelsize=8)
+
+    # ---- Panel B: envelope CCS profiles ----
+    ax_b = fig.add_subplot(gs[0, 1])
+    ax_b.axis("off")
+    ccs_cols = [f"isotope_ccs_m{k}" for k in (0, 1, 2)]
+    if all(c in feat.columns for c in ccs_cols) and "feature_mz" in feat.columns:
+        prof = feat[ccs_cols].apply(pd.to_numeric, errors="coerce").values
+        fmz = pd.to_numeric(feat["feature_mz"], errors="coerce").values
+        # Prefer features whose target has a measurable (>= 2 peak) envelope.
+        cand = np.where(np.isfinite(spread) & ~is_decoy)[0]
+        if len(cand) == 0:
+            cand = np.where(np.isfinite(spread))[0]
+        if len(cand):
+            rng = np.random.default_rng(seed)
+            pick = cand if len(cand) <= n_profiles else rng.choice(
+                cand, size=n_profiles, replace=False
+            )
+            pick = pick[np.argsort(fmz[pick])]
+            ncol = 4
+            nrow = int(np.ceil(len(pick) / ncol))
+            inner = gridspec.GridSpecFromSubplotSpec(
+                nrow, ncol, subplot_spec=gs[0, 1], hspace=0.75, wspace=0.45
+            )
+            for j, i in enumerate(pick):
+                sub = fig.add_subplot(inner[j // ncol, j % ncol])
+                sub.plot([0, 1, 2], prof[i], "o-", color=T_COLOR, ms=4, lw=1.2)
+                lab = f"{fmz[i]:.3f}\nT {spread[i]:.1f}"
+                # Co-located decoy on the identical feature (mz_shuffle-style nulls).
+                co = np.where((fmz == fmz[i]) & is_decoy)[0]
+                if len(co):
+                    c = co[0]
+                    sub.plot([0, 1, 2], prof[c], "s--", color=D_COLOR, ms=4, lw=1.2)
+                    lab += f" | D {spread[c]:.1f}"
+                sub.set_title(lab, fontsize=6)
+                sub.set_xticks([0, 1, 2])
+                sub.tick_params(labelsize=5)
+            fig.text(
+                0.74, 0.955,
+                "B. Envelope CCS profiles (x = isotopologue k, y = observed CCS Å²)",
+                fontsize=10, ha="center",
+            )
+
+    # ---- Panel C: spread vs log10(I_0) ----
+    ax = fig.add_subplot(gs[1, 0])
+    if "isotope_ccs_int_m0" in feat.columns:
+        i0 = pd.to_numeric(feat["isotope_ccs_int_m0"], errors="coerce").values
+        m = np.isfinite(spread) & np.isfinite(i0) & (i0 > 0)
+        if m.any():
+            li0 = np.log10(i0[m])
+            sp_m, dec_m = spread[m], is_decoy[m]
+            ax.scatter(li0[~dec_m], sp_m[~dec_m], s=7, alpha=0.35, color=T_COLOR,
+                       linewidths=0, label="Target")
+            ax.scatter(li0[dec_m], sp_m[dec_m], s=7, alpha=0.35, color=D_COLOR,
+                       linewidths=0, label="Decoy")
+            r = (float(np.corrcoef(li0, sp_m)[0, 1])
+                 if len(li0) > 1 and np.std(li0) > 0 and np.std(sp_m) > 0
+                 else float("nan"))
+            ax.set_title(
+                f"C. Spread vs M0 intensity (r = {r:.3f})\nnot an intensity proxy if |r| is small",
+                fontsize=10,
+            )
+            ax.legend(fontsize=8, markerscale=2)
+    else:
+        ax.set_title("C. Spread vs M0 intensity (isotope_ccs_int_m0 absent)", fontsize=10)
+    ax.set_xlabel("log₁₀(I₀)", fontsize=10)
+    ax.set_ylabel("isotope_ccs_spread (Å²)", fontsize=10)
+    ax.tick_params(labelsize=8)
+
+    # ---- Panel D: peak-count distribution ----
+    ax = fig.add_subplot(gs[1, 1])
+    levels = [0, 1, 2, 3]
+    width = 0.38
+    x = np.arange(len(levels))
+    for off, mask, color, name in [
+        (-width / 2, ~is_decoy, T_COLOR, "Target"),
+        (+width / 2, is_decoy, D_COLOR, "Decoy"),
+    ]:
+        vals = n_peaks[mask & np.isfinite(n_peaks)]
+        counts = [int((vals == lv).sum()) for lv in levels]
+        frac = np.array(counts, dtype=float) / max(len(vals), 1)
+        ax.bar(x + off, frac, width=width, color=color, alpha=0.75,
+               label=f"{name} (n={len(vals)})")
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(lv) for lv in levels])
+    ax.set_xlabel("isotope_ccs_n_peaks", fontsize=10)
+    ax.set_ylabel("fraction of class", fontsize=10)
+    ax.set_title("D. Envelope peak-count distribution", fontsize=10)
+    ax.legend(fontsize=8)
+    ax.tick_params(labelsize=8)
+
+    fig.suptitle("Isotope-envelope CCS consistency (IsoMobil-style IPMV in CCS units)",
+                 fontsize=12)
+    _save_and_close(fig, output_path)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -3874,6 +4050,19 @@ def save_debug_figures(
             logger.info("CCS scatter saved to %s/ccs_scatter.png", debug_dir)
     except Exception as exc:
         logger.warning("CCS scatter failed: %s", exc)
+
+    try:
+        plot_isotope_ccs_consistency(
+            features_df,
+            output_path=os.path.join(debug_dir, "isotope_ccs_consistency.png"),
+        )
+        if "isotope_ccs_spread" in features_df.columns:
+            logger.info(
+                "Isotope-envelope CCS consistency saved to %s/isotope_ccs_consistency.png",
+                debug_dir,
+            )
+    except Exception as exc:
+        logger.warning("Isotope-envelope CCS consistency figure failed: %s", exc)
 
     try:
         plot_mz_mobility_intensity_scatter(features_df, out_dir=debug_dir)

@@ -153,6 +153,40 @@ def _mob_hist_by_feature_idx(
     return hist_map or None
 
 
+def _observed_envelope_ccs_by_feature_idx(
+    candidates: pd.DataFrame,
+    maldi_mzs: np.ndarray,
+    envelope: dict | None,
+) -> dict | None:
+    """Build an ``observed_envelope_ccs`` dict keyed by candidate ``feature_idx``.
+
+    ``envelope`` is the dict returned by
+    ``maldi_query.extract_observed_feature_stats_raw`` (keys ``ccs_m0``/``ccs_m1``/
+    ``ccs_m2`` and ``int_m0``/``int_m1``/``int_m2``, each aligned with the queried
+    ``maldi_mzs`` grid).  Bridged to candidate ``feature_idx`` via ``feature_mz``
+    exactly like :func:`_observed_ccs_by_feature_idx`, because in raw-query mode
+    ``feature_idx`` indexes the digest grid rather than ``maldi_mzs``.  Each value is
+    the 6-element record ``(ccs_m0, ccs_m1, ccs_m2, int_m0, int_m1, int_m2)`` consumed
+    by ``maldi_features.compute_isotope_ccs_consistency_features``.  Returns ``None``
+    when the envelope is unavailable (no TIMS dimension / no alphatims).
+    """
+    if not envelope:
+        return None
+    rows = np.column_stack(
+        [envelope[f"ccs_m{k}"] for k in (0, 1, 2)]
+        + [envelope[f"int_m{k}"] for k in (0, 1, 2)]
+    ).astype(float)
+    mz_to_row = {float(m): i for i, m in enumerate(np.asarray(maldi_mzs))}
+    env_map = {
+        int(fi): rows[mz_to_row[float(mz)]]
+        for fi, mz in candidates[["feature_idx", "feature_mz"]]
+        .drop_duplicates()
+        .itertuples(index=False)
+        if float(mz) in mz_to_row
+    }
+    return env_map or None
+
+
 def _recompute_ppm_from_centroids(
     feature_mz: np.ndarray,
     maldi_mzs: np.ndarray,
@@ -1567,6 +1601,7 @@ def rescore(
     extraction_ppm: float = 25.0,
     mob_quality_mz_window_ppm: float = 25.0,
     mob_quality_k0_tol: float = 0.02,
+    isotope_ccs_min_peak_frac: float = 0.0,
     msf_path: str | None = None,
     ppm_tolerance: float = 20.0,
     init_fdr: float = 0.2,
@@ -2278,6 +2313,7 @@ def rescore(
     # candidates["feature_mz"] now holds every queried m/z (for mz_shift decoys
     # this is the shifted anchor).  Extract directly from the raw .d, then attach
     # the freshly computed per-feature intensities back onto the candidate rows.
+    observed_envelope_ccs = None
     if maldi_query_raw:
         from msi_picasso.maldi_query import (
             extract_observed_feature_stats_raw,
@@ -2308,6 +2344,7 @@ def rescore(
             _ccs_arr = raw_query_cache["ccs_arr"]
             _centroid_arr = raw_query_cache["centroid_arr"]
             _peak_quality = raw_query_cache.get("peak_quality")
+            _envelope_ccs = raw_query_cache.get("envelope_ccs")
             ion_image_mzs = maldi_mzs
             logger.info(
                 "Raw-query mode: reusing cached extraction (%d grid ion images) "
@@ -2324,7 +2361,7 @@ def rescore(
             ion_image_mzs = maldi_mzs
             # Observed peak centroids + CCS from the raw .d (alphatims). imzy exposes
             # neither, so the .d is opened a second time here.
-            _ccs_arr, _centroid_arr, _peak_quality = extract_observed_feature_stats_raw(
+            _ccs_arr, _centroid_arr, _peak_quality, _envelope_ccs = extract_observed_feature_stats_raw(
                 maldi_d_path, maldi_mzs, extraction_ppm=extraction_ppm,
                 mob_quality_window_ppm=mob_quality_mz_window_ppm,
                 mob_quality_k0_tol=mob_quality_k0_tol,
@@ -2338,7 +2375,7 @@ def rescore(
                     maldi_mzs=maldi_mzs, ion_images=ion_images,
                     extra_ion_images=extra_ion_images, spatial_features=spatial_features,
                     maldi_envelopes=maldi_envelopes, ccs_arr=_ccs_arr, centroid_arr=_centroid_arr,
-                    peak_quality=_peak_quality,
+                    peak_quality=_peak_quality, envelope_ccs=_envelope_ccs,
                 )
 
         # Attach per-feature intensities (mapped by m/z) onto the candidate rows.
@@ -2407,6 +2444,17 @@ def rescore(
         logger.info(
             "Raw-query mode: observed CCS available for %d features.",
             0 if observed_ccs_per_feature is None else len(observed_ccs_per_feature),
+        )
+
+        # Observed CCS + integrated intensity at M0/M+1/M+2, keyed the same way, for
+        # the isotope-envelope CCS consistency features.  Uses only observed peaks
+        # (never the candidate's predicted CCS), so it is symmetric by construction.
+        observed_envelope_ccs = _observed_envelope_ccs_by_feature_idx(
+            candidates, maldi_mzs, _envelope_ccs
+        )
+        logger.info(
+            "Raw-query mode: isotope-envelope observed CCS available for %d features.",
+            0 if observed_envelope_ccs is None else len(observed_envelope_ccs),
         )
 
     # --- Select calibration peptides (DeepLC / IM2Deep finetuning anchors) ---
@@ -2598,6 +2646,8 @@ def rescore(
         extra_ion_images=extra_ion_images,
         maldi_envelopes=maldi_envelopes,
         observed_ccs_per_feature=observed_ccs_per_feature,
+        observed_envelope_ccs=observed_envelope_ccs,
+        isotope_ccs_min_peak_frac=isotope_ccs_min_peak_frac,
         im2deep_calibration=im2deep_calibration,
         im2deep_kwargs=im2deep_kwargs,
         coloc_tic_quantile=coloc_tic_quantile,
@@ -2635,6 +2685,38 @@ def rescore(
             )
         else:
             logger.info("  drop_zero_signal: no zero-signal candidates found.")
+
+    # --- Isotope-envelope CCS consistency leak check ---
+    # Mirrors the im2deep *_resid m/z-leak check (maldi_features.compute_im2deep_features).
+    # isotope_ccs_spread uses only the OBSERVED CCS of three peaks within ~2 Da of each
+    # other, so it must not track how far a decoy's anchor was moved in m/z: the
+    # correlation with decoy_delta_da should be ~0.  The target-vs-decoy AUC is the
+    # useful signal (> 0.5 = decoys have chimeric/empty envelopes); it is ~0.5 for
+    # co-located decoys (mz_shuffle), where target and decoy share the same feature and
+    # therefore the identical envelope CCS — which is why these features are NOT in
+    # _MZ_SHUFFLE_CCS_LEAK_FEATURES.
+    if "isotope_ccs_spread" in features_df.columns and "is_decoy" in features_df.columns:
+        _sp = features_df["isotope_ccs_spread"].to_numpy(dtype=float)
+        _dec = features_df["is_decoy"].astype(bool).to_numpy()
+        _fin = np.isfinite(_sp)
+        _auc = float("nan")
+        if _fin.sum() >= 10 and _dec[_fin].any() and (~_dec[_fin]).any():
+            from sklearn.metrics import roc_auc_score
+            _auc = float(roc_auc_score(_dec[_fin].astype(int), _sp[_fin]))
+        _corr = float("nan")
+        if "decoy_delta_da" in features_df.columns:
+            _dd = np.abs(features_df["decoy_delta_da"].to_numpy(dtype=float))
+            _m = _fin & _dec & np.isfinite(_dd) & (_dd > 0)
+            if _m.sum() >= 10 and np.std(_sp[_m]) > 1e-12 and np.std(_dd[_m]) > 1e-12:
+                _corr = float(abs(np.corrcoef(_sp[_m], _dd[_m])[0, 1]))
+        _fmt = lambda x: "n/a" if not np.isfinite(x) else f"{x:.3f}"
+        logger.info(
+            "  Isotope-envelope CCS leak check (n=%d with >=2 peaks): target-vs-decoy "
+            "AUC(isotope_ccs_spread)=%s, |corr(isotope_ccs_spread, decoy_delta_da)|=%s "
+            "(expect AUC > 0.5 for a non-co-located null, corr ~ 0).",
+            int(_fin.sum()), _fmt(_auc), _fmt(_corr),
+        )
+
     # Resolve the set of features explicitly excluded from the ranker: the
     # user-supplied features_exclude plus, for mz_shuffle, the raw CCS + mobility-
     # gated colocalization features that leak the m/z baseline (see the ranker
