@@ -128,3 +128,20 @@ def test_negative_isotope_ccs_min_peak_frac_rejected(tmp_path):
     toml.write_text("[MSI-PICASSO]\nisotope_ccs_min_peak_frac = -0.1\n")
     with pytest.raises(Exception):
         parse_configurations([str(toml)])
+
+
+def test_isotope_mob_cooc_pixel_frac_default_and_override(tmp_path):
+    config = parse_configurations()["MSI-PICASSO"]
+    assert config["isotope_mob_cooc_pixel_frac"] == pytest.approx(0.1)
+
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("[MSI-PICASSO]\nisotope_mob_cooc_pixel_frac = 0.25\n")
+    config = parse_configurations([str(toml)])["MSI-PICASSO"]
+    assert config["isotope_mob_cooc_pixel_frac"] == pytest.approx(0.25)
+
+
+def test_isotope_mob_cooc_pixel_frac_above_one_rejected(tmp_path):
+    toml = tmp_path / "cfg.toml"
+    toml.write_text("[MSI-PICASSO]\nisotope_mob_cooc_pixel_frac = 1.5\n")
+    with pytest.raises(Exception):
+        parse_configurations([str(toml)])

@@ -25,6 +25,7 @@ from msi_picasso.maldi_features import (
     compute_colocalization_features,
     compute_im2deep_features,
     compute_isotope_ccs_consistency_features,
+    compute_isotope_mobility_cooccurrence_features,
     compute_lcms_ccs_features,
     compute_isotopologue_colocalization,
     compute_maldi_ionization_features,
@@ -89,6 +90,10 @@ MALDI_INTRINSIC_FEATURES = [
     # M0/M+1/M+2.  Observation-only (no predicted CCS), so no m/z-baseline leak; the
     # CCS analogue of IsoMobil's IPMV against isobaric mass coincidence.
     "isotope_ccs_n_peaks", "isotope_ccs_spread", "isotope_ccs_spread_rel",
+    # per-pixel isotope-envelope mobility co-occurrence — optional, requires raw-query
+    # ion mobility.  Fraction of M+1/M+2 intensity sharing M0's mobility band AND M0's
+    # pixels; bounded [0,1], higher = better.  Observation-only, so no m/z-baseline leak.
+    "isotope_mob_cooc_m1", "isotope_mob_cooc_m2", "isotope_mob_cooc_mean",
     # --- isotopologue co-localization (E1) — optional, requires ion_images ---
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
     "isotope_image_colocalization_mean",
@@ -324,6 +329,7 @@ _CCS_FEATS = frozenset([
 # separate set from _CCS_FEATS: these read only observed peaks, never a prediction.
 _ISOTOPE_CCS_FEATS = frozenset([
     "isotope_ccs_n_peaks", "isotope_ccs_spread", "isotope_ccs_spread_rel",
+    "isotope_mob_cooc_m1", "isotope_mob_cooc_m2", "isotope_mob_cooc_mean",
 ])
 _ISOTOPOLOGUE_COLOC_FEATS = frozenset([
     "isotope_image_colocalization_m1", "isotope_image_colocalization_m2",
@@ -411,6 +417,7 @@ def compute_all_features(
     maldi_mzs: np.ndarray | None = None,
     observed_ccs_per_feature: dict | None = None,
     observed_envelope_ccs: dict | None = None,
+    observed_envelope_cooc: dict | None = None,
     isotope_ccs_min_peak_frac: float = 0.0,
     im2deep_calibration: str = "linear",
     im2deep_kwargs: dict | None = None,
@@ -452,6 +459,9 @@ def compute_all_features(
     observed_envelope_ccs
         Dict mapping feature_idx → (ccs_m0, ccs_m1, ccs_m2, int_m0, int_m1, int_m2)
         for the isotope-envelope CCS consistency features (optional, raw-query only).
+    observed_envelope_cooc
+        Dict mapping feature_idx → (cooc_m1, cooc_m2) for the per-pixel isotope-envelope
+        mobility co-occurrence features (optional, raw-query only).
 
     Returns
     -------
@@ -540,6 +550,13 @@ def compute_all_features(
             df,
             observed_envelope_ccs=observed_envelope_ccs,
             isotope_ccs_min_peak_frac=isotope_ccs_min_peak_frac,
+        )
+
+    # --- Isotope-envelope mobility co-occurrence (optional, raw-query + ion mobility) ---
+    if observed_envelope_cooc is not None:
+        logger.debug("Computing isotope-envelope mobility co-occurrence features")
+        df = compute_isotope_mobility_cooccurrence_features(
+            df, observed_envelope_cooc=observed_envelope_cooc
         )
 
     # --- Spatial (optional) ---

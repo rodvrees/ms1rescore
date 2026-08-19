@@ -14,10 +14,12 @@ unchanged.
 
 ``extract_observed_feature_stats_raw`` is a separate companion that reads the raw
 ``.d`` via ``alphatims`` and returns, per candidate m/z, the observed peak centroid
-m/z (for a symmetric mass-accuracy ``ppm_error``) and the observed CCS (from the
-ion-mobility 1/K0).  It is separate from ``query_raw_maldi`` because ``imzy`` (used
-for the ion images) exposes neither the per-peak m/z centroid nor mobility, so the
-``.d`` must be opened a second time with ``alphatims``.
+m/z (for a symmetric mass-accuracy ``ppm_error``), the observed CCS (from the
+ion-mobility 1/K0), intrinsic 2D peak-quality descriptors, and the isotope-envelope
+statistics at M0/M+1/M+2 — including the per-pixel mobility co-occurrence fractions
+(:func:`_envelope_mobility_cooccurrence`).  It is separate from ``query_raw_maldi``
+because ``imzy`` (used for the ion images) exposes neither the per-peak m/z centroid
+nor mobility, so the ``.d`` must be opened a second time with ``alphatims``.
 """
 
 import logging
@@ -202,6 +204,152 @@ def _peak_quality_in_windows(
     return out
 
 
+# Floor on the co-occurrence lift before log2 (2**-6 = 1/64), so a window whose M+k
+# intensity is strictly anti-co-located with M0 stays finite for the StandardScaler.
+_COOC_LIFT_FLOOR = 2.0 ** -6
+
+
+def _envelope_mobility_cooccurrence(
+    peak_mzs: np.ndarray,
+    peak_ints: np.ndarray,
+    peak_mob: np.ndarray,
+    peak_frame: np.ndarray,
+    query_mzs: np.ndarray,
+    ppm: float,
+    k0_tol: float,
+    n_frames: int,
+    pixel_frac: float = 0.1,
+    chunk: int = 20_000_000,
+) -> dict[str, np.ndarray]:
+    """Fraction of M+1/M+2 intensity sharing M0's mobility band *and* M0's pixels.
+
+    For every query m/z the M0 window defines two things:
+
+    - a **mobility band** — ``|1/K0 - mean(1/K0 of M0)| <= k0_tol``.  The band is
+      centred on the intensity-weighted mean, matching
+      :func:`_peak_quality_in_windows`; on this data the mean is a better centre
+      estimate than the histogram mode (the mode's argmax is noisier at the
+      per-window intensities seen here).
+    - an **on-signal pixel set** — frames carrying at least ``pixel_frac`` of that
+      query's strongest single-frame M0 intensity.  A relative threshold, so it
+      adapts to each candidate's own dynamic range rather than a global cut.
+
+    The raw co-occurrence *fraction* does not work on this data: every window sits on
+    the same tissue at the same peptide-corridor mobility, so ~31% of any window's
+    intensity falls in M0's band and pixels by chance and targets and decoys both land
+    at ~0.31 (measured: 0.3077 vs 0.3050, AUC 0.495).  What is returned is therefore
+    the **enrichment over the independence null**
+
+        lift = P(band & pixel) / (P(band) * P(pixel))
+
+    with all three probabilities taken within the same M+k window, reported as
+    ``log2(lift)``: 0 = the isotopologue's mobility and its spatial distribution are
+    independent (diffuse background), > 0 = they co-occur, which is what a real
+    isotopologue of M0 does.  Cancelling the marginals removes the shared background
+    term that the raw fraction is dominated by.
+
+    Returns ``{"cooc_m1": ..., "cooc_m2": ...}``, each aligned 1:1 with ``query_mzs``.
+    ``NaN`` where the window has no intensity or a marginal is empty (unmeasurable,
+    left for the median imputer rather than worst-cased); the lift is floored at
+    ``_COOC_LIFT_FLOOR`` so the log stays finite.
+
+    Pure / vectorised — unit-testable without alphatims or a real ``.d``.  The
+    peak-to-window expansion is done in chunks of ``chunk`` peaks: at raw-query
+    scale the full expansion runs to billions of pairs and must never be
+    materialised at once.
+    """
+    query_mzs = np.asarray(query_mzs, dtype=np.float64)
+    n = len(query_mzs)
+    nan = np.full(n, np.nan)
+    if n == 0 or len(peak_mzs) == 0 or n_frames <= 0:
+        return {"cooc_m1": nan, "cooc_m2": nan.copy()}
+
+
+    peak_mzs = np.asarray(peak_mzs, dtype=np.float64)
+    peak_ints = np.asarray(peak_ints, dtype=np.float64)
+    peak_mob = np.asarray(peak_mob, dtype=np.float64)
+    peak_frame = np.asarray(peak_frame, dtype=np.int64)
+    n_peaks = len(peak_mzs)
+    ppm_f = ppm * 1e-6
+    nf = int(n_frames)
+
+    def _pairs(k: int, a: int, b: int):
+        """(query index, peak index) pairs for peaks[a:b] inside the k-th windows."""
+        qk = query_mzs + k * NEUTRON
+        pm = peak_mzs[a:b]
+        lo = np.searchsorted(qk, pm / (1.0 + ppm_f), "left")
+        hi = np.searchsorted(qk, pm / (1.0 - ppm_f), "right")
+        cnt = np.clip(hi - lo, 0, None).astype(np.int64)
+        total = int(cnt.sum())
+        if total == 0:
+            return None, None
+        prep = np.repeat(np.arange(a, b, dtype=np.int64), cnt)
+        starts = np.cumsum(cnt) - cnt
+        qidx = np.repeat(lo, cnt) + (np.arange(total) - np.repeat(starts, cnt))
+        return qidx, prep
+
+    # --- Pass A: M0 mobility centroid and per-(query, frame) M0 intensity ---
+    i0 = np.zeros(n)
+    k0w = np.zeros(n)
+    # ponytail: dense (n_query x n_frames) float32 M0 map — ~1 GB at raw-query scale
+    # (5 K candidates x 48 K pixels). Switch to a CSR/sparse accumulation if either
+    # the candidate count or the pixel count grows by an order of magnitude.
+    s0 = np.zeros(n * nf, dtype=np.float32)  # freed below
+    for a in range(0, n_peaks, chunk):
+        b = min(a + chunk, n_peaks)
+        qidx, prep = _pairs(0, a, b)
+        if qidx is None:
+            continue
+        w = peak_ints[prep]
+        i0 += np.bincount(qidx, weights=w, minlength=n)
+        k0w += np.bincount(qidx, weights=w * peak_mob[prep], minlength=n)
+        np.add.at(s0, qidx * nf + peak_frame[prep], w)
+
+    k0_mean = np.divide(k0w, i0, out=np.full(n, np.nan), where=i0 > 0)
+    # Relative on-signal threshold per query; NaN-free by construction.
+    thr = pixel_frac * s0.reshape(n, nf).max(axis=1).astype(np.float64)
+
+    # --- Pass B: M+1/M+2 intensity inside M0's band AND M0's pixels ---
+    # Also the two marginals, which give the per-candidate independence null.
+    out: dict[str, np.ndarray] = {}
+    for k in (1, 2):
+        ik = np.zeros(n)     # total in-window intensity
+        ico = np.zeros(n)    # inside band AND pixels  -> P(band & pixel)
+        iband = np.zeros(n)  # inside band             -> P(band)
+        ipix = np.zeros(n)   # inside pixels           -> P(pixel)
+        for a in range(0, n_peaks, chunk):
+            b = min(a + chunk, n_peaks)
+            qidx, prep = _pairs(k, a, b)
+            if qidx is None:
+                continue
+            w = peak_ints[prep]
+            sv = s0[qidx * nf + peak_frame[prep]]
+            # NaN k0_mean (no M0 signal) makes in_band False, as intended.
+            in_band = np.abs(peak_mob[prep] - k0_mean[qidx]) <= k0_tol
+            in_pix = (sv > 0) & (sv >= thr[qidx])
+            ik += np.bincount(qidx, weights=w, minlength=n)
+            ico += np.bincount(qidx, weights=w * (in_band & in_pix), minlength=n)
+            iband += np.bincount(qidx, weights=w * in_band, minlength=n)
+            ipix += np.bincount(qidx, weights=w * in_pix, minlength=n)
+        # Enrichment over the independence null:
+        #   lift = P(band & pixel) / (P(band) * P(pixel)) = (ico * ik) / (iband * ipix)
+        # A raw co-occurrence fraction is dominated by the shared background — every
+        # window sits on the same tissue at the same peptide-corridor mobility, so
+        # ~31% of ANY window's intensity lands in M0's band and pixels by chance and
+        # targets and decoys both come out at ~0.31.  Dividing by the product of the
+        # marginals cancels that: it asks whether band-membership and pixel-membership
+        # *co-occur more than chance within this window*, which is what a real
+        # isotopologue does and diffuse background does not.
+        ok = (ik > 0) & (iband > 0) & (ipix > 0)
+        lift = np.full(n, np.nan)
+        lift[ok] = (ico[ok] * ik[ok]) / (iband[ok] * ipix[ok])
+        # log2 so 0 = chance, >0 enriched, <0 depleted.  Floored well below any real
+        # value so a strictly anti-co-located window stays finite for the scaler.
+        out[f"cooc_m{k}"] = np.log2(np.maximum(lift, _COOC_LIFT_FLOOR))
+    del s0
+    return out
+
+
 def extract_observed_feature_stats_raw(
     d_path: str,
     query_mzs: np.ndarray,
@@ -209,6 +357,7 @@ def extract_observed_feature_stats_raw(
     charge: int = 1,
     mob_quality_window_ppm: float = 25.0,
     mob_quality_k0_tol: float = 0.02,
+    isotope_mob_cooc_pixel_frac: float = 0.1,
 ) -> tuple[np.ndarray, np.ndarray, dict | None, dict | None]:
     """Observed per-candidate ``(CCS, peak-centroid m/z, peak_quality, envelope)`` from the raw ``.d``.
 
@@ -234,7 +383,9 @@ def extract_observed_feature_stats_raw(
       a chimeric envelope (isobaric mass coincidence) does not, so the spread of
       these three CCS values is the isotope-envelope CCS-consistency feature (the
       CCS analogue of IsoMobil's IPMV).  Uses only observed peaks — no predicted
-      CCS enters, so there is no m/z-baseline leak.
+      CCS enters, so there is no m/z-baseline leak.  It additionally carries
+      ``cooc_m1``/``cooc_m2``, the per-pixel envelope co-occurrence fractions from
+      :func:`_envelope_mobility_cooccurrence`.
 
     Both are ``None`` without a TIMS dimension or when ``alphatims`` is unavailable.
 
@@ -296,6 +447,7 @@ def extract_observed_feature_stats_raw(
     coll_mz: list[np.ndarray] = []
     coll_int: list[np.ndarray] = []
     coll_scan: list[np.ndarray] = []
+    coll_frame: list[np.ndarray] = []
 
     # Stream raw peaks in chunks; keep only peaks in a query window.
     _CHUNK = 50_000_000
@@ -311,6 +463,9 @@ def extract_observed_feature_stats_raw(
         if has_mobility:
             push = np.searchsorted(push_indptr, raw_c, side="right") - 1
             coll_scan.append((push % scan_max).astype(np.int64))
+            # Frame == MALDI pixel; int32 keeps this ~10 GB rather than ~20 GB at
+            # raw-query scale (the collected pool runs to billions of peaks).
+            coll_frame.append((push // scan_max).astype(np.int32))
 
     if not coll_mz:
         logger.warning(
@@ -347,6 +502,17 @@ def extract_observed_feature_stats_raw(
             )
             envelope[f"int_m{k}"] = int_k
         ccs = envelope["ccs_m0"]
+        # Per-pixel envelope co-occurrence: what fraction of M+1/M+2 shares M0's
+        # mobility band AND M0's pixels.  Replaces the mean-1/K0 comparison, which
+        # is blind here (tissue-summed windows all return the same corridor).
+        envelope.update(
+            _envelope_mobility_cooccurrence(
+                peak_mzs, peak_ints, peak_mob, np.concatenate(coll_frame), query_mzs,
+                ppm=extraction_ppm, k0_tol=mob_quality_k0_tol,
+                n_frames=int(tims.frame_max_index) + 1,
+                pixel_frac=isotope_mob_cooc_pixel_frac,
+            )
+        )
         # Intrinsic joint (m/z, intensity, 1/K0) peak-quality descriptors.
         peak_quality = _peak_quality_in_windows(
             peak_mzs, peak_ints, peak_mob, query_mzs,

@@ -8,6 +8,7 @@ All functions are symmetric — no is_decoy branching in feature computation.
 import logging
 import os
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -1630,6 +1631,67 @@ def compute_isotope_ccs_consistency_features(
         "Isotope-envelope CCS consistency: %d/%d candidates with >=2 envelope peaks "
         "(mean n_peaks %.2f)",
         int(np.nansum(ok)), n, float(np.nanmean(n_peaks)) if have.any() else float("nan"),
+    )
+    return df
+
+
+def compute_isotope_mobility_cooccurrence_features(
+    df: pd.DataFrame,
+    observed_envelope_cooc: dict | None = None,
+) -> pd.DataFrame:
+    """Per-pixel isotope-envelope mobility co-occurrence.
+
+    ``observed_envelope_cooc`` maps ``feature_idx`` → ``(cooc_m1, cooc_m2)``, the
+    fraction of each isotopologue's window intensity that shares M0's mobility band
+    *and* M0's on-signal pixels (see
+    ``maldi_query._envelope_mobility_cooccurrence``).  If ``None``/empty the
+    DataFrame is returned unchanged — feature-list mode, TSF, or no TIMS dimension,
+    exactly like the ``im2deep_*`` features.
+
+    ``isotope_mob_cooc_m1``    log2 co-occurrence lift for M+1 (higher = better)
+    ``isotope_mob_cooc_m2``    log2 co-occurrence lift for M+2 (higher = better)
+    ``isotope_mob_cooc_mean``  mean over the isotopologues that were measurable
+
+    Each is ``log2( P(band & pixel) / (P(band) * P(pixel)) )`` within that
+    isotopologue's window: 0 = mobility and space are independent (diffuse
+    background), > 0 = they co-occur the way a real isotopologue of M0 does.  The
+    raw co-occurrence *fraction* was measured at AUC 0.495 because ~31% of any
+    window's intensity lands in M0's band and pixels by chance; dividing by the
+    marginals cancels that shared background term.  Direction is physically fixed:
+    a real envelope puts its isotopologues at M0's mobility in M0's pixels.
+    ``NaN`` where the isotopologue window carried no intensity (unmeasurable, so left
+    for the median imputer rather than worst-case-filled — the same reasoning as the
+    single-peak case in :func:`compute_isotope_ccs_consistency_features`).
+
+    **Symmetry / leak safety.** No ``is_decoy`` parameter: the record is keyed by the
+    candidate's own feature and read identically for targets and decoys.  It uses only
+    observed peaks — never the candidate's predicted CCS, mobility or mass — and both
+    the band and the pixel set are derived from M0 in the candidate's *own* window, so
+    there is no m/z-baseline dependence to leak.
+    """
+    if not observed_envelope_cooc:
+        return df
+
+    n = len(df)
+    recs = df["feature_idx"].map(observed_envelope_cooc)
+    have = recs.notna().to_numpy()
+    arr = np.full((n, 2), np.nan, dtype=float)
+    if have.any():
+        arr[have] = np.vstack([np.asarray(r, dtype=float) for r in recs[have]])
+
+    df = df.copy()
+    df["isotope_mob_cooc_m1"] = arr[:, 0]
+    df["isotope_mob_cooc_m2"] = arr[:, 1]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN rows are expected
+        df["isotope_mob_cooc_mean"] = np.nanmean(arr, axis=1)
+
+    _finite = np.isfinite(arr[:, 0])
+    logger.info(
+        "Isotope-envelope mobility co-occurrence: M+1 measurable for %d/%d candidates "
+        "(median fraction %.3f)",
+        int(_finite.sum()), n,
+        float(np.nanmedian(arr[:, 0])) if _finite.any() else float("nan"),
     )
     return df
 
