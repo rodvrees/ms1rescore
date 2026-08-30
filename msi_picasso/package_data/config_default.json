@@ -24,6 +24,7 @@
     "substitution_seed": 42,
     "substitution_no_collision_filter": false,
     "substitution_mass_shift_min_da": null,
+    "substitution_collision_ppm": null,
     "n_interaction_features": 0,
     "init_ppm_threshold": 2.0,
     "init_isotope_threshold": 0.7,

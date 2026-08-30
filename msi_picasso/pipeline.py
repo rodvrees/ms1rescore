@@ -1653,6 +1653,7 @@ def rescore(
     substitution_n_residues: int = 1,
     substitution_seed: int = 42,
     substitution_collision_filter: bool = True,
+    substitution_collision_ppm: float | None = None,
     substitution_mass_shift_min_da: float | None = None,
 ):
     """
@@ -2219,6 +2220,7 @@ def rescore(
             random_seed=substitution_seed,
             mass_shift_min_da=substitution_mass_shift_min_da,
             collision_filter=substitution_collision_filter,
+            collision_ppm=substitution_collision_ppm,
             snap_to_features=not maldi_query_raw,
             maldi_intensities=_maldi_intensities_arr,
             maldi_intensities_p90=maldi_intensities_p90,

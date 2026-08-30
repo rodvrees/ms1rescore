@@ -75,6 +75,7 @@
         "substitution_seed":                {"type": ["integer", "null"]},
         "substitution_no_collision_filter": {"type": ["boolean", "null"]},
         "substitution_mass_shift_min_da":   {"type": ["number",  "null"], "minimum": 0},
+        "substitution_collision_ppm":       {"type": ["number",  "null"], "minimum": 0},
 
         "protein_fdr": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "peptide_fdr": {"type": ["number", "null"], "minimum": 0, "maximum": 1},

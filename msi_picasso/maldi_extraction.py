@@ -588,6 +588,29 @@ def _compute_isotope_means_python(
     return sums / max(n_pixels, 1)
 
 
+def _weighted_isotope_channel(
+    m0_images: np.ndarray,
+    mk_images: np.ndarray,
+    m0_means: np.ndarray,
+) -> np.ndarray:
+    """M+k intensity estimated as the M0-weighted regression slope through the origin.
+
+    Returns ``slope * m0_mean``, i.e. the M+k intensity on the same scale as
+    ``m0_means``, so the envelope stays a 3-vector of intensities for the
+    cosine/chi2/KL comparisons downstream while the M+k/M0 *ratio* becomes the
+    slope ``Σ I0·Ik / Σ I0²``.
+
+    Weighting by M0 suppresses pixels where the peptide is absent but something
+    else occupies the M+k window.  See the call site for the measured effect.
+    """
+    a = np.asarray(m0_images).reshape(len(m0_images), -1)
+    b = np.asarray(mk_images).reshape(len(mk_images), -1)
+    s00 = np.einsum("ij,ij->i", a, a, dtype=np.float64)
+    s0k = np.einsum("ij,ij->i", a, b, dtype=np.float64)
+    slope = np.divide(s0k, s00, out=np.zeros_like(s00), where=s00 > 0)
+    return (slope * m0_means).astype(np.float32)
+
+
 def compute_isotope_envelope_means(
     reader,
     feature_mzs: np.ndarray,
@@ -1215,12 +1238,10 @@ def extract_maldi_data(
     logger.info("Computing MALDI isotope envelopes...")
     if extra_ion_images is not None:
         # RAM path: ion_images and m1/m2 images are already in memory — compute
-        # spatial means directly without a second streaming pass.
-        # sum / n_pixels matches the divisor used by compute_maldi_isotope_means.
         n_px = reader.n_pixels
         m0_means = (ion_images.sum(axis=(1, 2)) / n_px).astype(np.float32)
-        m1_means = (extra_ion_images["m1"].sum(axis=(1, 2)) / n_px).astype(np.float32)
-        m2_means = (extra_ion_images["m2"].sum(axis=(1, 2)) / n_px).astype(np.float32)
+        m1_means = _weighted_isotope_channel(ion_images, extra_ion_images["m1"], m0_means)
+        m2_means = _weighted_isotope_channel(ion_images, extra_ion_images["m2"], m0_means)
         logger.debug("  Computed envelope means from in-memory ion images (no extra streaming pass).")
     else:
         # Memmap path: images not fully in RAM; stream pixels once via Rust.
