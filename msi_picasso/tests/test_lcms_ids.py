@@ -34,6 +34,10 @@ def _make_psm(
 ) -> MagicMock:
     psm = MagicMock()
     psm.peptidoform = _FakePeptidoform(sequence, charge)
+    # Explicit: a bare MagicMock attribute is truthy and non-None, so without these the
+    # parser skips every PSM as a decoy and tries to float() a mock ion mobility.
+    psm.is_decoy = False
+    psm.ion_mobility = None
     psm.qvalue = q_value
     psm.pep = pep
     psm.score = score

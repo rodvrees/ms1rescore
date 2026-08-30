@@ -1,890 +1,376 @@
 # MSI-PICASSO — CLAUDE.md
 
-## Purpose
+**Scope of this document:** what the code *is* and what it must *never* do.
+It contains no experimental results. Everything about what has been tried, what it
+produced, and what to try next lives in **`/home/robbe/MALDI_MSI_score/PROGRESS.md`** —
+read that first for project state. Keeping results out of here is deliberate: the previous
+version of this file mixed findings from superseded decoy methods into the reference
+material, and those findings were then applied to configurations where they did not hold.
 
-`MSI-PICASSO` is a symmetric target-decoy rescoring package for MALDI-MSI MS1 data. It takes MALDI data (a raw Bruker `.d`) plus an LC-MS/MS PSM table, then produces FDR-controlled MALDI peptide identifications via semi-supervised rescoring. The current work centres on adapting it to real tissue: an amyloidosis tumour microarray (working well) and a whole kidney section (the case being improved).
-
-**Core invariant:** the design is strictly symmetric — **no feature computation function takes `is_decoy` as a parameter**. Targets and decoys receive features through identical code paths, so target-decoy competition (TDC) FDR stays valid. Every change must preserve this.
-
-**Why it was built this way:** the prior approach (ms2rescore "Approach B") used ProteomeDiscoverer output for candidates and features, which leaked the label (`lcms_xcorr`, a search-engine score, had AUC 0.993 against the PD target/decoy label). This package removes all PD-derived scores; every feature is computed from the raw `.d` (and, optionally, raw LC-MS/MS) under the symmetry invariant.
+Superseded material is archived in `/home/robbe/MALDI_MSI_score/docs/archive/`
+(`CLAUDE_pre_3008.md`, `ARCHITECTURE.md`, `AUDIT.md`, `FIX_KIDNEY_DISCREPANCY.md`).
 
 ---
 
-## Current state: baseline runs and what we are improving
+## Purpose
 
-Two reference runs define where the pipeline is today. They are the point of
-comparison for all current work, **not** finished examples.
+`MSI-PICASSO` is a symmetric target-decoy rescoring package for MALDI-MSI MS1 data. It
+takes MALDI data (a raw Bruker `.d`) plus an LC-MS/MS PSM table and produces FDR-controlled
+MALDI peptide identifications by semi-supervised rescoring.
 
-| | Amyloidosis (working) | Kidney (being improved) |
-|---|---|---|
-| Config | `configs/amyloidosis_substitution.toml` | `configs/kidney_test.toml` |
-| Results (R0, 2026-07-09) | `results/amyl_baseline_0907` | `results/kidney_baseline_0807` |
-| Tissue | tumour microarray (discrete deposits) | whole kidney section (heterogeneous) |
-| Whole-model T/D AUC | 0.558 | 0.543 (near chance) |
-| IDs at 5% FDR | ~290 | ~21 |
+**Goal:** raise the number of confident IDs on the ground-truth datasets — amyloidosis,
+her2, kidney (all TIMS, in-situ iprm-PASEF MS/MS ground truth), and `SC_Heeren` (no ion
+mobility). Nothing is fixed: decoy method, scoring backend, and feature set are all in play.
 
-(Numbers from the `ms1rescore_matches.tsv` result files; the `log.txt` files are stale.
-R0 config cleanup was run and did not close the gap — see `FIX_KIDNEY_DISCREPANCY.md`.)
+**Why it was built this way:** the prior approach (ms2rescore "Approach B") used
+ProteomeDiscoverer output for candidates and features, which leaked the label — `lcms_xcorr`,
+a search-engine score, had AUC 0.993 against the PD target/decoy label. This package removes
+all PD-derived scores; every feature is computed from the raw `.d` (and optionally raw
+LC-MS/MS) under the symmetry invariant below.
 
-**The active configuration both runs use** (this is the current pipeline, everything
-else in this document is alternative or legacy):
-- **Raw-query MALDI extraction** (`--maldi-query-raw`): candidates drive extraction;
-  each candidate's ion image, observed centroid m/z, and CCS are queried on demand from
-  the raw `.d`. See [Raw-query mode](#5-raw-query-mode-inverts-the-pipeline-ordering-the-active-mode).
-- **Substitution decoys** (`--decoy-method substitution`): one decoy per target by
-  substituting interior non-K/R residues. See [Decoy generation](#2-decoy-generation).
-- **LC-MS/MS-guided candidates** (Strategy C): candidates are the LC-MS/MS-identified
-  peptides only (no FASTA digest); `--lcms-prior-weight 0` so LC-MS/MS is used for the
-  candidate list and CCS calibration, not as a scoring prior.
-- **Semi-supervised rescoring** with `rbf_svm` in both baselines. `lda` is the general
-  default, but backend choice is data-dependent: on the weak-signal kidney case `rbf_svm`
-  empirically beat `lda` (out-of-fold AUC 0.543 vs 0.501 — a linear model extracted no
-  separation), so `rbf_svm` is kept for kidney. See [Rescoring backends](#rescoring-backends).
-- **Single-round scoring** (`--single-round`), spatial-ranker + region + mobility
-  colocalization features on.
+---
 
-**Known root cause of the kidney gap** (established; see `FIX_KIDNEY_DISCREPANCY.md` in
-the repo root for the full diagnosis and ranked fixes): colocalization is the dominant
-discriminator and it collapses in heterogeneous whole-section tissue, so the kidney
-seed is ~5× smaller and self-training erodes rather than grows it. Orthogonal,
-tissue-independent features (CCS error, mass accuracy) survive in kidney and are the
-lever for seeding.
+## Critical invariants
+
+Violating any of these silently corrupts the FDR. They are listed first because they are
+the only part of this file that is genuinely load-bearing.
+
+1. **No feature computation function takes `is_decoy`.** Targets and decoys receive features
+   through identical code paths. This is enforced at the API level — grep for `is_decoy` in
+   `maldi_features.py`, `feature_generator.py`, `lcms_evidence.py`, `utils.py` and
+   `maldi_query.py` returns nothing.
+2. **A decoy row's `feature_mz` must be the decoy's own m/z** — for `substitution` the
+   substituted peptide's [M+H]+, for `mz_shift` the shifted m/z. Never the source target's.
+   Load-bearing for raw-query mode, which extracts each candidate's ion image at its own
+   anchor.
+3. **Composition features stay out of `_BEST_FEAT_SKIP` and out of the seed.** Several decoy
+   methods alter elemental composition, so composition features separate target from decoy
+   as an artifact of decoy construction. Seeding on them makes the FDR anti-conservative.
+4. **`is_decoy` must be cast to `bool` dtype** before returning a candidates frame.
+   `pd.concat` with an empty frame yields `object`-dtype booleans, which break
+   `~df["is_decoy"]` indexing downstream.
+5. **Explicit falsy config values are honored** via `_apply_explicit_overrides` in
+   `config_parser.py`. `--matching-ppm 0` means exact matching and is not masked by the
+   default of 20.0. `cascade_config`'s own merge rule would drop it.
+6. **`maturin develop` must target the venv explicitly** (see Build below), or the extension
+   installs into the base pyenv Python and the package silently falls back to slow Python
+   paths.
+7. **`has_oxidized_met` is really `has_methionine`** (`maldi_features.py:1005`). Plain-sequence
+   candidates never carry `M[Oxidation]` annotations, so the literal definition is
+   unreachable. Rename it or wire up modification detection; do not trust the name.
 
 ---
 
 ## Repository layout
 
+The git repo is `MSI-PICASSO/` only. The parent `/home/robbe/MALDI_MSI_score/` is **not**
+under version control, so `configs/`, `results/`, `scripts/`, `data/` and `docs/` are
+untracked by design. Run provenance is instead recovered from the `.full_config.json` that
+`cli.py` writes into every output directory.
+
 ```
 MSI-PICASSO/
-├── pyproject.toml              # Package metadata and dependencies
-├── CLAUDE.md                   # This file
-├── msi_picasso/                # Python package (import name: msi_picasso)
-│   ├── __init__.py             # __version__ = "0.1.0"
-│   ├── utils.py                # Shared math utilities
-│   ├── candidates.py           # FASTA digest + MALDI m/z matching + decoy generation (substitution [current], shuffle, mz_shift, mz_shuffle, entrapment)
-│   ├── lcms_ids.py             # Parse LC-MS/MS IDs for Strategy C candidate generation
-│   ├── lcms_evidence.py        # LC-MS/MS feature extraction
-│   ├── maldi_extraction.py     # Raw MALDI extraction: feature detection, ion images, spatial features
-│   ├── maldi_query.py          # Raw-query mode: ion images (query_raw_maldi) + observed peak centroids & CCS (extract_observed_feature_stats_raw) from candidate m/z
-│   ├── maldi_imzml.py          # SCiLS Lab-style interval extraction for imzML data
-│   ├── maldi_features.py       # MALDI-side rescoring features (incl. TIC-masked / region-profile colocalization)
-│   ├── feature_generator.py    # Orchestration + PSMList construction; feature-group definitions
-│   ├── pipeline.py             # End-to-end pipeline function; rescoring backends (lda/qda); priors
-│   ├── probabilistic_scorer.py # Generative pre-scorer (legacy; was the SVM/CatBoost step-7b feature source — those backends are removed)
-│   ├── config_parser.py        # Cascade config merge + jsonschema validation (package_data/config_*.json)
-│   ├── cli.py                  # argparse CLI entry point (`picasso` command)
-│   ├── debug_viz.py            # Debug figure generation (saved when --verbose)
+├── pyproject.toml              # testpaths = ["msi_picasso/tests"]
+├── CLAUDE.md                   # this file
+├── msi_picasso/
+│   ├── cli.py             2030 # argparse CLI (`picasso` / `msi-picasso`), MALDI input dispatch
+│   ├── config_parser.py    144 # cascade_config merge + jsonschema validation
+│   ├── candidates.py      1987 # FASTA digest, all decoy generators, match_to_maldi_features
+│   ├── lcms_ids.py         722 # parse LC-MS/MS IDs -> identified proteins + peptides
+│   ├── lcms_evidence.py    965 # raw LC-MS/MS evidence features (MS2PIP, DeepLC-anchored MS1)
+│   ├── maldi_extraction.py 1237# raw Bruker .d extraction via imzy: ion images, spatial feats
+│   ├── maldi_query.py      391 # raw-query mode + observed centroids/CCS (alphatims) + disk cache
+│   ├── maldi_imzml.py     1174 # SCiLS-style interval extraction from imzML via pyimzml (legacy)
+│   ├── maldi_features.py  2657 # all MALDI-side features: mass accuracy, colocalization, isotope
+│   ├── feature_generator.py 591# feature-group constants + compute_all_features
+│   ├── pipeline.py        3324 # rescore() orchestrator, scoring backends, TDC q-values, PEP
+│   ├── debug_viz.py       4049 # debug figures (--verbose)
+│   ├── utils.py             99 # shared math (brainpy isotopes, spectral angle, mass constants)
 │   ├── package_data/           # config_default.json + config_schema.json
-│   └── tests/                  # Unit tests (pytest; testpaths configured in pyproject.toml)
-│       ├── fixtures/           # Static test fixtures (e.g. test_maldi.mgf)
-│       ├── test_balanced_shuffle.py
-│       ├── test_best_feature_init.py
-│       ├── test_calibration_selection.py
-│       ├── test_candidates.py
-│       ├── test_colocalization_mask.py       # TIC on-tissue masking
-│       ├── test_config_parser.py
-│       ├── test_debug_viz.py
-│       ├── test_deisotoping.py
-│       ├── test_drop_zero_signal.py
-│       ├── test_nosignal_coloc_fill.py
-│       ├── test_entrapment_decoys.py
-│       ├── test_evidence_score.py            # pre-existing broken (stale import)
-│       ├── test_isotope_distribution.py
-│       ├── test_lcms_apex_features.py
-│       ├── test_lcms_ids.py
-│       ├── test_lda_backend.py
-│       ├── test_lda_cv.py                     # cross-validated LDA scoring
-│       ├── test_maldi_extraction.py          # pre-existing broken (stale import)
-│       ├── test_maldi_query.py                # raw-query extraction
-│       ├── test_mz_shift.py
-│       ├── test_mz_shuffle.py
-│       ├── test_region_colocalization.py     # region-profile colocalization
-│       ├── test_within_region_colocalization.py  # within-region / dominant-region colocalization (O3)
-│       ├── test_pep.py
-│       ├── test_protein_coverage.py          # protein_coverage label-leak fix
-│       ├── test_qda_backend.py
-│       └── test_spatial_ranker_features.py
-└── msi-picasso-rs/             # Rust extension (PyO3 + rayon)
-    ├── Cargo.toml
-    └── src/
-        ├── lib.rs              # PyO3 module definition
-        ├── digest.rs           # Peptide mass + composition + m/z matching
-        ├── xic.rs              # Parallel XIC extraction
-        ├── spectral.rs         # Spectral angle computation
-        ├── isotope.rs          # MS1 isotope envelope extraction (LC-MS/MS)
-        ├── features.rs         # Ionization and property features (rayon parallel)
-        ├── ion_image.rs        # Profile-mode pixel window integration (rayon)
-        └── maldi_isotope.rs    # MALDI M+1/M+2 mean intensity via CSR streaming pass
+│   └── tests/                  # 50 test modules
+└── msi-picasso-rs/             # PyO3 + rayon extension, crate "MSI-PICASSO-rs"
+    └── src/{lib,digest,features,ion_image,isotope,maldi_isotope,mob_coloc,spectral,xic}.rs
 ```
 
-Run the test suite from the `MSI-PICASSO/` directory:
-
-```bash
-cd MSI-PICASSO && pytest   # testpaths = ["MSI-PICASSO/tests"] in pyproject.toml
-```
+**The Rust crate imports as `ms1rescore_rs`** — the module name was never renamed with the
+package. Every call site wraps it in `try/except ImportError` with a Python fallback.
 
 ---
 
-## Core design principles
+## Pipeline flow
 
-### 1. Symmetric target-decoy computation
+1. **Entry** — `cli.main()` (`cli.py:1458`) → `parse_configurations(...)["MSI-PICASSO"]`.
+2. **Config cascade** (`config_parser.py:82`) — `package_data/config_default.json` → user
+   JSON/TOML → explicit CLI args. `store_true` flags are converted `False → None`
+   (`cli.py:1479`) so argparse defaults do not clobber config-file values.
+3. **MALDI input dispatch** (`cli.py:1613`), mutually exclusive:
+   `maldi_npz | maldi_mzs | maldi_raw | maldi_imzml | maldi_d`.
+   With `maldi_d` + `maldi_query_raw=true` extraction is **deferred** into `rescore()`.
+   This is what every current config uses.
+4. **`rescore()`** (`pipeline.py:1555`):
+   - Step 1 candidate generation; 1b extra FASTA; 1c decoy generation (`pipeline.py:2093`)
+   - Raw-query extraction (`pipeline.py:2277`) — `query_raw_maldi()` +
+     `extract_observed_feature_stats_raw()`, then symmetric `ppm_error` recomputation from
+     the observed centroids
+   - Calibration-peptide selection for DeepLC / IM2Deep finetuning (`pipeline.py:2412`)
+   - Steps 2–5 LC-MS/MS branch, skipped when no mzML or `lcms_prior_weight == 0`
+   - Step 6 `compute_all_features()`; then optional `drop_zero_signal`, CCS filter,
+     mobility-filtered colocalization, spatial-ranker features
+   - Step 8 build `PSMList`; Step 9 rescoring, winner selection, TDC q-values, PEP
+5. **Output** — `_write_results()` (`cli.py:220`), debug figures via `save_debug_figures()`.
 
-Every function that computes features must be blind to `is_decoy`. The symmetry guarantee is enforced at the API level: none of the feature computation functions have an `is_decoy` parameter. This means targets and decoys receive features via identical code paths.
+### Two-pass scoring
 
-### 2. Decoy generation
+Round 1 scores all candidates → per-feature winner selection (`_select_feature_winners`)
+keeps the top-scoring candidate per MALDI m/z → Round 2 retrains on winners only → TDC
+q-values over winners.
 
-**Current method — substitution decoys** (`--decoy-method substitution`,
-`generate_substitution_candidates` in [candidates.py](msi_picasso/candidates.py)). One
-decoy peptide p′ per unique target p, made by substituting `substitution_n_residues`
-(default 2) interior non-K/R residues. K and R are excluded from both the substitution
-alphabet and the substituted positions so tryptic cleavage sites are preserved, and the
-L/I isobaric pair is handled by rejecting same-mass replacements. Each peptide uses its
-own MD5-seeded RNG (target-independent), and the upper hash bits enforce ~50/50 up/down
-mass shifts. In raw-query mode each decoy is queried at its own theoretical [M+H]+, so
-it gets a genuine on-demand ion image at a mass distinct from all targets. Properties
-that make it the current default:
-- **Size-fair** for protein-level features: `|DECOY_X| == |X|` by construction.
-- **CCS-safe:** the mass shift is ~1–50 Da (≈0.1% of ~1000 Da), far below the
-  `mz_shuffle` gap of 50–500 Da, so there is no m/z-gap CCS artifact and the
-  `_MZ_SHUFFLE_CCS_LEAK_FEATURES` exclusion does **not** apply — CCS features are usable.
-- **Spatial-ranker-compatible:** each decoy has its own real on-demand ion image.
-
-**Caveat (documented, watch when relaxing seed guards):** substitution changes
-elemental composition, so composition features (e.g. `n_S`) separate target from decoy
-as an artifact of the decoy construction, not real signal. These are kept out of the
-ranker and out of the seed (`_BEST_FEAT_SKIP`); do not reintroduce them.
-
-**Alternative methods** (`shuffle`, `mz_shift`, `mz_shuffle`, `entrapment`,
-`balanced_shuffle`, `paired_shuffle`) are still implemented and catalogued under
-[Rescoring backends → decoy_method](#pipelinepy). They are not the current default; the
-original K/R-preserving shuffle (`_shuffle_protein`) shuffles non-K/R residues while
-fixing cleavage sites, which breaks elemental-composition conservation while keeping the
-tryptic length distribution.
-
-### 3. Neutral mass matching for LC-MS/MS
-
-MALDI features are detected as [M+H]+ (charge 1). LC-MS/MS MS2 scans are acquired at charge 2, 3, etc. Matching is done by comparing **neutral masses** (`maldi_mz - PROTON` vs `ms2_precursor_mz * charge - charge * PROTON`), not m/z values directly. Matching on m/z alone gives ~88/1398 features with MS2 scans; neutral mass matching gives ~1067/1398.
-
-### 4. DeepLC-anchored MS1 features (fully symmetric)
-
-LC-MS/MS MS1 features are computed using the DeepLC predicted retention time as the anchor for each candidate. For each candidate (target or decoy), the DeepLC RT prediction is used to locate the nearest MS1 scan, and signal, SNR, and isotope envelope features are extracted at that scan. This is fully symmetric: targets and decoys receive identical treatment because DeepLC predictions do not depend on `is_decoy`. No XIC extraction is performed.
-
-**Why not XICs:** XIC extraction is inappropriate for DDA LC-MS/MS data (a peptide may appear in only one or a few MS2 events, and XIC apex selection is unreliable). Using the search engine's identified RT (MS2 scan RT) as the anchor would break TDC symmetry (decoys would never have an identified RT). DeepLC predicted RT is the only symmetric, model-based RT anchor available for all candidates.
-
-### 5. Raw-query mode inverts the pipeline ordering (the active mode)
-
-In the legacy feature-list path the MALDI feature list is detected/supplied first and candidates are matched against it (`_load_maldi() → generate_candidates() → match_to_features()`). With `maldi_query_raw=True` the ordering inverts: candidates are generated first against the digest m/z grid, then `query_raw_maldi` extracts ion images from the raw `.d` at `candidates_df["feature_mz"]` (`generate_candidates() → query_raw_maldi(candidate mzs)`). Per-feature intensities are mapped back onto the candidate rows after extraction. **The guarantee that `feature_mz` on a decoy row is the decoy's own m/z — for `substitution` the substituted peptide's [M+H]+, for `mz_shift` the shifted (off-target) m/z — not the original target peptide m/z, is load-bearing here:** the raw query extracts the decoy's ion image at its own anchor, which is the correct signal for that decoy.
-
-**This is the mode the current baselines run in** (see [Current state](#current-state-baseline-runs-and-what-we-are-improving)). When extending the pipeline, make a feature work correctly and efficiently in raw-query first; feature-list mode is the legacy fallback. The standing work items on this frontier:
-- **Extraction speed.** Profile-mode `.d` extraction is the dominant cost (~5 min/pass for ~3 K m/z over ~48 K pixels). Faster windowed/streaming extraction (the Rust `ion_image.rs` path, batching, on-tissue-only pixel reads) is the main lever for making raw-query cheap enough to default. **Reuse across runs:** `rescore(raw_query_cache=...)` is a bidirectional cache — pass `None` to always extract; pass `{}` to extract once and populate it; pass the populated dict to reuse the full-grid ion images / observed centroids / CCS without touching the `.d`. The candidate m/z grid is fixed by the digest + decoy method, so a parameter sweep that varies only scoring params (e.g. `scripts/grid_search.py` in raw-query mode) extracts once on the first run and reuses it for all the rest. The cached arrays cover the whole grid, a superset of any run's `query_mzs`, so they are reused as-is (extra ion images are ignored by the `feature_mz → image` lookups).
-- **Symmetric observed statistics.** `ppm_error` is recomputed from the observed peak centroid in each candidate's own window (`_recompute_ppm_from_centroids`), worst-case-filled when no peak is found, so targets and decoys are measured identically; observed CCS is keyed per feature_idx (`_observed_ccs_by_feature_idx`). These must stay symmetric as raw-query grows.
-- **Ion mobility / CCS.** Observed CCS is extracted from the `.d` via `alphatims` (Mason-Schamp 1/K0→CCS); raw-query is where CCS becomes a first-class observed quantity rather than a prediction-only feature.
+`--single-round` skips Round 2 only. **Winner selection still runs**, so the
+target-vs-decoy competition that defines the TDC population is unchanged and the FDR
+semantics are identical; only the final discriminant refit is dropped.
 
 ---
 
-## Modules
+## Reading MALDI data
 
-### `maldi_extraction.py`
+Two readers exist. Only the first is on the active path.
 
-Converts raw Bruker `.d`/TSF data into the NPZ format consumed by the rest of the pipeline via `imzy`. CLI flag: `--maldi-raw`.
+**imzy (active).** `maldi_extraction.py:200` — `imzy.get_reader(d_path)` dispatches Bruker
+`.d` (TDF/TSF, bundled `libtimsdata.so`) and `.imzML`. `extract_maldi_data()`
+(`maldi_extraction.py:865`) is the single public entry, returning
+`(feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes)`.
 
-Install: `pip install MSI-PICASSO[maldi]` (installs `imzy`).
+**pyimzml (legacy).** `maldi_imzml.extract_scils_features()`, reached only via
+`--maldi-imzml`. SCiLS-style interval extraction. No current config uses it.
 
-#### `extract_maldi_data(d_path, ppm_bin, extraction_ppm, matching_ppm, min_fraction, feature_mzs, images_path, image_batch_size, output_npz, output_spatial_tsv, output_dir, verbose)`
+Performance-relevant details:
 
-Returns a 5-tuple: `(feature_mzs, ion_images, extra_ion_images, spatial_df, maldi_envelopes)`.
+- **`_extract_centroid_fast`** (`maldi_extraction.py:193`) — TSF only. Pre-converts feature
+  m/z windows to raw spectral index windows once from the reference frame's calibration,
+  then makes one DLL call per pixel. Accepts <5 ppm systematic calibration error. Without
+  it, imzy's two-calls-per-pixel pattern is ~3 hours for 49 K pixels on a network filesystem.
+- **`_extract_profile_fast_multi`** (`maldi_extraction.py:351`) — the default in-RAM path.
+  Extracts all six feature sets (main, M+1, M+2, Na, K, CHCA) in a **single**
+  `spectra_iter()` pass, buffering 512 pixels at a time into the Rust
+  `accumulate_profile_chunk` (rayon).
+- **imzy writes its own caches**: an `.icache` npz beside each imzML holding per-spectrum
+  `.ibd` byte offsets and coordinates (so opening a 133 MB imzML is an npz load, not an XML
+  parse), and a `.icache/frame_index_cache.npz` inside each Bruker `.d`.
+- **RAM vs memmap** — by default the full `(n_features, H, W)` float32 array lives in RAM.
+  Passing `images_path` switches to a `np.memmap` written in `image_batch_size` batches.
 
-`extra_ion_images` is a `dict | None` with keys `"m1"`, `"m2"`, `"na"`, `"k"`, `"chca"`, each an `(N, H, W)` float32 array of ion images extracted at M+1/M+2 and adduct (Na, K, CHCA) shifted m/z positions. Used by `compute_isotopologue_colocalization` and `compute_adduct_colocalization` in `maldi_features.py` to compute direct per-feature Pearson r without requiring isotopologue/adduct peaks to be present in the feature list. Set to `None` when images are loaded from a pre-computed NPZ `images_path` or when data is sourced from imzML (those paths do not have a live reader for extra extraction).
+### The `.d` is opened more than once
 
-Four-step extraction:
+`imzy` exposes neither per-peak centroid m/z nor mobility, so raw-query mode opens the `.d`
+a second time with `alphatims` (`maldi_query.py:197`) for observed peak centroids, observed
+CCS, and the mobility peak-quality descriptors. Mobility colocalization
+(`maldi_features.py`) streams the TDF a third time.
 
-1. **Feature detection** — `detect_features(reader, ppm_bin, min_fraction)`. Streams all pixels, builds a log-ppm histogram, and greedily merges adjacent bins to produce consensus feature m/z values. Works directly on centroid data (instrument-picked peaks). Profile data is not handled here — use `maldi_imzml.py` for profile imzML.
+**This second pass dominates runtime** (roughly 40 minutes of a ~69 minute amyloidosis run,
+streaming ~4e9 raw peaks) while producing only a handful of arrays of `len(query_mzs)`.
+Two caches exist for it:
 
-2. **`extract_ion_images(reader, feature_mzs, ppm=25.0)`** — tries fast extraction paths first (`_extract_centroid_fast` for Bruker TSF, `_extract_profile_fast` cumsum trick for profile), then falls back to `reader.get_ion_images()`. Returns `(n_features, H, W)` float32.
+- **`raw_query_cache`** (`pipeline.py:1566`, logic at `2292`) — an in-process dict covering
+  the *whole* extraction (`maldi_mzs`, `ion_images`, `extra_ion_images`, `spatial_features`,
+  `maldi_envelopes`, `ccs_arr`, `centroid_arr`, `peak_quality`). Pass `None` to always
+  extract, `{}` to extract once and populate, or a populated dict to reuse without touching
+  the `.d`. Used by `scripts/grid_search.py`. Dies with the process.
+- **`--raw-query-cache-dir`** (`raw_query_cache_dir`) — persists just the alphatims stats to
+  an `.npz` keyed by a SHA-256 of the `.d` path, the **full** query m/z grid, and the window
+  parameters. Survives across processes. Hashing the whole grid means a changed candidate
+  set (different decoy method, digest, or FASTA) misses rather than silently reusing stale
+  statistics. This is the cache to use for the experiment cycle; the ion images are only
+  ~5 minutes of work but several GB of array, so they are deliberately *not* persisted.
 
-3. **Extra ion image extraction** (RAM path only, when `images_path is None`) — calls `extract_ion_images` five more times at `feature_mzs + delta` for M+1 (+1.003355 Da), M+2 (+2.006710 Da), Na adduct (+21.9819 Da), K adduct (+37.9559 Da), and CHCA matrix adduct (+171.0320 Da). Saved to NPZ as `extra_m1`, `extra_m2`, `extra_na`, `extra_k`, `extra_chca` keys alongside `mzs`, `images`, `x_coords`, `y_coords`.
-
-4. **`compute_spatial_features(ion_images, feature_mzs, n_pixels_total)`** — computes per-feature: `fraction_detected`, `n_pixels_detected`, `mean_intensity`, `intensity_p90`, `intensity_sum`, `intensity_cv`, Moran's I (`spatial_autocorrelation`).
-
-**imzy reader API used:**
-- `reader.n_pixels`, `reader.is_centroid`, `reader.mz_min`, `reader.mz_max`
-- `reader.spectra_iter(silent=False)` — yields `(mzs, ints)` per pixel
-- `reader.get_ion_images(mzs, ppm=..., fill_value=0.0)` → `(n_features, H, W)` float32
-- Used as context manager: `with imzy.get_reader(d_path) as reader:`
-
-**Two ppm parameters:**
-
-- `extraction_ppm` (default 25.0, CLI `--extraction-ppm`): ion image assembly window. Slightly wider than instrument centroid accuracy to avoid clipping peak tails.
-- `matching_ppm` (default 20.0, CLI `--matching-ppm`): downstream candidate-to-feature linking in `match_to_maldi_features`. Not used internally by the extraction functions.
-
-**Deprecated: LC-MS/MS guided extraction** (`_features_from_lcms_file_diagnostic`):
-
-Kept for diagnostic/legacy use only. Do not use for rescoring — it pre-selects features guaranteed to match LC-MS/MS candidates, making scoring trivial.
-
----
-
-### `maldi_imzml.py`
-
-> **Legacy input path.** The current baselines read the raw Bruker `.d` directly in
-> raw-query mode; the imzML/SCiLS interval path below is retained for imzML-only
-> datasets but is not the path under active development. Prefer `--maldi-d`
-> `--maldi-query-raw`. Skim this section unless you are specifically ingesting imzML.
-
-SCiLS Lab-style interval-based m/z feature extraction for imzML data. CLI flag: `--maldi-imzml`.
-
-Install: `pip install MSI-PICASSO[maldi]` (installs `pyimzml`).
-
-#### Algorithm
-
-1. **Build mean spectrum** across all pixels on a common m/z grid (`mz_grid_resolution` Da resolution). Fast path for aligned profile data (all spectra share the same m/z axis): direct array sum. General path: `np.add.at` with grid index = `round((mz - mz_min) / resolution)`, O(n_peaks) per pixel. Each pixel spectrum is optionally RMS- or TIC-normalized before accumulation so every pixel contributes equally.
-
-2. **Baseline correction** (optional, `baseline_correction=True`): rolling-minimum filter (`scipy.ndimage.minimum_filter1d`) + Gaussian smoothing of the baseline estimate, subtracted from the mean spectrum before peak detection. Window width in points computed at median m/z from `baseline_window_ppm`.
-
-3. **Detect intervals** on the (optionally baseline-corrected) mean spectrum: Savitzky-Golay smooth → `find_peaks(height=threshold)` → valley-to-valley boundaries. The height threshold matches the paper's "4% relative intensity threshold" (peaks above 4% of the base peak, as an absolute height filter). **Do not use scipy's topographic `prominence=` here** — prominence is the peak height above its lowest connecting saddle to a higher peak, which can be far below the absolute height for peaks surrounded by moderately intense neighbours, causing genuine peaks to be missed. When `local_prominence_window_da > 0`, the threshold for each peak is `peak_prominence × local_max(±window)` (sliding-window local max) instead of `peak_prominence × global_max`. This reduces the effective threshold in low-signal m/z regions (e.g. >1600 Da) where the global threshold would suppress genuine peptide peaks. For each detected peak, left boundary = last valley before the peak, right boundary = first valley after the peak. Fallback to `mz_apex ± ppm_tolerance × mz_apex × 1e-6` when no flanking valley exists. Intervals narrower than `min_interval_width_ppm` are symmetrically expanded.
-
-4. **Recalibration** (optional, `calibrant_mzs` non-empty): for each calibrant m/z, find the nearest detected apex within `calibrant_tol_ppm`; fit a linear ppm offset vs m/z model; apply correction to all interval apices and boundaries.
-
-5. **Deisotoping** (optional, `deisotope=True`): uses the `ms_deisotope` package (`deconvolute_peaks()`) to remove isotope satellite peaks. A pre-merge step (`_merge_duplicate_intervals`) collapses near-identical apices within `tol_da=0.001` Da (taking max intensity) before deconvolution.
-
-   `ms_deisotope` fits averagine-based isotope envelopes using MSDeconV scoring. Peaks that appear as k>0 positions in a fitted envelope (score ≥ `deisotope_min_score`) are removed as satellites. Peaks not assigned to any envelope are kept.
-
-   Key behavioral properties:
-   - Envelopes where M+k is far more intense than M0 score below threshold and are not removed (ms_deisotope returns empty `peak_set` for physically inconsistent intensity ratios).
-   - Error tolerance is in ppm (`deisotope_error_ppm`), not Da. At 1000 Da, 15 ppm ≈ 0.015 Da (stricter than the old 0.15 Da default).
-   - Charge range is configurable via `deisotope_charge_range` (default `(1, 1)` for MALDI [M+H]+).
-   - Averagine model is configurable: `"peptide"` (default), `"glycopeptide"`, `"glycan"`, `"heparin"`.
-
-   **Note**: in single-cell MALDI-MSI data, M+1 peaks often survive deisotoping because heterogeneous cell expression patterns cause the mean spectrum M0/M+1 ratio to be lower than the averagine prediction. This is a fundamental limitation of mean-spectrum deisotoping; per-pixel deisotoping would be needed to eliminate all isotope peaks reliably.
-
-6. **Mass defect filter** (optional, `filter_mass_defect=True`): Senko-plot peptide corridor. For each [M+H]+ apex: `neutral = apex − 1.007276`, `nominal = floor(neutral)`, `defect = neutral − nominal` (always in [0,1)), `expected = 0.000509 × nominal` (averagine slope, positive). Keep if `|defect − expected| ≤ mass_defect_halfwidth`. Default halfwidth 0.5 passes all peaks; use 0.25 to filter lipids/matrix while retaining all tryptic peptides in 800–2000 Da. **Do not use `round()` for nominal mass** — for neutrals with fractional part >0.5 it flips the defect sign and breaks the corridor test.
-
-7. **Integrate pixels** over intervals. RMS normalization (if `normalize_rms=True`, takes priority) or TIC normalization (if `normalize_tic=True`) is applied to each pixel spectrum before interval integration. Per interval: sum all intensities within `[mz_start, mz_end]` (`use_apex=False`) or take the apex intensity (`use_apex=True`).
-
-8. **Filter intervals**: keep intervals where mean intensity ≥ `min_intensity` AND pixel fraction with non-zero signal ≥ `min_pixel_fraction`.
-
-#### `SCiLSConfig` dataclass
-
-```python
-SCiLSConfig(
-    ppm_tolerance=10.0,           # fallback interval half-width (ppm)
-    smoothing_window=7,
-    smoothing_polyorder=2,
-    peak_prominence=0.01,         # min peak prominence as fraction of mean-spectrum max
-    min_intensity=0.0,
-    min_pixel_fraction=0.01,
-    min_interval_width_ppm=2.0,
-    normalize_tic=True,           # TIC-normalize per pixel (default)
-    normalize_rms=False,          # RMS-normalize per pixel (takes priority over TIC; matches SCiLS default)
-    use_apex=False,               # False = sum; True = apex intensity
-    mz_grid_resolution=0.001,    # Da, for mean spectrum grid
-    # Baseline correction
-    baseline_correction=False,
-    baseline_window_ppm=500.0,
-    # Recalibration
-    calibrant_mzs=[],             # theoretical m/z of internal standards
-    calibrant_tol_ppm=200.0,
-    # Deisotoping (ms_deisotope-based)
-    deisotope=False,
-    deisotope_averagine="peptide",   # "peptide", "glycopeptide", "glycan", "heparin"
-    deisotope_scorer="MSDeconVFitter",  # or "PenalizedMSDeconVFitter"
-    deisotope_min_score=10.0,        # MSDeconV score threshold; lower = more aggressive
-    deisotope_charge_range=(1, 1),   # MALDI is [M+H]+; widen for multi-charge data
-    deisotope_error_ppm=15.0,        # m/z matching tolerance in ppm (15 ppm ≈ 0.015 Da at 1000 Da)
-    # Senko mass defect filter
-    filter_mass_defect=False,
-    mass_defect_halfwidth=0.5,    # 0.5 = all pass; 0.15–0.20 = meaningful peptide filter
-    # Local adaptive prominence (0 = global max reference)
-    local_prominence_window_da=0.0,  # >0 enables sliding-window local max; suggested 200 Da
-)
-```
-
-#### Published pipeline replication (PXD056528 CHCA dataset)
-
-The paper describes: SCiLS RMS normalization → mMass baseline correction → peak picking at 4% relative threshold → deisotoping → recalibration with trypsin autolysis peaks (842.51, 870.54, 1045.56 Da) → Senko mass defect filter → spatial filter (fraction of pixels).
-
-```bash
-picasso \
-  -f data/PXD056528/uniprot_human_reviewed.fasta \
-  -l data/PXD056528/231212_AG_11.mzML \
-  -l data/PXD056528/231212_AG_12.mzML \
-  -l data/PXD056528/231212_AG_21.mzML \
-  --maldi-raw data/PXD056528/MALDI_MSI/20221013_SingleCells_CHCA.d \
-  --msf data/PXD056528/240125_AG_DDA.msf \
-  --model lda \
-  --normalize-rms \
-  --baseline-correction \
-  --peak-prominence 0.04 \
-  --calibrant-mzs 842.51 870.54 1045.56 \
-  --deisotope \
-  --filter-mass-defect --mass-defect-halfwidth 0.25 \
-  --min-fraction 0.01 \
-  --smoothing-window 11 --smoothing-polyorder 2 \
-  --output-dir results/replicated_pipeline/ \
-  --extra-fasta data/contaminants.fasta \
-  -v
-```
-
-**Parameter notes:**
-- `--normalize-rms`: matches SCiLS Lab default (RMS, not TIC). Takes priority over the default TIC normalization.
-- `--peak-prominence 0.04`: matches the paper's "4% relative intensity threshold".
-- `--calibrant-mzs`: trypsin autolysis peaks used as internal mass standards. `--calibrant-tol-ppm` defaults to 200 ppm (wide enough to find them before recalibration).
-- `--mass-defect-halfwidth 0.25`: covers all 22 GT tryptic peptides in 800–2000 Da while filtering lipids/matrix. Use 0.5 (default) to disable the filter.
-- `--picking-height 0.75` (default): matches the mMass "picking height 75%" setting. Computes apex m/z as the midpoint of the two interpolated crossings at 75% of the peak maximum, giving a more accurate centroid for asymmetric peaks. Use `--picking-height 0.0` to revert to the raw smoothed-spectrum apex.
-- `--smoothing-window 11 --smoothing-polyorder 1`: best config from parameter sweep on this dataset (v11: 17/22 GT features matched).
-- `--deisotope-min-score 10.0` (default): MSDeconV score threshold for accepting an isotope envelope. Lower values remove more peaks; raise to 20+ to be conservative. At 10.0, a clear 3-peak M0/M+1/M+2 pattern matching averagine scores ~20.
-- `--deisotope-error-ppm 15.0` (default): m/z tolerance for envelope fitting. At 1000 Da, 15 ppm ≈ 0.015 Da. The old `--deisotope-tol-da 0.15` was 150 ppm at 1000 Da (10× looser).
-- `--deisotope-averagine peptide` (default): averagine model. Use `glycopeptide`, `glycan`, or `heparin` for non-peptide analytes.
-- `--deisotope-scorer MSDeconVFitter` (default): scoring function. `PenalizedMSDeconVFitter` applies an additional penalty for charge-state ambiguity.
-
-#### `extract_scils_features(imzml_path, config, output_dir, visualize)`
-
-Returns `(intervals, intensity_matrix, pixel_coords)`:
-- `intervals`: list of `(mz_start, mz_end, mz_apex)` tuples, one per kept interval
-- `intensity_matrix`: `np.ndarray` shape `(n_pixels, n_intervals)`, float32
-- `pixel_coords`: list of `(x, y)` 0-based tuples, same row order as `intensity_matrix`
-
-When `visualize=True`, saves 4 PNG files to `output_dir`:
-1. Mean spectrum with interval shading
-2. Interval apex m/z histogram
-3. Per-interval pixel fraction and mean intensity distributions
-4. Ion image mosaic for top 9 intervals by mean intensity (γ=0.5, `hot` colormap)
-
-**pyimzml API used:**
-- `parser.coordinates` — list of (x, y, z) 1-based tuples
-- `parser.spectrum_mode` — `'profile'` | `'centroid'` | `None`
-- `parser.getspectrum(i)` — seeks ibd file, returns `(mzs, ints)` arrays
-
-#### CLI flags
-
-| Flag | Format | Feature detection | Ion images | Spatial features | Extra images (adducts) |
-|---|---|---|---|---|---|
-| `--maldi-npz PATH` | NumPy NPZ | No | Yes (if `"images"` key) | No | From NPZ `extra_*` keys |
-| `--maldi-mzs PATH` | Plain text m/z list | No | No | No | No |
-| `--maldi-raw PATH` | Bruker `.d` | Histogram binning (centroid) | Yes | Yes | Yes |
-| `--maldi-d PATH` | Bruker `.d` (alias for `--maldi-raw`) | Histogram binning (centroid) | Yes | Yes | Yes |
-| `--maldi-imzml PATH` | imzML + ibd | SCiLS interval detection | Yes (reconstructed from interval matrix) | Yes | No |
-| `--maldi-query-raw` (modifier, with `--maldi-raw`/`--maldi-d`) | Bruker `.d` | None — candidate m/z drive extraction | Yes (at candidate m/z) | Yes | Yes |
-
-**Raw-query mode (`--maldi-query-raw`):** A modifier on `--maldi-raw`/`--maldi-d` (not a standalone source). Instead of detecting a feature list first, candidates are generated first (against the digest m/z grid) and `maldi_query.query_raw_maldi` extracts ion images directly from the `.d` at `candidates_df["feature_mz"]` (zero-signal features are retained, so decoys in empty m/z space yield genuine zero-signal images). The extraction reuses `extract_maldi_data(feature_mzs=query_mzs, drop_zero_signal=False)`, so the 5-tuple return and all downstream code are unchanged. With `decoy_method="mz_shift"` and `mz_shift_delta_min < 10`, a `UserWarning` flags that small shifts may land in empty m/z space.
-
-**Observed peak centroids, ppm, and CCS in raw-query mode:** `imzy` (used for the ion images) exposes neither the per-peak m/z centroid nor mobility, so `maldi_query.extract_observed_feature_stats_raw` opens the `.d` a *second* time with `alphatims` and, in one pass, computes per candidate window (pure vectorised helper `_weighted_mean_in_windows`): (1) the intensity-weighted **observed peak centroid m/z**, and (2) the intensity-weighted mean 1/K0 → **observed CCS** via `one_over_k0_to_ccs`.
-
-- **ppm recompute (symmetric).** In raw-query mode candidates are matched against the *theoretical* digest grid (`maldi_mzs = unique(peptide_db["mh_mz"])`), so the usual `(feature_mz − mh_mz)` ppm is 0 for every self-match and decoys inherit 0. The pipeline replaces it via `_recompute_ppm_from_centroids`: for **every** candidate row (target and decoy identically), `ppm_error = (observed_centroid − feature_mz) / feature_mz × 1e6`, where `feature_mz` is the candidate's own queried anchor (peptide [M+H]+ for a target, the shifted m/z for an `mz_shift` decoy). This is a real mass-accuracy measurement bounded by ±`extraction_ppm`, computed from each candidate's own window with **no inheritance from the paired target** and **no label leak** (a decoy's ppm never references the peptide mass). Applies to all decoy methods (shuffle/entrapment matched to the grid are 0 by construction too). A window with **no observed peak** (e.g. an `mz_shift` decoy shifted into empty m/z) has unmeasurable mass accuracy and is assigned the **worst-case ppm** (`worst_case_ppm=extraction_ppm`, the window edge — the worst in-distribution value), so empty-signal candidates are penalised on ppm rather than median-imputed to an average value by the LDA. If extraction produced no centroids at all (alphatims missing / no signal anywhere), `ppm_error` is left as the matched-grid value instead. Needs only m/z + intensity, so it works even without a TIMS dimension.
-- **observed CCS** builds `observed_ccs_per_feature` via `_observed_ccs_by_feature_idx` — keyed by the candidates' own `feature_idx` (bridged through `feature_mz`, since in raw-query `feature_idx` indexes the digest grid, not the query m/z), matching how `compute_im2deep_features` consumes it. This unlocks the IM2Deep CCS features, the `match_ccs` filter, and `mob_coloc`. `NaN` (→ `observed_ccs_per_feature=None`) when `alphatims` is missing or the data has no TIMS dimension (TSF).
-
-Note: `query_raw_maldi` does not return `pixel_coords`, so `ppm_error_calibrated_z` is unavailable in raw-query mode.
-
-**Mobility colocalization wiring:** `mob_coloc` (opt-in, `--mob-coloc`) requires `im2deep_predicted_ccs`, which now exists in raw-query mode once observed CCS is extracted. `compute_mobility_colocalization_features` reads the `.d` itself via `alphatims` + `MaldiFrameInfo` X/Y, so it is independent of the imzy ion images and the raw-query grid swap. (Earlier the pipeline call omitted the required `tdf_path` argument and the `TypeError` was swallowed by a `try/except`, so `mob_coloc` never ran in any mode; the call now passes `tdf_path` and `mob_window_multiplier`.)
-
-**`--maldi-d` vs `--maldi-imzml`:** When raw Bruker `.d` data is available, prefer `--maldi-d`. It extracts ion images directly from raw spectra, includes adduct/isotopologue extra images (`extra_ion_images`), and is not affected by SCiLS recalibration offsets. `--maldi-imzml` reconstructs ion images from SCiLS-integrated interval intensities — all spatial features are computed, but adduct images (`na`, `k`, `chca`) are unavailable because the interval list covers only detected monoisotopic peaks. Note that SCiLS-exported imzML m/z values may differ from raw Bruker calibration by 10–80+ ppm; verify alignment with `Amy_TMA_MS1.d` before using `--maldi-d` with a SCiLS feature CSV.
+Both are valid for exactly one reason: the candidate m/z grid is fixed by the digest plus
+the decoy method, so it is constant across runs that vary only scoring parameters.
 
 ---
 
-### `utils.py`
-
-Shared mathematical utilities. No external state.
-
-| Function | Description |
-|---|---|
-| `theoretical_isotope_distribution(n_C, n_H, n_N, n_O, n_S, n_peaks=4)` | brainpy Mercury algorithm; `@lru_cache` keyed on composition tuple |
-| `composition_from_sequence(peptide)` | Element counts from amino acid sequence |
-| `averagine_composition(mass)` | Averagine model composition |
-| `cosine_similarity(a, b)` | Safe cosine with zero-vector guard |
-| `spectral_angle(a, b)` | 1 - arccos(cosine) / π |
-| `mz_to_mass(mz, charge)` | Neutral mass from m/z and charge |
-| `mass_to_mz(mass, charge)` | m/z from neutral mass and charge |
-| `ppm_error(observed, theoretical)` | Signed ppm |
-
-Constants: `NEUTRON = 1.003355`, `PROTON = 1.007276`
-
-**`theoretical_isotope_distribution` — normalization scheme:** brainpy is called with `npeaks = max(n_peaks, 6)` to ensure the normalization denominator captures essentially all isotope signal. The returned intensities are normalized over all returned peaks (full-spectrum norm), then truncated to `n_peaks`. As a result, the sum of the returned array is < 1 for `n_peaks < 6` (remaining signal is in M+3+). This is more physically correct than the prior Poisson approach, which renormalized only over the first 3 peaks. The `lru_cache` makes repeated calls with the same composition free — the vectorized path in `maldi_features.py` builds a dict of unique compositions first to minimize brainpy calls to O(unique compositions).
-
-### `candidates.py`
-
-Two candidate generation strategies are supported, both producing a DataFrame with one row per (peptide, MALDI feature) pair.
-
-**`digest_fasta(fasta_path, ..., generate_decoys=True)` — Strategy A (full FASTA):**
-1. Phase 1 (pyteomics): `pyteomics.parser.cleave()` for tryptic digestion. Decoys generated by `_shuffle_protein()` (K/R-preserving shuffle, seeded at 42) when `generate_decoys=True`.
-2. Phase 2 (Rust or pyteomics fallback): `compute_peptide_masses()` from `ms1rescore_rs` computes mass, [M+H]+ m/z, and elemental composition (n_C, n_H, n_N, n_O, n_S).
-
-**`digest_identified_proteins(..., generate_decoys=True)` — Strategy C (LC-MS/MS-guided):**
-See the [Candidate generation strategies](#candidate-generation-strategies) section below. Pass `generate_decoys=False` to suppress decoy generation.
-
-**`generate_mz_shift_candidates(target_df, feature_mzs, ..., snap_to_features=True)` — observation-space m/z-shift decoys:** For each unique target peptide, samples a random delta in `[delta_min, delta_max]` Da (alternating sign). Two placement modes:
-- **`snap_to_features=True` (default, feature-list mode):** snaps the shifted query to the nearest MALDI feature within `snap_tolerance_ppm`, rejecting snaps within `matching_ppm` of any target peptide m/z (collision filter). `feature_idx` is the snapped grid index.
-- **`snap_to_features=False` (raw-query mode):** the decoy feature *is* the exact shifted m/z `mh_mz ± delta` (no snap — raw-query images any m/z on demand), accepted only if it does not collide (within `matching_ppm`) with a target peptide m/z **or** with an already-assigned decoy m/z. This guarantees one **distinct** feature per decoy (no clustering onto shared grid points, which otherwise collapses many decoys onto few features and skews the per-feature-winner T:D ratio). Each decoy gets a unique `feature_idx` past the grid range `[0, len(feature_mzs))`.
-
-Targets are matched normally; decoy rows reuse the target sequence with `is_decoy=True`, `source="decoy_mz_shift"`, `feature_mz=` the shifted m/z, and a diagnostic `decoy_delta_da` (NaN for targets). `ppm_error` in feature-list mode is copied from the peptide's best target match (non-discriminative); in raw-query it is recomputed from observed peak centroids in `pipeline.py` (`_recompute_ppm_from_centroids`). **`feature_mz` on decoy rows being the shifted m/z is load-bearing for raw-query mode** (`maldi_query.query_raw_maldi`). The pipeline passes `snap_to_features=not maldi_query_raw`.
-
-**`generate_mz_shuffle_candidates(target_df, feature_mzs, ...)` — m/z-assignment-shuffle decoys:** Matches targets normally, takes each unique target peptide's representative feature (lowest `ppm_error_abs`), and forms decoys by a **derangement** of the peptide→feature assignment: peptide `i` is relocated onto the feature of peptide `σ(i)`, where `σ` is a mass-sorted cyclic rotation by `k ∈ [n/4, 3n/4)` ranks (guarantees no fixed point and a large mass gap → never self- or near-isobaric). Decoy rows: `is_decoy=True`, `source="decoy_mz_shuffle"`, `feature_mz`/`feature_idx` = the assigned (other peptide's) feature — so each decoy is **co-located on the identical ion image as that feature's target**. `ppm_error` is inherited from the peptide's own best target match (non-discriminative; **not** computed against the decoy's feature, which would be a fake discriminator absent from real false positives). `decoy_delta_da = assigned_feature_mz − peptide_mh_mz`. The key property: feature-quality features are identical between a feature's target and decoy, so discrimination is forced onto the peptide↔observation match (CCS, isotope). **Targets are deduplicated to one representative row per unique peptide** (the lowest-|ppm| match, the same `best` set the derangement is built from) before being concatenated with the decoys. This is required for a 1:1 null: a target peptide whose m/z falls within `matching_ppm` of several MALDI peaks would otherwise contribute multiple target rows against its single decoy, producing a ~(mean features/peptide):1 target:decoy imbalance (e.g. 5901:2895) with most target rows left without a co-located decoy. Deduplicating loses no unique peptide identifications (only redundant near-isobaric secondary matches). Decoy rows are given a **separate protein namespace** (`protein = "DECOY_" + source_protein`) so protein-level features (`protein_colocalization*`, `protein_n_features`, `protein_coverage`, …) are computed within class — never pooling a decoy with its source target's protein. `protein_tryptic_count` is inherited from the source protein (the `DECOY_` prefix is stripped for the lookup). Returns the combined target+decoy frame.
-
-**`load_entrapment_candidates(entrapment_fasta, target_df, feature_mzs, ...)` — entrapment decoys:** Digests a foreign-organism FASTA with the same trypsin rules, computes [M+H]+ m/z, then applies a **contamination filter** — `match_mz(target_mzs, entrapment_mzs, matching_ppm)` removes any entrapment peptide isobaric with a target. *Rationale:* an isobaric entrapment peptide would inherit the real biological signal at its m/z, making the null artificially good; this is a contamination filter, not a decoy-selection step. The collision rate is logged and a >10% rate warns of m/z-space overlap between the entrapment organism and the sample proteome. Surviving peptides are matched to features via `match_to_maldi_features` and flagged `is_decoy=True`, `protein="ENTRAPMENT_{accession}"`, `source="entrapment"`. Returns matched decoy rows only (the pipeline concatenates them with the matched target candidates).
-
-`match_to_maldi_features()` uses `match_mz()` from `ms1rescore_rs` (binary search) or Python fallback. Returns a candidates DataFrame with one row per (peptide, MALDI feature) pair. Protein-level features (`protein_n_features`, `n_candidates`) are computed over all candidates symmetrically.
-
-**`protein_coverage` — label-leak fix (symmetric numerator + true-digest denominator).** `protein_coverage` is the fraction of a protein's tryptic peptides that are observed, computed in `compute_protein_consistency_features`. It previously used `protein_n_features / protein_tryptic_count`, which leaked the target/decoy label: every decoy peptide is placed on exactly one feature by construction (`mz_shift`/`mz_shuffle`), so a decoy protein's `n_features` equals its observed-peptide count and — because `protein_tryptic_count` was the candidate-pool count, not the full digest — coverage was pinned to exactly **1.0 for every decoy**, while target peptides matching several near-isobaric features pushed target coverage above 1. Two changes fix it: (1) the **numerator** counts distinct observed *peptides* (`protein_n_peptides = groupby(protein).peptide.nunique()`), which is symmetric because a protein and its `DECOY_`/`ENTRAPMENT_` namespace share the same peptide set; (2) the **denominator** is overridden in `pipeline.py` (just before Step 6) with the *true full tryptic digest count* per protein, computed from `peptide_db` (the complete length-filtered digest, before m/z matching) and keyed by base accession so decoys inherit their source protein's count. Result: coverage ∈ (0,1], symmetric (target ≈ decoy per protein), and non-degenerate (real variation across proteins). `protein_tryptic_count` is consumed only by `protein_coverage`. (Note: the decoy protein namespacing and `protein_tryptic_count` *inheritance* were already correct — the leak was in the metric definition, not the decoy setup.)
-
-Key parameters: `maldi_intensities`, `maldi_intensities_p90`, `maldi_intensities_sum` (each a numpy array aligned with `maldi_mzs`) populate `feature_intensity`, `feature_intensity_p90`, and `feature_intensity_sum` respectively, from which `log_maldi_intensity`, `log_maldi_intensity_p90`, and `log_maldi_intensity_sum` are derived. Prefer `intensity_p90` from `compute_spatial_features()` over mean-of-nonzero for the main intensity feature. In `pipeline.py`, these are read from `spatial_features` columns when available.
-
-### `lcms_evidence.py`
-
-The most complex module. Handles all LC-MS/MS evidence extraction.
-
-#### `LCMSData` dataclass
-
-Holds all MS1 and MS2 scan data loaded from mzML or Bruker `.d` files. Lazily computes:
-- `_ms2_neutral_mass`: neutral mass from `ms2_precursor_mz * charge - charge * PROTON`
-- `_ms2_mass_sort_idx`: argsort for binary search over neutral masses
-
-#### Key functions
-
-| Function | Description |
-|---|---|
-| `load_lcms_data(mzml_paths)` | Load mzML via pyteomics or Bruker `.d` via alphatims; routes based on extension |
-| `load_lcms_data_from_d(d_path)` | Load timsTOF `.d` folder with alphatims; MS1 per-frame, MS2 vectorised via `index_precursors()` |
-| `_find_matching_ms2_scans(neutral_mass, lcms_data, ppm)` | Binary search over MS2 neutral masses |
-| `get_ms2pip_predictions(pairs, model)` | Batch MS2PIP predictions for `(peptide, charge)` pairs. Import: `from ms2pip.core import predict_batch` |
-| `finetune_deeplc(msf_path)` | Fine-tune DeepLC on PD TargetPsms (q≤0.01) |
-| `finetune_deeplc_from_df(rt_df)` | Fine-tune DeepLC from a DataFrame with `sequence`/`rt_mean` columns (minutes); used for FragPipe input |
-| `get_deeplc_predictions(peptides, model)` | Batch DeepLC RT predictions |
-| `extract_all_xics(unique_mzs, lcms_data, ppm)` | XIC extraction utility (available but not used in the main pipeline) |
-| `compute_all_lcms_evidence(candidates_df, ...)` | Main entry point: returns dict mapping candidate index → feature dict |
-
-#### `compute_all_lcms_evidence` structure
-
-**DeepLC-anchored, fully symmetric.** No XIC extraction. All MS1 features are computed at the nearest MS1 scan to the DeepLC predicted RT.
-
-1. Pre-compute per MALDI feature (1,398 iterations):
-   - Matching MS2 scan indices (by neutral mass)
-2. Per-candidate loop (707K iterations): all peptide-specific computations:
-   - **MS2 RT filter**: when `rt_window_min > 0`, `predicted_rt` is fetched before the MS2 loop and the neutral-mass-matched scan list is further restricted to scans whose `ms2_precursor_rt` is within ±`rt_window_min` of `predicted_rt`. `lcms_ms2_n_matches` reflects this filtered count. When `rt_window_min == 0`, only neutral-mass matching applies (original behaviour).
-   - Spectral angle vs MS2PIP prediction (peptide+charge specific). `lcms_ms2_spectral_angle` = NaN when no MS2PIP prediction is available; 0.0 when a prediction exists but fewer than 3 fragments match.
-   - `lcms_ms2_rt_delta` (F4): |RT of the highest-SA MS2 scan − predicted_rt|. NaN when no MS2 match passes both filters.
-   - DeepLC predicted RT → MS1 scan window (cached per unique peptide sequence). When `rt_window_min > 0`: all MS1 scans within ±`rt_window_min`; when `rt_window_min == 0`: single nearest scan.
-   - `lcms_ms1_intensity`: log1p of summed signal in ±ppm window at precursor m/z across selected scans
-   - `lcms_ms1_snr`: log10(signal / median_background) when both signal > 0 and background > 0; log10(signal) when signal > 0 but no non-zero background found; 0.0 when signal = 0
-   - Isotope envelope [M0, M+1, M+2] from `_extract_ms1_envelope` at the **LC-MS/MS charge** (charge of the highest-SA MS2 scan, fallback charge 1). The envelope m/z is `(neutral_mass + z * PROTON) / z` with peak spacing `NEUTRON / z`.
-   - `lcms_ms1_isotope_cosine`: cosine similarity of observed vs theoretical envelope
-   - `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`: |obs_ratio − theo_ratio| for M+1/M0 and M+2/M0
-   - **Apex window features** (F1–F3, only when `rt_window_min > 0`): computed at `lc_mz` (LC-MS/MS charge m/z) over the same scan window:
-     - `lcms_ms1_apex_rt_delta`: |RT of the max-signal scan − predicted_rt|. NaN when no signal found.
-     - `lcms_ms1_frac_apex_signal`: signal at the DeepLC-nearest scan / signal at the apex scan. 0.0 when no signal. Equals 1.0 when predicted_rt falls exactly at the elution apex.
-     - `lcms_ms1_n_scans_with_signal`: count of scans in the window with non-zero signal at `lc_mz ± ppm_tolerance`.
-   - If `maldi_envelopes` provided: MALDI vs LC-MS/MS envelope comparison → `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `log_isotope_m1_ratio_diff`, `log_isotope_m2_ratio_diff`, `isotope_n_matched`
-     - **`log_isotope_m1_ratio_diff`**: `log1p(|MALDI_M+1/MALDI_M0 − LCMS_M+1/LCMS_M0|)`. Compares the M+1/M0 isotope intensity ratio observed in the MALDI ion images (mean pixel intensities across the tissue section) to the same ratio measured in the LC-MS/MS MS1 spectrum (summed over scans within the DeepLC RT window, normalized to sum to 1). A value near 0 means the MALDI isotope pattern is concordant with the LC-MS/MS observation for the same candidate peptide; higher values indicate discordance, which can arise from chimeric MALDI features or mass coincidences. The log1p transform compresses the range and reduces sensitivity to outliers. NaN when `maldi_envelopes` is not provided or when either M0 signal is zero.
-     - **`log_isotope_m2_ratio_diff`**: `log1p(|MALDI_M+2/MALDI_M0 − LCMS_M+2/LCMS_M0|)`. Same as `log_isotope_m1_ratio_diff` but for the M+2 peak, which is particularly informative for sulfur-containing peptides (elevated M+2 relative to averagine) and heavier peptides (> ~1500 Da, where M+2 intensity approaches or exceeds M+1). NaN when fewer than 3 isotope peaks are available (k < 3).
-
-**`rt_window_min` is set to `2.0 × p95_mae`** of DeepLC calibration residuals in `pipeline.py`, where `p95_mae` is the 95th-percentile absolute error over the fine-tuning calibration set. When no calibration is performed, `rt_window_min = 0.0` and all window-based features (F1–F4 plus the MS2 RT filter) fall back to their sentinel values automatically.
-
-**Signature:**
-```python
-compute_all_lcms_evidence(
-    candidates_df, lcms_data, ms2pip_cache,
-    deeplc_cache=None,     # peptide → predicted RT (minutes)
-    maldi_envelopes=None,  # feature_mz → normalized envelope array
-    ppm_tolerance=20.0,
-    fragment_tol_da=0.02,
-    rt_window_min=0.0,     # ±window for MS2 RT filter and apex features
-) -> dict[int, dict[str, float]]
-```
-
-#### DeepLC finetuning SQL
-
-```sql
-SELECT DISTINCT Sequence AS peptide, RetentionTime AS rt
-FROM TargetPsms
-WHERE PercolatorqValue <= 0.01 AND RetentionTime IS NOT NULL
-```
-`RetentionTime` is taken directly from `TargetPsms` — no join needed.
-
-### `maldi_features.py`
-
-MALDI-side features. All functions take the candidates DataFrame and return it with new columns added.
-
-#### Ion-image colocalization and spatial autocorrelation
-
-All four ion-image feature functions are performance-critical. Their design:
-
-**On-tissue pixel masking (TIC) — required for valid colocalization.** Every MALDI ion image is ~0 in the unmeasured padding around the acquired pixel grid and broadly follows the tissue footprint within it (every peak is near-0 off-tissue, positive on-tissue). A raw Pearson r between two ion images is therefore dominated by this shared on/off-tissue structure and is inflated toward the tissue outline for *any* pair of images, real or decoy. Empirically (see `notebooks/gt_protein_ion_images.ipynb`) the within-protein mean pairwise r is ~0.76–0.84 and **decoy proteins colocalize as well as or better than targets** — the feature measures "is this on tissue," not protein-specific co-distribution. `compute_tissue_mask(ion_images, tic_quantile=0.0)` (in `maldi_features.py`) builds a flattened `(H*W,)` boolean on-tissue mask from a TIC proxy (per-pixel sum over all ion images): TIC == 0 padding is always dropped; `tic_quantile > 0` raises the threshold to that quantile of the measured-pixel TIC, additionally trimming low-signal edges. `compute_all_features` builds the mask once and threads it (as `pixel_mask`) into `_pearson_r_matrix` and the iso/adduct functions so the correlation is computed over on-tissue pixels only. Exposed via `--coloc-tic-quantile` (config `coloc_tic_quantile`, default `0.0` = drop only padding). Image validity (non-constant) is assessed on the masked pixels too.
-
-**`_pearson_r_matrix(ion_images, ion_image_mzs, pixel_mask=None)`** — shared helper. Stacks all valid (non-constant) ion images into a `(n_valid, n_pixels)` float32 matrix and computes the full `(n_valid, n_valid)` Pearson correlation matrix in a single BLAS `dgemm` call via `np.corrcoef`. When `pixel_mask` is given, the columns are restricted to the selected on-tissue pixels before centring/normalising. Called once by `feature_generator.compute_all_features` and passed as `_corr_cache` to all three colocalization functions to avoid 3× redundant BLAS work.
-
-**`compute_colocalization_features()`** — within-protein Pearson correlations:
-1. `_pearson_r_matrix` → full corr matrix (shared with other functions)
-2. Pandas self-join on `protein` to enumerate all within-protein feature pairs (O(Σ k²) rows where k = features per protein, typically small)
-3. Vectorized `corr_matrix[idx_a, idx_b]` lookup on the join result
-4. `groupby(['feature_mz', 'protein']).agg(...)` → merge back onto candidates
-
-In addition to `protein_colocalization` (mean), `_max`, `_median`, `_n_partners`, the same single pass computes **intensity-weighted** and **rank-weighted** aggregations from a per-pair weight `w = sqrt(I_a · I_b)` where `I` is the **linear** `feature_intensity_p90` (fallback `feature_intensity`, else uniform `w=1` so the weighted features equal the plain mean). All blind to `is_decoy`; full column list in `maldi_features._COLOC_FEATURE_COLS`; all added to `PROTEIN_LEVEL_FEATURES` (enter the ranker via `--use-protein-level-feats`):
-- `protein_colocalization_weighted` = Σ(w·r)/Σw  (intensity-weighted mean r — down-weights faint partner pairs)
-- `protein_colocalization_weighted_max` = max(w·r)
-- `protein_colocalization_top{2,3,5}` = mean r over the k highest-weight partner pairs (`sort_values("w").groupby(...).head(k)`; uses all pairs when fewer than k exist, no NaN padding)
-
-**`compute_region_colocalization_features()`** — region-profile colocalization (opt-in, `--region-coloc`; also needs `--use-protein-level-feats`). The headline granular colocalization metric; it **replaces** the former NMF (`--nmf-coloc`) and patch (`--patch-coloc`) colocalization features, which were removed. `_region_profile_corr_matrix` segments the on-tissue pixels into `region_coloc_k` regions (default 20) with `sklearn.cluster.MiniBatchKMeans` over the per-pixel-TIC-normalized `log1p` composition, then reduces each ion image to a per-region mean fingerprint and computes the within-protein **Pearson r** of those fingerprints (centre + L2-normalize + gemm), aggregated to `protein_region_colocalization` (mean), `_max`, `_median`. Asks "do same-protein peptides light up the *same regions*?" — sharper than global ion-image Pearson r, which is dominated by the shared tissue envelope. Two design choices matter: per-pixel TIC normalization removes that common envelope *before* segmenting (so regions reflect composition, not "how much tissue"), and the signed Pearson r can go **negative** when peptides occupy different regions (unlike a cosine of non-negative loadings), which is the discriminative signal a decoy at a foreign m/z produces. Reuses the same protein self-join machinery as `compute_colocalization_features`; protein-level, so valid only because every decoy method gives decoys a separate `DECOY_`/`ENTRAPMENT_` namespace. Declared in `feature_generator.REGION_COLOCALIZATION_FEATURES`, computed in `compute_all_features` only when `region_coloc=True`, appended to the ranker pool at runtime in `pipeline.py` when the flag is set. When `debug` is passed it returns the per-pixel region map + fingerprints, which `debug_viz` renders (under `--verbose`) as three outputs: `region_segmentation.png` (k-means map), `region_profiles.png` (per-protein fingerprint heatmaps), and a `region_ion_images/` subfolder containing one PNG per protein (ion image | region overlay | profile bar, one row per peptide). **Empirical (see `figures/coloc_metric_perprotein_delta.png`):** on the amyloidosis TMA this lifts ~40% of proteins to a clear target-vs-decoy delta the global Pearson r misses; on a homogeneous kidney whole section the gain is weak (most detected proteins are ubiquitous and genuinely co-distributed). Validate with `scripts/audit_coloc_leak.py` before trusting it in the ranker (it must separate target from decoy without being an abundance proxy).
-
-**`compute_within_region_colocalization_features()`** — within-region and dominant-region Pearson-r colocalization (opt-in, `--within-region-coloc`; O3 in `FLAWS_AND_OPPORTUNITIES.md`; **experimental / unvalidated**, gated in `features-exclude` on both live configs until proven). Unlike `compute_region_colocalization_features` (which correlates per-region *mean fingerprints* across images — blind to how pixels covary within a region), `_within_region_corr_matrices` segments on-tissue pixels with the identical MiniBatchKMeans recipe, then calls `_pearson_r_matrix` (unmodified, with the same `coloc_tic_normalize`/`coloc_common_mode` preprocessing as the best-performing global metric) **restricted to each region's own pixel mask**, i.e. it correlates raw pixel intensities *inside* a region rather than per-region averages. Two aggregations, both reusing the protein self-join/groupby body factored out into `_aggregate_protein_pairwise_corr` (shared with `compute_region_colocalization_features`):
-- `protein_within_region_colocalization` (+ `_max`, `_median`): pixel-count-weighted mean of each region's own Pearson r, over regions with ≥ `min_region_pixels` (default 30) on-tissue pixels, expressed in the canonical full-tissue valid-image index space.
-- `protein_dominant_region_colocalization` (+ `_max`, `_median`): Pearson r restricted to just the single largest region, exempt from the `min_region_pixels` floor.
-
-Declared in `feature_generator.WITHIN_REGION_COLOCALIZATION_FEATURES` (mean-only, matching the `_max`/`_median`-excluded-from-ranker-pool precedent set by `REGION_COLOCALIZATION_FEATURES`), computed in `compute_all_features` only when `within_region_coloc=True`, appended to the ranker pool at runtime in `pipeline.py` when the flag is set, and included in `_PROTEIN_COLOC_WORST_PREFIXES` for the zero-signal worst-case fill. No new debug visualization — reuses `region_segmentation.png` (same k/seed). Reuses `scripts/audit_coloc_leak.py`'s `COLOC_PREFIXES` matching (extended) for target-vs-decoy AUC / abundance-leak auditing. See O3 in `FLAWS_AND_OPPORTUNITIES.md` for the full validation protocol (discriminability sweep, decoy-vs-decoy null calibration, GT-anchored FDR check) and go/no-go thresholds before removing these columns from `features-exclude` in any config.
-
-**`_pearson_r_pairwise(images_a, images_b, pixel_mask=None)`** — helper used by isotopologue and adduct colocalization. Takes two `(N, H, W)` float32 arrays and returns a length-N array of per-feature Pearson r values. Uses manual mean-centering and dot product (avoids `np.corrcoef` memory overhead). When `pixel_mask` is given, r is computed over on-tissue pixels only (consistent with `_pearson_r_matrix`). Returns `np.nan` for constant images.
-
-**`compute_isotopologue_colocalization()`** and **`compute_adduct_colocalization()`** — both accept an `extra_ion_images: dict | None` parameter. When provided (keys: `"m1"`, `"m2"`, `"na"`, `"k"`, `"chca"`), they use `_pearson_r_pairwise` to compute direct per-feature Pearson r between M0 images and pre-extracted partner images. This is necessary because MALDI feature lists contain only predefined monoisotopic M0 peaks — M+1/M+2 and adduct peaks are absent from the feature list and cannot be found by index lookup. When `extra_ion_images=None`, the old fallback path uses `_find_partner_indices` (vectorized `searchsorted` + nearest-neighbour check) to locate partner images within the feature list and slices the shared corr matrix — preserved for backwards compatibility (e.g. plain m/z text file or imzML input).
-
-**Colocalization image-preprocessing toggles** (`--coloc-tic-normalize`, `--coloc-common-mode`) — optional pre-correlation transforms on `_pearson_r_matrix`, applied only to the cross-feature protein-coloc cache (the isotopologue/adduct caches stay on raw images, since they correlate an M0 image against its own isotopologue/adduct image where common-mode removal is meaningless). `tic_normalize` divides each pixel by its total signal across images (removes the multiplicative brightness envelope); `common_mode_removal` subtracts the per-pixel mean image (removes the additive shared spatial component). Both default off, so the default global-Pearson `protein_colocalization*` behaviour is unchanged; `feature_generator.compute_all_features` builds a second preprocessed cache only when a toggle is set.
-
-**`compute_spatial_autocorrelation_full()`** — Moran's I and Geary's C:
-- Replaces per-feature `scipy.signal.convolve2d` with `_neighbor_sum_batch`: batched numpy 8-neighbour sum using zero-padded slicing, no scipy dependency.
-- Processes features in chunks of `chunk_size=200` (caps peak RAM at ~150 MB per chunk for a 49 K-pixel image at float32).
-- Chunks dispatched to a `ThreadPoolExecutor` — numpy releases the GIL for large array ops, so threads run in parallel.
-- Uses float32 throughout; only final reduction sums accumulate in float64.
-
-**Benchmark at 1398 features, 220×225 px (49,500 pixels), realistic candidate set:**
-
-| Step | Time |
-|---|---|
-| `_pearson_r_matrix` (shared, once) | ~1.4 s |
-| `compute_colocalization_features` | ~0.03 s |
-| `compute_isotopologue_colocalization` | ~0.01 s |
-| `compute_adduct_colocalization` | ~0.01 s |
-| `compute_spatial_autocorrelation_full` | ~0.8 s |
-
-#### `compute_theoretical_isotope_features()`
-
-Uses `theoretical_isotope_distribution()` from `utils.py` (brainpy-backed, `lru_cache`). The hot path deduplicates compositions before calling brainpy:
-
-```python
-comp_cols = ["n_C", "n_H", "n_N", "n_O", "n_S"]
-unique_comps = {tuple(row) for row in df[comp_cols].astype(int).values}
-iso_cache = {k: theoretical_isotope_distribution(*k, n_peaks=3) for k in unique_comps}
-dist = np.array([iso_cache[tuple(row)] for row in df[comp_cols].astype(int).values])
-theo_m0, theo_m1, theo_m2 = dist[:, 0], dist[:, 1], dist[:, 2]
-```
-
-The averagine comparison path (for `averagine_deviation` features) uses the same function with `n_S=0` (consistent with the prior behaviour of omitting sulfur from the averagine model). Uses `n_C, n_H, n_N, n_O, n_S, mass` columns from `digest_fasta()`.
-
-### `feature_generator.py`
-
-Orchestrates feature computation and PSMList construction.
-
-`candidates_to_psm_list()` uses `itertuples()` (not `iterrows()`) for ~5x speedup. MALDI PSMs are always charge 1 (`Peptidoform(f"{peptide}/1")`).
-
-Three named feature group lists are exported from this module — see "Feature groups" section below. `LDA_FEATURES` is an alias for `MALDI_INTRINSIC_FEATURES` (currently identical) used by the LDA backend.
-
-### Feature groups
-
-`feature_generator.py` exports three lists that are importable directly:
-
-```python
-from MSI-PICASSO.feature_generator import (
-    MALDI_INTRINSIC_FEATURES, PROTEIN_LEVEL_FEATURES, LCMS_PRIOR_FEATURES
-)
-```
-
-**`MALDI_INTRINSIC_FEATURES`** — features passed to the ranker by default; computable from MALDI data alone plus in-silico properties:
-- Mass accuracy: `ppm_error_abs`, `ppm_rank`, `ppm_best_ratio`, `ppm_error_calibrated_z` (optional, requires pixel coords)
-- Ambiguity: `n_candidates`, `log_n_candidates`
-- Peptide (basic): `peptide_length`, `n_missed_cleavages`
-- Peptide (extended): `has_oxidized_met`, `has_cys`, `n_proline`, `acidic_residue_density`
-- MALDI signal: `log_maldi_intensity_p90`, `log_maldi_intensity_sum`
-- Mass defect: `kendrick_mass_defect`, `mass_defect_residual`
-- CHCA matrix: `chca_cluster_distance_ppm`
-- Theoretical isotope: `theo_isotope_cosine`, `theo_isotope_chi2`, `theo_isotope_kl`, `theo_has_sulfur`, `averagine_deviation`, `averagine_deviation_sulfur`, `theo_m1_ratio_diff`, `theo_m2_ratio_diff`, `monoisotopic_confidence`
-- Ionization priors: `n_arginine`, `n_basic_residues`, `n_aromatic`, `gravy_score`, `charge_proxy`
-- Ion mobility (optional, requires im2deep + observed CCS): `im2deep_delta_ccs`, `im2deep_abs_delta_ccs_pct`, `im2deep_ccs_zscore`, `im2deep_ccs_rank`, plus the m/z-detrended variants `im2deep_delta_ccs_resid`, `im2deep_abs_delta_ccs_pct_resid`, `im2deep_ccs_zscore_resid`, `im2deep_ccs_rank_resid` (see "m/z-detrended CCS" below)
-- Isotopologue co-localization (optional, requires ion_images): `isotope_image_colocalization_m1`, `isotope_image_colocalization_m2`, `isotope_image_colocalization_mean`
-- Adduct co-localization (optional, requires ion_images): `adduct_colocalization_na`, `adduct_colocalization_k`, `adduct_colocalization_chca`
-
-**`SPATIAL_PRIOR_FEATURES`** — excluded from the ranker; applied as additive log-prior alongside `LCMS_PRIOR_FEATURES` (via `compute_spatial_prior()` in `pipeline.py`):
-- `spatial_autocorrelation`, `fraction_detected`, `intensity_cv`, `log_mean_intensity`, `spatial_entropy`, `spatial_morans_i`, `spatial_gearys_c`
-
-**Why excluded from the ranker:** these are feature-level signals (identical for every candidate at the same MALDI m/z). They cannot discriminate between candidate sequences within a feature, so including them in the ranker adds no signal and may destabilise training. `spatial_gearys_c` is negated before normalization (lower Geary's C = positive autocorrelation = better quality).
-
-**`PROTEIN_LEVEL_FEATURES`** — excluded from the ranker by default; opt-in via `--use-protein-level-feats`:
-- Protein consistency: `protein_n_features`, `log_protein_n_features`, `protein_coverage`, `protein_rank`, `protein_best_ratio`
-- Protein co-localization (optional, requires ion_images): `protein_colocalization`, `protein_colocalization_max`, `protein_colocalization_median`, `protein_colocalization_n_partners`, `protein_colocalization_weighted`, `protein_colocalization_weighted_max`, `protein_colocalization_top2/top3/top5`; region-profile (opt-in `--region-coloc`): `protein_region_colocalization`
-
-**Why excluded by default:** these features aggregate counts and correlations over all candidates sharing a protein. They are only valid when decoys occupy a **separate protein namespace** from targets — every decoy method gives decoys a distinct protein label (`DECOY_…` for shuffle / balanced_shuffle / paired_shuffle / mz_shift / mz_shuffle, `ENTRAPMENT_…` for entrapment), so a decoy is never pooled with its source target's protein. (Before this was fixed, `mz_shift`/`mz_shuffle` decoys kept the real target protein name, which pooled targets and decoys under one protein and made decoy proteins colocalize as well as — or better than — targets: an invalid null.) Even with the namespace correct, these features can interact subtly with the decoy model, so they stay opt-in via `--use-protein-level-feats`.
-
-**`SPATIAL_RANKER_FEATURES`** — excluded from the ranker by default; opt-in via `--use-spatial-ranker-features`. Adds feature-level spatial quality (`spatial_autocorrelation`, `spatial_morans_i`, `spatial_gearys_c`, `fraction_detected`, `intensity_cv`) and protein colocalization (`protein_colocalization`, `protein_colocalization_max`, `protein_colocalization_median`, `protein_colocalization_n_partners`) to the ranker feature pool. The list is appended at runtime in `pipeline.py` only when the flag is active; `MALDI_INTRINSIC_FEATURES` is not modified.
-
-**Permitted decoy methods:** only `entrapment`, `mz_shift`, and `mz_shuffle`. Their decoys land on real MALDI features, so spatial features form a symmetric null (the ranker learns that real peptides at high-quality, spatially structured features score better than decoys at random/foreign anchors). `mz_shuffle` is the ideal case — its decoys are co-located with targets on the identical features, so the spatial features are *exactly* symmetric and cannot bias the null at all. With `shuffle`/`balanced_shuffle`/`paired_shuffle` the flag is **force-disabled with a `UserWarning`** (`_resolve_spatial_ranker_features` in `pipeline.py`): those decoys have no consistent spatial anchor, so spatial features would be asymmetric. The `protein_colocalization_*` members overlap `PROTEIN_LEVEL_FEATURES`; an order-preserving dedup guard in the `pipeline.py` feature-pool assembly prevents double-inclusion when both `--use-protein-level-feats` and `--use-spatial-ranker-features` are active.
-
-**`LCMS_PRIOR_FEATURES`** — excluded from the ranker, applied as an additive log-prior after scoring. All features are derived symmetrically from raw mzML (no search engine scores):
-
-*mzML-derived* (`_LCMS_MZML_FEATURES`):
-- MS2: `lcms_ms2_spectral_angle`, `lcms_ms2_n_matches` (both filtered by DeepLC RT window when `rt_window_min > 0`)
-- DeepLC-anchored MS1 signal: `lcms_ms1_intensity`, `lcms_ms1_snr`
-- DeepLC-anchored MS1 isotope: `lcms_ms1_isotope_cosine`, `theo_m1_ratio_diff_lcms`, `theo_m2_ratio_diff_lcms`, `log_theo_m1_ratio_diff_lcms`, `log_theo_m2_ratio_diff_lcms`
-- MALDI vs LC-MS/MS envelope similarity (requires `maldi_envelopes`): `isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_n_matched`, `isotope_absolute_diff`, `log_isotope_m1_ratio_diff`, `log_isotope_m2_ratio_diff`
-- DeepLC-anchored RT-consistency (requires `rt_window_min > 0`): `lcms_ms1_apex_rt_delta`, `lcms_ms1_frac_apex_signal`, `lcms_ms1_n_scans_with_signal`, `lcms_ms2_rt_delta`
-
-Note: all six MALDI-vs-LC-MS/MS envelope similarity features (`isotope_envelope_cosine`, `isotope_envelope_pearson`, `isotope_envelope_mse`, `isotope_n_matched`, `isotope_absolute_diff`, `log_isotope_m1_ratio_diff`, `log_isotope_m2_ratio_diff`) are in `_LCMS_MZML_FEATURES` and applied as a prior. They require `maldi_envelopes` to be non-None; when absent, all values are 0.0 and the columns are skipped by `compute_lcms_prior` (min == max → all-NaN after normalisation).
-
-*CCS-derived* (`_LCMS_CCS_FEATURES`, optional): `lcms_ccs_delta`, `lcms_ccs_abs_pct`
-
-Note: `_LCMS_ID_FEATURES` (`lcms_q_value`, `lcms_pep`, `lcms_score`, `n_psms`, `lcms_intensity`) are populated in the candidates DataFrame by Strategy C but are **not** included in `LCMS_PRIOR_FEATURES`. Using ID-derived features in the prior would give LC-MS/MS confirmed targets different treatment than decoys, breaking TDC symmetry.
-
-**Design rationale:** LC-MS/MS features are explicitly excluded from the ranker training set. Instead, LC-MS/MS evidence is applied as an additive log-prior *after* MALDI-intrinsic scoring (see `compute_lcms_prior()` and `compute_spatial_prior()` in `pipeline.py`). `compute_lcms_prior` min-max normalizes each mzML feature (using `np.nanmin`/`np.nanmax` to ignore NaN), fills NaN sentinel values (e.g. `lcms_ms2_spectral_angle` when no MS2PIP prediction) with the column minimum after normalization so they do not penalize candidates, and returns the `np.nanmean` across features as a per-candidate weight in (0, 1]. Features that are all-NaN after normalization are skipped. The log of this weight (and the spatial prior) is added to the round-2 score before FDR computation.
-
-`get_feature_names()` returns `MALDI_INTRINSIC_FEATURES + LCMS_PRIOR_FEATURES` for backwards compatibility (optional groups included only when data was computed).
+## Decoy generation
+
+`decoy_method` selects the Step-1c generator. All five are supported and all remain
+candidates for improving results. **This section describes capability only** — for how each
+one has actually performed, see PROGRESS.md §4, where every finding carries the
+configuration it was established under.
+
+| method | what it does | preserves | notes |
+|---|---|---|---|
+| `substitution` | substitutes `substitution_n_residues` interior non-K/R residues, one decoy per unique target | length, cleavage sites | **changes elemental composition** — see invariant 3. Mass shift ~1–50 Da, so CCS features stay usable and it is compatible with `--match-ccs`. |
+| `mz_shift` | shifts the query m/z by a random delta in `[delta_min, delta_max]` Da | sequence exactly | in raw-query, snapping is disabled so each decoy sits at its exact shifted m/z on a distinct feature |
+| `mz_shuffle` | derangement of the peptide→feature assignment (mass-sorted rotation) | sequence exactly | decoys are **co-located** with targets on identical ion images, so feature-quality features are exactly symmetric. **Do not combine with `--match-ccs`** — it would remove ~all decoys by design. Raw CCS scalars and mobility-gated colocalizations are auto-excluded (`_MZ_SHUFFLE_CCS_LEAK_FEATURES`); only `*_resid` variants are kept. |
+| `entrapment` | tryptic peptides from a foreign-organism FASTA (`entrapment_fasta`), isobaric-with-target ones filtered out | — | `protein="ENTRAPMENT_{acc}"` |
+| `balanced_shuffle` / `paired_shuffle` | iterative K/R-preserving protein shuffle, keeping only decoys that match a MALDI feature | cleavage sites | achieves ~1:1 T:D on sparse feature lists. **Not compatible with `use_spatial_ranker_features`** (no consistent spatial anchor). |
+
+Every method places decoys in a **separate protein namespace** (`DECOY_…` / `ENTRAPMENT_…`)
+so protein-level features are computed within class and a decoy is never pooled with its
+source target's protein.
+
+`_SPATIAL_RANKER_OK_DECOYS` (`pipeline.py:53`) = `{entrapment, mz_shift, mz_shuffle,
+substitution}`. With any other method `use_spatial_ranker_features` is force-disabled with a
+`UserWarning`.
 
 ---
 
-## Candidate generation strategies
+## Scoring backends
 
-> **The baseline runs use Strategy C** (LC-MS/MS-guided). Both configs pass
-> `lcms-peptides` and no `fasta` in raw-query mode, so the candidate set is the
-> LC-MS/MS-identified peptides only (see the `Strategy C candidates: N lcms_confirmed +
-> 0 protein_digest + N decoy` log line). Strategy A (full-FASTA "digest mode") is the
-> legacy path, retained but not the current focus.
+`--model` accepts **`{lda, qda, svm, gbt, rbf_svm}`** (`cli.py:819`).
 
-### Strategy A — full FASTA digest (legacy)
-
-`digest_fasta(fasta_path, ...)` digests all proteins in the FASTA and generates K/R-preserving shuffled decoys. Used when `rescore()` is called without `lcms_peptides_path`. Add `--digest` to combine a FASTA digest with Strategy C; the baselines do not.
-
-### Strategy C — LC-MS/MS guided (current)
-
-Activated in `rescore()` by passing `lcms_peptides_path`. Implemented in `lcms_ids.py` + `digest_identified_proteins()`.
-
-**Candidate set** = in-silico digest of identified proteins ∪ directly identified LC-MS/MS peptides.
-
-The `source` column on the candidates DataFrame encodes the origin of each row:
-
-| `source` value | Meaning |
-|---|---|
-| `"protein_digest"` | From in-silico digest of an identified protein; not directly observed in LC-MS/MS |
-| `"lcms_confirmed"` | Directly identified in LC-MS/MS at the specified FDR; also included in digest when protein is identified |
-| `"decoy"` | K/R-preserving shuffle of an identified protein (digest mode), or pseudo-protein concat decoy (LC-only mode) |
-
-**Decoy generation — two sub-cases:**
-
-*With `--digest` (fasta_path not None):* Identified proteins are shuffled at the protein level (`_shuffle_protein`) and re-digested. Novel confirmed sequences not reachable from the digest get a per-peptide K/R-preserving shuffle as their decoy. `protein = "DECOY_{accession}"`.
-
-*Without `--digest` (fasta_path=None, LC-only mode):* All confirmed peptides are novel. Per-peptide shuffle would produce decoys with identical elemental composition (same residue multiset, just reordered) — making isotope envelope features (`theo_isotope_cosine`, `theo_isotope_chi2`) non-discriminative. Instead, the **concatenated pseudo-protein** strategy is used:
-1. All confirmed sequences are sorted and concatenated into a single pseudo-protein string.
-2. `_shuffle_protein(pseudo_protein, random_state=42)` redistributes non-K/R residues across the entire sequence.
-3. The shuffled pseudo-protein is digested with the same trypsin rules (same `missed_cleavages`, `min_length`, `max_length`).
-4. Exact matches with any target sequence are removed.
-5. If more decoys than targets: subsample to match (seeded). If fewer: warn about sub-1:1 TDC ratio.
-6. All decoys get `protein = "DECOY_concat"` and `source = "decoy"`.
-
-This ensures decoy peptides draw non-K/R residues from across the shuffled pool of all target peptides, breaking the isobaric property of per-peptide shuffle.
-
-LC-MS/MS evidence is joined onto target rows from `lcms_ids.peptides`; decoy rows always get `NaN`.
-
-**Fallback:** if `digest_identified_proteins()` returns 0 rows (e.g. no FASTA proteins found), `rescore()` falls back to Strategy A with a warning.
-
-**`is_decoy` dtype:** Both `digest_fasta()` and `digest_identified_proteins()` enforce `df["is_decoy"] = df["is_decoy"].astype(bool)` before returning. This prevents pandas `object`-dtype booleans (which arise from `pd.concat` with empty DataFrames) from breaking `~df["is_decoy"]` boolean indexing downstream.
-
-### `lcms_ids.py`
-
-Parses LC-MS/MS identification results into an `LCMSIds(proteins, peptides)` namedtuple.
-
-| Component | Type | Content |
+| model | estimator | notes |
 |---|---|---|
-| `proteins` | `set[str]` | Normalised accessions passing `protein_fdr` |
-| `peptides` | `pd.DataFrame` | Unique sequences passing `peptide_fdr`, with evidence columns |
+| `lda` | `LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")` | package default; importances are `coef_[0]` |
+| `svm` | `sklearn.svm.LinearSVC` | shares `_rescore_linear` with `lda`; adds no dependency |
+| `rbf_svm` | `sklearn.svm.SVC(kernel="rbf")` | nonlinear; no `coef_`, so importances are reported as \|structure coefficient\|. `rbf_svm_gamma` accepts `"scale"`/`"auto"` or a float. Training is O(N²). |
+| `qda` | `QuadraticDiscriminantAnalysis(reg_param=0.1)` | reuses R1 posteriors for PEP under `--single-round` |
+| `gbt` | gradient-boosted trees (`_rescore_gbt`, `pipeline.py:991`) | `gbt_n_estimators`, `gbt_max_depth`, `gbt_learning_rate`; never benchmarked on the three datasets |
 
-**Peptide DataFrame columns:** `sequence`, `peptidoform`, `protein`, `q_value`, `pep`, `score`, `n_psms`, `charge`, `rt_mean`, `lcms_intensity`
+All backends share the same semi-supervised loop: seed → pseudo-label iteration → winner
+selection → TDC.
 
-**RT unit normalisation** (`_parse_psm_utils`): after aggregating PSMs to peptide level, if the median `rt_mean` exceeds 200 the values are divided by 60 (seconds → minutes). This matches the same pattern used in `_join_psm_rt_intensity`. FragPipe PSM TSV files report `Retention` in seconds (typical range 131–2564 s); all other supported formats report in minutes.
+**Out-of-fold scoring.** `_cv_semisup_scores` (default `cv_folds=3`, stratified by
+`is_decoy`) scores every candidate with a model trained on the other folds. Feature
+importances come from a model fit on everything, but the FDR scores are strictly
+out-of-fold.
 
-**Supported formats** (pass as `lcms_id_format` to `rescore()`):
+**Round-1 seed** — `_find_best_feature_labels` (`pipeline.py:456`) sweeps each feature and
+both ranking directions, counting targets at q ≤ `train_fdr`. Sub-ULP random noise breaks
+ties so row order cannot bias the result. If the best single feature yields fewer than
+`min_seed_positives` targets it escalates to pairwise sums/differences on standardised
+columns, then to a depth-3 `DecisionTreeClassifier`. Columns in `_BEST_FEAT_SKIP`
+(composition and ionisation features) are excluded throughout — invariant 3.
 
-| Format | Files needed | Notes |
-|---|---|---|
-| `"percolator"` (default) | `peptides_path` (required), `proteins_path` (optional), `psms_path` (optional) | Column names auto-discovered by partial lowercase match; psms file used for RT/intensity aggregation |
-| `"mzidentml"` | single mzIdentML file as `peptides_path` | q-value from CV `MS:1002354`, PEP from `MS:1002356` |
-| `"psm_utils"` | any psm_utils-supported file as `peptides_path` | Aggregated to peptide level |
-| `"msf"` | ProteomeDiscoverer `.msf` SQLite file as `peptides_path` | Queries `TargetPsms` joined with `TargetProteins`; filters by `PercolatorqValue <= peptide_fdr`; no separate PEP stored (`pep` column is NaN). In the CLI, passing `--msf` without `--lcms-peptides` automatically activates Strategy C using the MSF as the ID source. |
-| `"ms2rescore"` | ms2rescore `.psms.tsv` output as `peptides_path` | Alias for `psm_utils` reader with `psm_utils_reader="tsv"`. Use when LC-MS/MS IDs come from an ms2rescore-rescored PSM list. |
+Fallback chain when that yields nothing: `ppm_error_abs < init_ppm_threshold` OR
+`n_candidates == 1`; then the top `r1_seed_percentile` of targets by `ppm_error_abs`.
 
-**Accession normalisation** (`_normalize_accession`): strips UniProt/RefSeq prefixes before comparing against the FASTA:
-
-```
-sp|P12345|GENE_HUMAN  →  P12345
-tr|A0A000|GENE_HUMAN  →  A0A000
-P12345 some description  →  P12345
-P12345  →  P12345
-```
-
-`filter_fasta_to_proteins(fasta_path, protein_accessions)` warns if fewer than 50% of requested accessions are found — this typically indicates an accession format mismatch between the LC-MS/MS search database and the supplied FASTA.
-
-### `pipeline.py`
-
-`rescore()` is the end-to-end entry point. Accepts `extra_ion_images: dict | None` (keys: `"m1"`, `"m2"`, `"na"`, `"k"`, `"chca"`) and passes it through to `compute_all_features` → `compute_isotopologue_colocalization` / `compute_adduct_colocalization`. Populated by `_load_maldi` in `cli.py` from the Bruker RAM extraction path or from NPZ `extra_*` keys. Steps 1-8 are identical for both backends; step 9 diverges:
-
-**Key `rescore()` parameters exposed since v0.1:**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `matching_ppm` | 20.0 | ppm window for candidate-to-feature linking in `match_to_maldi_features` — separate from `ppm_tolerance` (extraction window) |
-| `fragment_tol_da` | 0.02 | MS2 fragment matching tolerance (Da) for spectral angle computation |
-| `winner_percentile` | 0.02 | `_select_feature_winners` quality filter: features whose R1 winner score falls below this quantile of all winner scores are dropped before R2 training |
-| `rt_window_multiplier` | 2.0 | RT window = multiplier × p95 DeepLC MAE; controls ±window for MS1/MS2 RT filtering |
-| `lcms_prior_weight` | 1.0 | Multiplicative weight on the LC-MS/MS log-prior in reweighted scoring |
-| `spatial_prior_weight` | 1.0 | Multiplicative weight on the spatial quality log-prior in reweighted scoring |
-| `match_ccs` | False | Enable CCS-based candidate filtering after IM2Deep finetuning (see below) |
-| `ccs_window_multiplier` | 2.0 | CCS filter threshold = multiplier × p95 \|delta_CCS%\| on single-candidate calibration set |
-| `entrapment_fasta` | None | Foreign-organism FASTA used as the null when `decoy_method="entrapment"` (required for that method) |
-| `maldi_query_raw` | False | Raw-query mode: extract ion images directly at candidate-derived m/z (requires `maldi_d_path`); inverts pipeline ordering |
-| `maldi_d_path` | None | Raw Bruker `.d` directory; required when `maldi_query_raw=True` |
-| `extraction_ppm` | 25.0 | Ion image extraction half-window (ppm) for raw-query mode |
-| `use_spatial_ranker_features` | False | Include `SPATIAL_RANKER_FEATURES` in the ranker; only valid with `decoy_method` ∈ {entrapment, mz_shift} |
-| `drop_zero_signal` | False | Remove candidates where `feature_intensity_sum == 0` after feature computation. Symmetric: co-located target+decoy are both dropped. Prevents `peptide_length` leak from the `mz_shuffle` zero-signal subpopulation. CLI `--drop-zero-signal`. |
-
-**Decoy mode parameter:** `decoy_method` (str) controls Step 1c:
-- `"substitution"` — **current default for the baseline runs.** One decoy per unique target by substituting `substitution_n_residues` interior non-K/R residues (`generate_substitution_candidates`). Size-fair, CCS-safe, spatial-ranker-compatible; the recommended method in raw-query mode. See [Core design principle 2](#2-decoy-generation). CLI: `--decoy-method substitution`, `--substitution-n-residues INT`, `--substitution-no-collision-filter`.
-- `"shuffle"` — standard K/R-preserving protein shuffle (via `digest_fasta` / `digest_identified_proteins`). Decoys are sequence-space decoys with distinct elemental compositions (different `theo_isotope_cosine`).
-- `"mz_shift"` — observation-space m/z-shift decoys via `generate_mz_shift_candidates()`. Each unique target peptide is shifted by a random delta in `[mz_shift_delta_min, mz_shift_delta_max]` Da (sign alternates). In feature-list mode the shift is snapped to the nearest MALDI feature within `mz_shift_snap_tolerance_ppm`; **in raw-query mode (`maldi_query_raw`) snapping is disabled** (`snap_to_features=False`) so each decoy sits at its exact shifted m/z on a distinct feature — avoiding the decoy-clustering that otherwise collapses decoys onto few grid points and skews the winner T:D ratio (see candidates.py). A collision filter rejects shifts within `matching_ppm` of a target m/z (and, in raw-query, of an already-used decoy m/z). **`feature_mz` on mz_shift decoy rows is the shifted (off-target) m/z, not the original peptide m/z** — load-bearing for raw-query. `ppm_error` is copied from the peptide's best target match in feature-list mode (non-discriminative) and recomputed from observed peak centroids in raw-query mode. `source = "decoy_mz_shift"`. Decoys get a **separate protein namespace** (`DECOY_<protein>`) so protein-level features stay within-class. **Compatible with `use_spatial_ranker_features`** (decoys land on real MALDI features → genuine spatial signal at the anchor; an acceptable null).
-- `"mz_shuffle"` — m/z-assignment-shuffle decoys via `generate_mz_shuffle_candidates()`. A derangement of the peptide→feature assignment: each real target peptide is relocated onto **another peptide's real feature** (mass-sorted rotation σ with no fixed point and a large mass gap, so never self- or near-isobaric). Result: decoy features = the target feature set, **co-located 1 target + 1 decoy per feature on the identical ion image**, so feature-quality features (`fraction_detected`, intensity, spatial, colocalization) are *identical* between a feature's target and decoy and contribute **zero** to the target/decoy separation — the ranker is forced onto the peptide-specific predicted-vs-observed match (`im2deep_*` CCS, isotope). Restores genuine per-feature competition (contested features, which `mz_shift` lacks). `ppm_error` is inherited from the peptide's best target match (non-discriminative; recomputed anchor-relative in raw-query) — it must **not** be computed against the decoy peptide's own mass, since that mismatch does not exist for real false positives (which match within tolerance) and would make the null anti-conservative. `source = "decoy_mz_shuffle"`. **Recommended with `use_spatial_ranker_features`** — this is the case where the quality features are exactly symmetric. Mild conservative bias (the decoy's "wrong peptide" is another real peptide-like peak; real false positives may be easier-to-reject non-peptides). **CCS / mobility handling:** any feature that uses the candidate's *predicted* CCS/mobility to gate or compare against the observed feature leaks the m/z baseline for `mz_shuffle` (decoys relocated far in mass; CCS / 1-K0 ∝ m/z). The pipeline therefore **excludes `_MZ_SHUFFLE_CCS_LEAK_FEATURES` from the ranker for `mz_shuffle`** — the raw `im2deep_*` CCS scalars **and** the mobility-gated colocalizations (`isotope_colocalization_*_mob`, `adduct_colocalization_*_mob`, which filter the shared ion image with each candidate's own predicted-1/K0 window, so a decoy's window misses the heavy feature's peak) — keeping only the m/z-detrended `*_resid` CCS features. The **non-gated** colocalizations (`isotope_image_colocalization_*`, `adduct_colocalization_*`) stay: they read the shared co-located ion image, so they are exactly symmetric (AUC ≈ 0.5). Other decoy methods keep all of these. **Do not combine `mz_shuffle` with `--match-ccs`** — the CCS prefilter would remove ~all decoys (they fail CCS by design), collapsing the null; let CCS discriminate in the ranker instead.
-
-**m/z-detrended CCS (`*_resid`):** `compute_im2deep_features` fits a power-law CCS↔m/z trend `g(mz)=A·mz^B` on the calibration peptides (`_ccs_mz_baseline`) and subtracts the expected m/z-gap CCS difference `g(feature_mz) − g(mh_mz)` from the raw delta. For targets (`feature_mz == mh_mz`) the baseline is 0 so `*_resid == raw`; for decoys whose peptide m/z differs from the feature m/z (`mz_shift`/`mz_shuffle`/`entrapment`) it removes the trivial m/z-gap separation, leaving the conformational mismatch (`conf(observed) − conf(predicted)`), which is exchangeable with an isobaric false positive. A leak-check log line reports `|corr(raw Δ, decoy_delta_da)|` vs `|corr(residual Δ, decoy_delta_da)|` — the residual should be near 0.
-- `"entrapment"` — decoys are tryptic peptides from a foreign-organism FASTA (`entrapment_fasta`) via `load_entrapment_candidates()`. A contamination filter removes any entrapment peptide isobaric (within `matching_ppm`) with a target; surviving peptides are matched to MALDI features exactly as targets. `protein="ENTRAPMENT_{accession}"`, `source="entrapment"`. **Compatible with `use_spatial_ranker_features`.**
-- `"balanced_shuffle"` — iterative K/R-preserving protein shuffle with MALDI-match filtering via `generate_balanced_shuffle_candidates()`. Runs up to `max_shuffle_rounds` (default 50) rounds of protein-level shuffle, keeping only decoy peptides that match a MALDI feature within `matching_ppm`. Subsamples the collected pool to `target_ratio * N_target` (default 1.0). Unlike standard shuffle (one decoy per target regardless of MALDI match), this ensures decoys compete in the same observation space as targets and achieves ~1:1 T:D even when the MALDI feature list is sparse. LC-MS/MS evidence columns are NaN for all decoy rows (shuffle decoys have different sequences; inheriting evidence would break TDC symmetry). `source = "decoy_balanced_shuffle"`. **Not compatible with `use_spatial_ranker_features`** (no consistent spatial anchor).
-- `"paired_shuffle"` — same shuffle pool as `balanced_shuffle` but decoys are feature-occupancy-matched (`selection_mode="feature"`), drawn at the same m/z features that targets occupy to maximise per-feature competition. **Not compatible with `use_spatial_ranker_features`.**
-
-CLI flags: `--decoy-method {shuffle,mz_shift,mz_shuffle,entrapment,balanced_shuffle,paired_shuffle}`, `--entrapment-fasta PATH`, `--mz-shift-delta-min FLOAT`, `--mz-shift-delta-max FLOAT`, `--mz-shift-snap-tolerance-ppm FLOAT`, `--max-shuffle-rounds INT`, `--decoy-target-ratio FLOAT`, `--maldi-query-raw`, `--use-spatial-ranker-features`, `--drop-zero-signal`.
-
-1. Generate candidates (Strategy A or C) + match to MALDI features
-2. Load LC-MS/MS data
-3. Find MS2 matches by neutral mass; run MS2PIP only for `(peptide, charge)` pairs at features with observed MS2 scans
-4. DeepLC: optionally fine-tune on PD MSF or FragPipe RT table, then predict RT for all unique peptides
-5. Compute LC-MS/MS evidence features (DeepLC-anchored MS1 features; fully symmetric)
-6. Compute all features (includes IM2Deep finetuning on `n_candidates==1` matches when CCS data is available)
-6a. **No-signal colocalization fill** — `_fill_nosignal_coloc_worst_case()` runs unconditionally: for candidates where `feature_intensity_sum == 0`, any protein-colocalization NaN (which the imputer would otherwise fill with the column median, silently rewarding zero-evidence candidates) is replaced by the pooled finite minimum — the worst in-distribution value. The mask and fill value are both `is_decoy`-blind (co-located pairs under `mz_shuffle` share the same `feature_intensity_sum`).
-6b. *(optional)* **Zero-signal drop** — when `drop_zero_signal=True` (`--drop-zero-signal`): all candidates where `feature_intensity_sum == 0` are removed. Symmetric (both target and decoy at a zero-signal feature are dropped, preserving T:D balance). Recommended for raw-query + `mz_shuffle` to prevent `peptide_length` leak (see Known Bias §1).
-6c. *(optional)* **CCS filter** — when `match_ccs=True`: compute p95 of `im2deep_abs_delta_ccs_pct` on single-candidate matches; remove all candidates where `im2deep_abs_delta_ccs_pct > ccs_window_multiplier × p95`; recompute `n_candidates` and `log_n_candidates`. LDA positive seeding at step 9 uses post-filter `n_candidates`, so newly unambiguous features (filtered down to one candidate) contribute as seed positives.
-7. Build PSMList + populate rescoring features
-8. Rescore using selected backend (see "Rescoring backends" below)
-
-### Two-pass scoring logic
-
-All backends follow the same two-pass structure:
-
-1. **Round 1** — score all candidates globally. The model does not use per-feature grouping; every candidate is treated on equal footing.
-2. **Per-feature winner selection** (`_select_feature_winners`) — for each MALDI m/z feature, retain only the highest round-1 score candidate. Produces `winners_df` (~N rows for N features). A quality filter is then applied: features whose winner R1 score falls below `np.quantile(winner_scores, winner_percentile)` are dropped (`is_tdc_winner=False`, `q_value=NaN`). `winner_percentile` defaults to 0.02 (2nd percentile); raise it to filter more aggressively before R2 training.
-3. **Round 2** — retrain/rescore on the winner subset only. Because each feature contributes exactly one candidate, this is a cleaner training set than the full candidate pool.
-4. **FDR** — standard TDC (`_tdc_qvalues`) over all winners sorted by round-2 score. Q-values propagated to non-winners as NaN.
-
-**Single-round toggle (`single_round=True`, `--single-round`).** Skips step 3: the FDR is computed directly on the R1 winner scores (`scores2 = scores1[winner_pos]`), and the R2 importance/struct outputs reuse the R1 model. Steps 1, 2, 4 are unchanged — crucially, the per-feature winner selection (the **target-vs-decoy competition** that defines the TDC population) still runs, so the FDR semantics are identical; only the final discriminant refit is dropped. Motivated by raw-query (`--maldi-query-raw`): with `--matching-ppm 0` there is ~1 target per feature and (with `mz_shuffle`) one co-located decoy, so R1 already trains on a clean ~1:1 target:decoy set and R2 typically adds little. The winner selection collapses *target-vs-target* ambiguity — moot in raw-query — but the *target-vs-decoy* duel it performs is not, which is why winner selection is kept and only R2 is optional. Implemented for `lda`/`svm` (shared branch) and `qda` (which reuses R1 posterior probabilities for PEP). Use it to A/B whether R2 changes the IDs-at-1%-FDR on a given run. **Debug figures** are kept honest when `single_round`: `save_debug_figures(single_round=True)` suppresses the round-2 feature-importance panel and relabels the round-2/final panels in the score-PP, score-distribution, PEP-mixture, and feature-distribution figures as "final (R1 winners)" instead of "R2" (the `*_score_r2` column is retained as the final-score slot; only labels change). The R2 importance TSVs / score pickles are not written.
-
-`result_df` contains all candidates. Round-2 score, q-value, and reweighted columns are NaN for non-winners. `is_tdc_winner` marks the round-1 winner per feature.
-
-### Rescoring backends
-
-`rescore()` accepts a `model` parameter (`{lda, qda, svm, rbf_svm}`). **`lda` is the general default**, and the right choice when the seed is strong and the separation is roughly linear (amyloidosis: 159 positives). **Backend choice is data-dependent, though:** on the weak-signal kidney case (near-chance features, 32-positive seed) `lda` collapsed to an out-of-fold AUC of 0.501 — pure chance, zero IDs — while `rbf_svm` reached 0.543 by capturing a little nonlinear structure. So `rbf_svm` is kept for kidney. Lesson: a weak seed is not automatically a reason to prefer `lda`; if the signal is near-chance and nonlinear, the linear model extracts nothing. Test both.
-
-**`model="lda"` (default):** Semi-supervised `LinearDiscriminantAnalysis` (sklearn) on `MALDI_INTRINSIC_FEATURES`. No extra dependencies beyond sklearn (always installed). Converges quickly and produces clean feature importances.
-
-Preprocessing: ±inf replaced with NaN, then `SimpleImputer(strategy="median")` + `StandardScaler` inside a sklearn `Pipeline`. LDA is configured with `solver="lsqr"` and `shrinkage="auto"` (Ledoit-Wolf regularisation).
-
-**Shared linear routine.** LDA and SVM (below) are both linear, `decision_function`-based classifiers and share a single implementation, `_rescore_linear(..., make_clf, clf_name)` (`pipeline.py`). `make_clf` is a zero-arg factory for the final pipeline estimator and `clf_name` its step key / log tag; `_rescore_lda` and `_rescore_svm` are thin wrappers. The entire dispatch branch (`if model in ("lda","svm")`) is shared — winner selection, TDC, PEP-from-scores, reweighting — with score columns tagged `f"{model}_score_r1/r2"` and importance TSVs `17_debug_{model}_importances_r{1,2}.tsv`. Importances are `coef_[0]` for both.
-
-**Cross-validated scoring (LDA, SVM, and QDA).** The pseudo-label iteration scores candidates **out-of-fold** (`_cv_semisup_scores`, default `cv_folds=3`, stratified by `is_decoy` via `_make_fold_ids`): at each iteration every candidate is scored by a model trained on the *other* folds' positives/decoys, so no row is scored by a model that trained on it. This prevents the semi-supervised discriminant from **overfitting** — i.e. manufacturing target/decoy separation by fitting noise in high-dimensional feature space, which would make the TDC FDR anti-conservative. (Diagnostic: a plain in-sample LDA on a fair `mz_shuffle` null gave in-sample AUC 0.71 but 5-fold CV AUC 0.45 — at chance; the in-sample separation was entirely overfit.) Folds are fixed across iterations; the function falls back to in-sample scoring only when there are fewer than `2·cv_folds` targets or decoys (logged). The returned **feature importances / structure coefficients come from a model fit on all positives+decoys** (reporting only — never the FDR scores, which are strictly out-of-fold). `_tdc_qvalues`, winner selection, and reweighting all operate on the out-of-fold scores.
-
-**Round-1 seed — `_find_best_feature_labels` (Mokapot-style):**
-
-For each feature column and each ranking direction (ascending / descending), TDC q-values are computed and the number of targets at q ≤ `train_fdr` is counted. Sub-ULP random noise (`np.random.default_rng(0).uniform(-1e-9, 1e-9)`) is added before argsort to break ties and prevent row-order bias (targets listed before decoys in the DataFrame would otherwise receive artificially low q-values under stable sort). The (feature, direction) pair yielding the most targets is selected.
-
-If the best single-feature result is below `min_pair_threshold` (default 10) targets, all pairwise sums and differences of eligible features are tried on standardised columns. The composite score beating the single-feature result is used if one exists.
-
-If the pairwise result is *still* below that threshold, a depth-3 `DecisionTreeClassifier` (`min_samples_leaf=20`) is fit on all eligible columns at once (target vs. decoy), and candidates are ranked by leaf target-probability. This is the O6 seeding tier: single features and pairwise sums/differences are both linear-direction rankings, so a pattern like "target iff (feature A high AND feature B high) OR (feature A low AND feature B low)" — two disjoint target-rich regions with no shared sign — cannot be captured by either; a tree with two leaves can. Only runs when both classes are present (skipped for degenerate all-target/all-decoy inputs, e.g. the R2 seed call).
-
-Columns in `_BEST_FEAT_SKIP` are excluded from the single-feature, pairwise, and tree sweeps because they measure amino acid composition rather than spectral quality and can produce spurious pseudo-positives when shuffled decoys have a different residue composition than targets:
-
-```python
-_BEST_FEAT_SKIP = {
-    "peptide_length", "n_missed_cleavages",         # basic sequence
-    "has_oxidized_met", "has_cys", "n_proline", "acidic_residue_density",  # composition
-    "n_arginine", "n_basic_residues", "n_aromatic", "gravy_score", "charge_proxy",  # ionisation
-}
-```
-
-**Fallback chain when best-feature init yields 0 targets:**
-1. `ppm_error_abs < init_ppm_threshold` OR `n_candidates == 1`
-2. If that also yields nothing: top `r1_seed_percentile` (default 10%) of targets by `ppm_error_abs`
-
-**Pseudo-label iteration** (up to `max_iter` rounds, default 5): train on seed positives (+1) + all decoys (−1), excluding unlabelled targets (0) from the training set; score all candidates with `decision_function`; recompute TDC q-values; promote all targets at q ≤ `train_fdr` to +1. Stop when the positive count changes by < 1% or no positives remain.
-
-**Round-2 seed:** top `r2_seed_percentile` (default 20%) of target TDC winners by R1 score — i.e. targets with `R1_score ≥ np.percentile(target_winner_scores, 100*(1−r2_seed_percentile))`. Ppm-based seeding is not used for R2 because after winner selection most targets already satisfy `ppm_error_abs < init_ppm_threshold` and the criterion becomes uninformative.
-
-**Key parameters** (all configurable via CLI / TOML):
-
-| Parameter | Default | Effect |
-|---|---|---|
-| `init_ppm_threshold` | 5.0 | ppm cutoff for the ppm-based fallback seed |
-| `train_fdr` | 0.01 | q-value threshold for pseudo-label promotion |
-| `max_iter` | 5 | Maximum pseudo-label iterations |
-| `min_pair_threshold` | 10 | Min targets required from single feature before trying pairs |
-| `r1_seed_percentile` | 0.10 | Top fraction of targets by ppm used as last-resort R1 seed |
-| `r2_seed_percentile` | 0.20 | Top fraction of target winners by R1 score used as R2 seed |
-
-Feature importances: `|coef_[0]|` from the final Pipeline LDA. Saved to `17_debug_lda_importances_r1/r2.tsv` when `--verbose`.
-
-Returns `(psm_list, result_df, feature_names)` where `result_df` has columns: `peptide`, `protein`, `feature_mz`, `feature_idx`, `is_decoy`, `lda_score_r1`, `lda_score_r2`, `q_value`, `is_tdc_winner`, `reweighted_score`, `reweighted_q_value`.
-
----
-
-**`model="svm"`:** Semi-supervised `sklearn.svm.LinearSVC` (`penalty="l2"`, `loss="squared_hinge"`, `C=svm_c` (default 1.0, `--svm-c`), `dual="auto"`, `max_iter=2000`) on `MALDI_INTRINSIC_FEATURES`. Shares `_rescore_linear` with LDA, so the median imputer (LinearSVC rejects NaN), StandardScaler, out-of-fold CV, pseudo-label iteration, and `coef_[0]` importances are identical; only the final estimator differs. `LinearSVC.decision_function()` provides the per-candidate score the CV machinery needs. Result columns: `svm_score_r1`, `svm_score_r2`. A fast linear alternative to LDA for benchmarking (the two often track closely; SVM's hinge loss is less sensitive to non-Gaussian feature tails).
-
-> **Removed backends (distinct from the above):** the *old* `model="svm"` (mokapot `PercolatorModel`) and `model="catboost"` (`CatBoostRanker`) were removed. The current `svm` is sklearn `LinearSVC` and adds no dependency. `--model` accepts `{lda, qda, svm}`. The `mokapot`/`catboost` packages and `probabilistic_scorer.py` (the former SVM/CatBoost step-7b feature source) are no longer used by the scoring path.
-
-**`model="qda"`:** Semi-supervised `QuadraticDiscriminantAnalysis(reg_param=0.1)` on `MALDI_INTRINSIC_FEATURES`. Same pseudo-label iteration and seed logic as LDA. `reg_param=0.1` regularizes the per-class covariance toward a scaled identity matrix. Returns `(psm_list, result_df, feature_names)` where `result_df` has columns analogous to LDA but with `qda_score_r1`, `qda_score_r2`.
-
-**`model="rbf_svm"`:** Semi-supervised RBF-kernel `sklearn.svm.SVC(kernel="rbf", C=rbf_svm_c, gamma=rbf_svm_gamma)`. Nonlinear analog of the linear `svm` backend; reuses the same `_rescore_linear` machinery (seed, pseudo-label iteration, out-of-fold CV, winner selection, TDC, PEP, reweighting) via `decision_function`. The kernel has no `coef_`, so per-feature importances are reported as `|structure coefficient|` (correlation of each feature with the score). `rbf_svm_gamma` accepts `"scale"`/`"auto"` or a float; on standardized features gamma ≈ 0.01–0.03 with `rbf_svm_c` ≈ 5–10 typically beats `"scale"` (`--rbf-svm-gamma`, `--rbf-svm-c`). Score columns `rbf_svm_score_r1/r2`. Training is ~O(N²) — fine at MALDI candidate scale. **Caveat:** needs a reasonably sized seed; on a weak seed (kidney: 32 positives) it can erode rather than grow the positive set — prefer `lda` there.
-
-
-**Post-scoring reweighting** (applied after all backends to winners only):
-
-`compute_lcms_prior()` min-max normalizes each `LCMS_PRIOR_FEATURES` column using `nanmin`/`nanmax`. NaN values (e.g. `lcms_ms2_spectral_angle` when no prediction exists) are treated as the column minimum after normalization so they contribute 0 without inflating the mean. The `nanmean` across available features returns a per-candidate weight in (0, 1]; candidates where all features are NaN receive weight 1.0 (no penalty).
-
-`compute_spatial_prior()` min-max normalizes spatial quality features (`spatial_autocorrelation`, `spatial_gearys_c` negated, etc.) for the winner subset and returns a per-candidate weight in (0, 1]. Returns 1.0 if no informative spatial features are present.
-
-Both priors are combined as a **weighted additive log-prior** (not a multiplicative prior):
+**Post-scoring reweighting** (winners only) is an **additive log-prior**, not multiplicative:
 
 ```
 reweighted_score = round2_score
-                 + lcms_prior_weight  * log(lcms_prior)
+                 + lcms_prior_weight   * log(lcms_prior)
                  + spatial_prior_weight * log(spatial_prior)
 ```
 
-`lcms_prior_weight` and `spatial_prior_weight` (both default 1.0) scale the contribution of each prior independently. Values > 1 amplify the prior's influence; 0 disables it entirely. Multiplicative combination would invert the ranking for negative scores (a bad candidate with low prior would become less negative, i.e. higher ranked). The additive log form penalises low-prior candidates uniformly regardless of score sign. Q-values are recomputed on the reweighted scores with a second `_tdc_qvalues` call. Only winner rows receive non-NaN values.
+Multiplicative combination would invert the ranking for negative scores.
 
 ---
 
-## Rust extension (crate `MSI-PICASSO-rs`, dir `msi-picasso-rs/`, import `ms1rescore_rs`)
+## Feature groups
 
-Built with PyO3 + rayon; imported in Python as `from ms1rescore_rs import ...`. Exposed functions:
+Defined in `feature_generator.py`; import as `from msi_picasso.feature_generator import ...`.
 
-| Function | Module | Description |
+| constant | line | in the ranker? |
 |---|---|---|
-| `compute_peptide_masses(sequences)` | digest.rs | Returns (masses, mh_mzs, n_C, n_H, n_N, n_O, n_S) for a list of peptide sequences |
-| `match_mz(feature_mzs, peptide_mzs, ppm)` | digest.rs | Binary search m/z matching; returns (feat_idx, pep_idx, ppm_errors) |
-| `extract_xics_batch(ms1_rts, ms1_mz_arrays, ms1_int_arrays, target_mzs, ppm)` | xic.rs | Parallel XIC extraction for multiple target m/z values across all MS1 scans |
-| `extract_ms1_envelopes_batch(ms1_mz_arrays, ms1_int_arrays, scan_indices, target_mzs, charge, n_peaks, ppm)` | isotope.rs | MS1 isotope envelope extraction at specified scans |
-| `spectral_angles_batch(pred_mzs, pred_ints, obs_mzs, obs_ints, fragment_tol_da)` | spectral.rs | Batch spectral angle; returns 0.0 when fewer than 3 fragments match (genuine poor match). NaN (no-prediction sentinel) is set at the Python level in `compute_all_lcms_evidence` when no MS2PIP prediction exists for a candidate. |
-| `compute_ionization_features(sequences)` | features.rs | Returns (n_R, n_K, n_H, n_F, n_W, n_Y, gravy, pi) — 8 arrays; parallel rayon |
-| `compute_property_features(sequences)` | features.rs | Returns (n_D, n_E, n_C, n_P, n_M, n_W, n_Y, seq_len, nterm_code, pi) — 10 arrays; parallel rayon |
-| `count_missed_cleavages_batch(sequences)` | features.rs | K/R not followed by P, excluding last residue; parallel rayon |
-| `compute_maldi_isotope_means(flat_mzs, flat_ints, pixel_offsets, target_mzs, ppm_tolerance)` | maldi_isotope.rs | Mean intensity per target m/z across all MALDI pixels in a single CSR streaming pass (rayon). Replaces two `get_ion_images()` calls for M+1/M+2 extraction. Returns list of float64, one per target m/z. |
-| `accumulate_profile_chunk(pixel_matrix, lo_indices, hi_indices)` | ion_image.rs | Profile-mode pixel window integration. Takes `(n_pixels, n_mz)` float32 C-contiguous array and per-feature `[lo, hi)` index pairs; returns flat float32 array of shape `(n_pixels * n_features,)` to be reshaped in Python. Rayon parallel over pixels. |
+| `MALDI_INTRINSIC_FEATURES` | 53 | yes, by default |
+| `PROTEIN_LEVEL_FEATURES` | 103 | opt-in `--use-protein-level-feats` |
+| `REGION_COLOCALIZATION_FEATURES` | 133 | opt-in `--region-coloc` |
+| `WITHIN_REGION_COLOCALIZATION_FEATURES` | 144 | opt-in `--within-region-coloc` (experimental) |
+| `LCMS_PRIOR_FEATURES` | 188 | no — applied as an additive log-prior |
+| `SPATIAL_RANKER_FEATURES` | 210 | opt-in `--use-spatial-ranker-features` |
+| `MOB_QUALITY_FEATURES` | 230 | gated by `_MOB_QUALITY_DEFAULT_DECOYS` (`pipeline.py:62`) |
+| `MAIN_FEATURES` | 243 | subset selector |
+| `FEATURE_NAN_FILL` | 286 | per-feature NaN sentinels |
 
-All functions gracefully fall back to Python equivalents if the Rust extension is not importable. The Python code checks `from ms1rescore_rs import <function>` inside try/except blocks.
+`MOB_QUALITY_FEATURES` = `mob_2d_concentration`, `mob_k0_spread`, `mob_mz_spread_ppm`,
+`mob_peak_snr` — intrinsic joint (m/z, intensity, 1/K0) peak-quality descriptors, available
+only when the dataset has a TIMS dimension.
 
-**Peptide sequence feature performance** (707K rows, 395K unique sequences):
+**Why `LCMS_PRIOR_FEATURES` are excluded from the ranker:** LC-MS/MS ID-derived features
+(`lcms_q_value`, `lcms_pep`, `lcms_score`, `n_psms`, `lcms_intensity`) would give confirmed
+targets different treatment from decoys, breaking TDC symmetry. They are populated on the
+candidates frame by Strategy C but never enter the prior either.
 
-| Function | Before (Python) | After (Rust rayon) | Speedup |
-|---|---|---|---|
-| `compute_peptide_properties` | 0.62 s | 0.50 s | 1.2× |
-| `compute_maldi_ionization_features` | 0.80 s | 0.34 s | 2.3× |
-| `compute_peptide_property_features` | 1.34 s | 0.43 s | 3.1× |
+**Why `PROTEIN_LEVEL_FEATURES` are opt-in:** they aggregate over all candidates sharing a
+protein, and are only valid because decoys occupy a separate protein namespace. Even so they
+can interact subtly with the decoy model.
 
-pI values from Rust are bit-for-bit identical to the Python bisection implementation.
+Compose the active set via config rather than by editing the module:
 
-### Building the Rust extension
+```toml
+[MSI-PICASSO]
+features_preset  = "all"          # "all" | "main"
+features_exclude = ["peptide_length", "adduct_colocalization_chca"]
+```
+
+---
+
+## Candidate generation
+
+**Strategy C (current)** — activated by passing `lcms_peptides_path`. Candidates are the
+in-silico digest of identified proteins ∪ the directly identified LC-MS/MS peptides. The
+`source` column records the origin: `protein_digest`, `lcms_confirmed`, or `decoy`.
+Without `--digest` (no FASTA) all confirmed peptides are novel, so decoys are built from a
+**concatenated pseudo-protein** — all target sequences concatenated, shuffled once, then
+re-digested — because a per-peptide shuffle would give decoys identical elemental
+composition and make isotope features non-discriminative.
+
+**Strategy A (legacy)** — `digest_fasta()` over a whole FASTA with K/R-preserving shuffled
+decoys. Used when `rescore()` gets no `lcms_peptides_path`. Add `--digest` to combine it
+with Strategy C.
+
+`protein_coverage` counts distinct observed *peptides* over the **true full tryptic digest
+count** (overridden in `pipeline.py` from `peptide_db` before Step 6). Both halves matter:
+the earlier `protein_n_features / candidate_pool_count` form pinned every decoy protein to
+exactly 1.0 and leaked the label.
+
+### LC-MS/MS ID formats
+
+`lcms_id_format` ∈ `percolator` (default), `mzidentml`, `psm_utils`, `msf`, `ms2rescore`.
+With `psm_utils`, `psm_utils_reader` picks the concrete reader (`fragpipe`,
+`proteome_discoverer`, `tsv`, …). Accessions are normalised (`sp|P12345|GENE_HUMAN` →
+`P12345`) before comparison with the FASTA; a <50% match rate warns of a database mismatch.
+FragPipe reports `Retention` in **seconds** — `_parse_psm_utils` divides by 60 when the
+median exceeds 200.
+
+---
+
+## Configuration
+
+Priority, lowest to highest: `package_data/config_default.json` → `--config-file`
+(JSON/TOML) → explicit CLI arguments (`None` never overrides). The merged config is written
+to `<output_dir>/.full_config.json` at the start of every run — **this is the run provenance
+record**, and `scripts/scoreboard.py --diff` reads it.
+
+The TOML table name is `[MSI-PICASSO]`, with `[MSI-PICASSO.maldi_extraction]` and
+`[MSI-PICASSO.im2deep]` subtables.
+
+Package defaults worth knowing, because the checked-in configs override all of them:
+
+| key | package default | baseline configs use |
+|---|---|---|
+| `model` | `lda` | `rbf_svm` |
+| `decoy_method` | `balanced_shuffle` (`rescore()` signature says `shuffle`) | `substitution` |
+| `substitution_n_residues` | `1` | `2` |
+| `train_fdr` | `0.05` | `0.1` (amyloidosis) / `0.3` (her2, kidney) |
+| `init_ppm_threshold` | `2.0` (`rescore()` signature says `5.0`) | `10.0` / `5.0` |
+| `min_seed_positives` | `50` | `125` / `20` |
+| `matching_ppm` | `20.0` | `0` (exact; see invariant 5) |
+
+### Adding a configurable parameter
+
+1. `package_data/config_default.json` — add the key with its default.
+2. `package_data/config_schema.json` — add the type (use `["type", "null"]` to allow a CLI
+   `None` passthrough). The schema rejects unknown keys, so this step is mandatory.
+3. `cli.py` — add `--param-name` with `default=None`; add the snake_case name to
+   `_TOP_LEVEL_ATTRS` (and `_STORE_TRUE_ATTRS` for boolean flags); pass it in the `rescore()`
+   call at the bottom of `main()`.
+4. `pipeline.py` — add it to the `rescore()` signature with the same default.
+5. Add a test in `tests/test_config_parser.py`.
+
+---
+
+## Environment, build, tests
+
+```bash
+# interpreter — the bare pyenv python does NOT have the dependencies
+/home/robbe/.pyenv/versions/MSIscore/bin/python
+
+pip install -e MSI-PICASSO/            # or "MSI-PICASSO/[timstof]" for Bruker .d support
+```
+
+Sibling checkouts `ms2rescore/`, `ms2pip/`, `psm_utils/`, `IM2Deep/`, `ms2rescore-rs/` are
+upstream tools on custom branches, all installed editable into the same env.
+
+**Rust extension** (invariant 6):
 
 ```bash
 cd MSI-PICASSO/msi-picasso-rs
@@ -892,254 +378,48 @@ VIRTUAL_ENV=/home/robbe/.pyenv/versions/3.11.11/envs/MSIscore \
   /home/robbe/.pyenv/versions/3.11.11/envs/MSIscore/bin/maturin develop --release
 ```
 
-**Important:** `maturin develop` must target the same Python environment as the Jupyter kernel. The MSIscore venv lives at `/home/robbe/.pyenv/versions/3.11.11/envs/MSIscore` (the symlink `/home/robbe/.pyenv/versions/MSIscore` also works for `VIRTUAL_ENV`, but call the venv's own `maturin` binary explicitly to avoid picking up the wrong interpreter). Without `VIRTUAL_ENV` and the correct binary, maturin installs into the base pyenv Python, not the venv.
+`target/` reaches 1–2 GB; `rm -rf` it if disk is tight, it rebuilds.
 
-The Rust `target/` directory can be 1-2 GB. Delete it with `rm -rf MSI-PICASSO/msi-picasso-rs/target/` if disk space is low (it is rebuilt on the next `maturin develop`).
-
----
-
-## Environment
-
-- Python: `/home/robbe/.pyenv/versions/MSIscore`
-- Notebook kernel: MSIscore
-- Key packages: `ms2pip>=4.0.0a1`, `deeplc>=4.0.0a1`, `pyteomics>=4.7`, `psm_utils>=1.1`, `brain-isotopic-distribution>=1.5` (PyPI name for `brainpy`), `alphatims>=1.0` (optional, for reading Bruker `.d` files directly). The `mokapot` and `catboost` packages are no longer required — the SVM/CatBoost backends were removed (LDA/QDA only).
-- ms2pip import: `from ms2pip.core import predict_batch` (not `from ms2pip import predict_batch`)
-- `brain-isotopic-distribution` is a transitive dependency of `ms-deisotope` but is listed explicitly in `pyproject.toml` as a core dependency because `theoretical_isotope_distribution()` in `utils.py` imports `from brainpy import isotopic_variants` directly.
-
-Install the package in editable mode:
-```bash
-pip install -e MSI-PICASSO/
-# With Bruker timsTOF .d support:
-pip install -e "MSI-PICASSO/[timstof]"
-```
+**Tests** — `pytest` from `MSI-PICASSO/`, `testpaths = ["msi_picasso/tests"]`.
+The suite currently has known failures; see PROGRESS.md §7 before treating a red run as a
+regression.
 
 ---
 
-## Notebooks and scripts
+## Scripts
 
-- **`notebooks/04_maldi_rescoring.ipynb`**: End-to-end notebook. Cells follow pipeline steps 1-9.S
-- **`scripts/visualize_ms1rescore_features.py`**: Feature visualization script. For each selected MALDI feature: summary heatmaps, feature distribution histograms, bar charts. For each of 3 selected candidates per feature (best-ppm target, best-SA target, best-ppm decoy): XIC chromatogram, MS2 mirror plot, isotope envelope comparison, ion image, mass accuracy bar, feature card.
-- **`scripts/audit_coloc_leak.py`**: Colocalization discriminability audit. Given a `13_debug_features.tsv`, reports per colocalization column: target-vs-decoy AUC, per-protein target-decoy delta distribution (mean, median, frac>0.1), and Pearson correlation with abundance proxies (protein peptide count, mean intensity). Use before enabling a coloc feature in the ranker to confirm it separates target from decoy without being an abundance proxy.
-- **`scripts/grid_search.py`**: Parameter grid search over `rescore()` options (model, decoy method, feature flags including `region_coloc`/`coloc_tic_normalize`/`coloc_common_mode`). Reuses a shared `raw_query_cache` across runs when `--maldi-query-raw` is active.
-- **`scripts/ablation_svm.py`**: Feature ablation study comparing LDA against feature subsets including `REGION_COLOCALIZATION_FEATURES`.
+In `/home/robbe/MALDI_MSI_score/scripts/`:
 
----
+| script | purpose |
+|---|---|
+| `scoreboard.py` | scrape all `results/*/*/run.log` into one comparison table; `--markdown` for a PROGRESS.md row, `--diff A B` for a settings diff between two runs |
+| `validate_results.py` | biological validation: marker recovery, GT recovery, LC-MS concordance |
+| `diagnose_gt.py` | per-GT-peptide failure diagnosis against a results dir |
+| `grid_search.py` / `analyze_grid_search.py` | parameter sweep (reuses `raw_query_cache`) and its sensitivity analysis |
+| `ablation_svm.py` / `ablation_lda.py` | feature ablation |
+| `audit_coloc_leak.py` | per-colocalization-column target/decoy AUC and abundance-leak check — run before promoting a coloc feature into the ranker |
+| `envelope_qc.py` | isotope-envelope QC |
+| `visualize_ms1rescore_features.py` | per-feature, per-candidate target/decoy visualisation |
 
-## Known issues and limitations
-
-### Low spectral angles (~0.011 mean)
-
-The mean spectral angle is low because most of the 707K candidates are random mass coincidences. The max is ~0.402 for correct peptides. This is expected: centroided Thermo MS2 spectra have 12-34 peaks, and most MALDI features do not have a matching LC-MS/MS MS2 scan at all. The feature is still informative as a discriminator.
-
-### `maldi_intensities_p90` must be passed explicitly
-
-`match_to_maldi_features()` accepts `maldi_intensities`, `maldi_intensities_p90`, and `maldi_intensities_sum`. If none are passed, all log-intensity features are 0. In `pipeline.py`, these are read from `spatial_features` columns (`intensity_p90`, `intensity_sum`, `mean_intensity`) when available. In standalone use (e.g. the viz script), pass at least `maldi_intensities` from ion images or spatial features.
-
-### Scale
-
-With the human FASTA (~20K proteins) and 1,398 MALDI features at 20 ppm:
-- ~707K candidates (target + decoy)
-- ~542K unique peptides
-- ~1,067/1,398 features with MS2 matches
-- MS2PIP is run for ~683K unique (peptide, charge) pairs (only at features with observed MS2 scans)
-- DeepLC predictions run for all ~542K unique peptide sequences; each candidate is anchored to its peptide's nearest MS1 scan
+One-off analyses are parked in `scripts/archive/`.
 
 ---
 
-## Known result biases
-
-Each entry names the bias, which decoy method(s) and pipeline mode it affects, why it arises, and what the current mitigation is.
-
-> **Mostly legacy.** Biases §1, §3, §4, §6 concern `mz_shift`/`mz_shuffle` decoys, which
-> the current baselines do not use. The ones that still matter for the current
-> substitution + raw-query path are **§2 (raw Pearson colocalization inflated by tissue
-> morphology)** — the reason on-tissue TIC masking is mandatory and the reason
-> colocalization is weak in heterogeneous kidney tissue — and the substitution
-> composition caveat noted under [Core design principle 2](#2-decoy-generation). Read
-> §2 first; the rest is orientation for the alternative decoy methods.
-
----
-
-### 1. `peptide_length` leaks the mass-sorted derangement in the zero-signal subpopulation (`mz_shuffle` + `--maldi-query-raw`)
-
-**Affects:** `decoy_method="mz_shuffle"` in raw-query mode when `drop_zero_signal=False`.
-
-**Why it arises.** The mz_shuffle derangement is a mass-sorted cyclic rotation: each target peptide is relocated onto the feature of a peptide ~n/4–3n/4 positions away in mass-sorted order. Consequently, the decoy peptide co-located on a given feature has a systematically *different* mass (and therefore a different `peptide_length`) from the target peptide. For features that have genuine MALDI signal (`feature_intensity_sum > 0`), MALDI-dependent features (`log_maldi_intensity*`, `ppm_error`, isotope, CCS, etc.) provide the discrimination signal and overwhelm `peptide_length`. For **zero-signal features** — m/z bins with no detected peak across all pixels — all MALDI-dependent features collapse to 0 or their imputed median, leaving only sequence-derived features (`peptide_length`, amino acid composition) to separate targets from decoys. Because `peptide_length` ∝ mass and the derangement enforces a large mass gap, `peptide_length` achieves AUC ≈ 0.91 in the zero-signal subpopulation. This skews the FDR: the semi-supervised ranker trains on these easy zero-signal decoys and assigns artificially high scores to short (or long) target peptides regardless of MALDI evidence.
-
-**Mitigation.** Two layers:
-1. `_fill_nosignal_coloc_worst_case()` runs unconditionally after feature computation: protein-colocalization NaNs on zero-signal rows are replaced with the pooled finite minimum (worst in-distribution value) rather than being left for the median imputer to silently fill to an average colocalization score.
-2. `drop_zero_signal=True` (CLI `--drop-zero-signal`, disabled by default) removes all candidates where `feature_intensity_sum == 0` before scoring. The mask is `is_decoy`-blind: under mz_shuffle co-located target and decoy share the identical ion image, so both are dropped together, preserving the 1:1 T:D ratio. Recommended in raw-query + mz_shuffle; retaining zero-signal rows adds only noise because no MALDI evidence supports them.
-
-**Symptom.** If zero-signal rows are retained, the ranked-list shows an inflated tail of short peptides (low mass → negative mass-sorted offset → `peptide_length` of decoy > target) passing FDR, with no supporting MALDI ion image.
-
-**Note.** `peptide_length` (and all `_BEST_FEAT_SKIP` features) are already excluded from the round-1 seed initialization sweep (`_find_best_feature_labels`) for the same underlying reason: composition features can produce spurious pseudo-positives when targets and decoys have different sequence distributions.
-
----
-
-### 2. Raw Pearson colocalization inflated by tissue morphology (all decoy methods)
-
-**Affects:** all modes when `compute_colocalization_features` (global Pearson) is used without TIC masking, and even with TIC masking on this dataset. The opt-in `compute_region_colocalization_features` (which replaced the former NMF/patch features) targets exactly this problem via per-pixel-TIC-normalized region segmentation; it recovers signal on heterogeneous tissue but not on a homogeneous whole section (see its docstring above and `figures/coloc_metric_perprotein_delta.png`).
-
-**Why it arises.** Any MALDI ion image is ~0 in the unmeasured off-tissue padding and broadly tracks the tissue footprint on-tissue. The shared on/off-tissue structure dominates the raw Pearson r between any two ion images: mean within-protein r ~0.76–0.84, with mz_shuffle decoys at 0.778 — *higher* than all targets (0.736). TIC masking (`--coloc-tic-quantile`) restricts computation to on-tissue pixels and halves the absolute values (masked targets 0.279, decoys 0.301), but does not reverse the decoy ≥ target ordering. The underlying reason is that the mz_shuffle null is symmetric by design: relocated decoys land on real confirmed ion images, and every real image shares the same few tissue substructures, so any protein-level aggregation is equally coherent for targets and decoys. NMF substructure cosine shows the same pattern (targets 0.715, decoys 0.790).
-
-
----
-
-### 3. `ppm_error` non-discriminative for `mz_shift` decoys in feature-list mode (by design)
-
-**Affects:** `decoy_method="mz_shift"` in feature-list mode (no `--maldi-query-raw`).
-
-**Why it arises.** In feature-list mode, the `ppm_error` for an mz_shift decoy is copied from the target peptide's best match ppm — the delta between the peptide's theoretical [M+H]+ and the feature it was matched to — rather than computed against the decoy's shifted (off-target) feature m/z. This makes `ppm_error` identical for a target and its mz_shift decoy, contributing zero discrimination signal.
-
-**Why this is intentional.** Computing `ppm_error` against the decoy's snapped-to feature m/z (which could be many Da away) would artificially penalise decoys for a large ppm offset that does not correspond to any real ambiguity a false positive would have. Real false positives match within the ppm window by definition; the decoy's shifted anchor is not a mass-match, so penalising it on that delta would make the null anti-conservative.
-
-**In raw-query mode** this limitation is removed: `_recompute_ppm_from_centroids` computes `ppm_error` from the observed peak centroid in each candidate's own extraction window, identically for targets and decoys. An mz_shift decoy shifted into empty m/z space receives the worst-case ppm (`extraction_ppm`) rather than a median-imputed value, so zero-signal decoys are penalised rather than treated as average-quality (see `pipeline.py:_recompute_ppm_from_centroids`).
-
----
-
-### 4. CCS / `im2deep_*` features leak the m/z baseline for `mz_shuffle` decoys
-
-**Affects:** `decoy_method="mz_shuffle"` when IM2Deep CCS features are active.
-
-**Why it arises.** CCS is approximately proportional to m/z (Mason-Schamp relation; larger peptides drift slower). Under mz_shuffle, a decoy peptide is placed on a feature that belongs to a peptide of systematically different mass (the derangement enforces a large mass gap). The observed CCS at that feature reflects the feature peptide's mass, while the predicted CCS from IM2Deep reflects the decoy peptide's mass. The raw delta (`im2deep_delta_ccs`, `im2deep_abs_delta_ccs_pct`, `im2deep_ccs_zscore`, `im2deep_ccs_rank`) therefore encodes the mass gap, not a conformational mismatch — creating a trivial discriminator that does not exist for real isobaric false positives. Mobility-gated colocalization features (`isotope_colocalization_*_mob`, `adduct_colocalization_*_mob`) are also affected because they filter the shared co-located ion image through each candidate's own predicted 1/K0 window; the decoy's window misses the real feature's peak.
-
-**Mitigation.** For `mz_shuffle`, the pipeline automatically excludes `_MZ_SHUFFLE_CCS_LEAK_FEATURES` (raw CCS scalars and mobility-gated colocalization) from the ranker and uses only the m/z-detrended residual features (`*_resid`). The residuals subtract the expected CCS difference due to the m/z gap (fitted as a power-law `CCS = A · mz^B` on calibration peptides), leaving only the conformational mismatch — which is exchangeable with a real isobaric false positive. A diagnostic log line reports `|corr(raw Δ, decoy_delta_da)|` vs `|corr(residual Δ, decoy_delta_da)|`; the residual should be near 0.
-
----
-
-### 5. `protein_coverage` pinned at 1.0 for decoys (historical, now fixed)
-
-**Affected versions:** before the symmetric numerator + true-digest denominator fix.
-
-**Why it arose.** The original `protein_coverage = protein_n_features / protein_tryptic_count` leaked the target/decoy label: each decoy peptide is placed on exactly one feature by construction (`mz_shift`/`mz_shuffle`), so `protein_n_features` equalled the candidate count for every decoy protein, and since `protein_tryptic_count` was the candidate-pool count (not the full digest), coverage was pinned to exactly 1.0. Targets matching several near-isobaric features could exceed 1.0. The LDA therefore trivially separated targets from decoys on this feature.
-
-**Current state.** Fixed: the numerator counts distinct observed *peptides* (symmetric, because target and DECOY_ protein share the same peptide set) and the denominator is the true full-tryptic-digest count per protein (from `peptide_db`, applied in `pipeline.py` just before Step 6). Coverage ∈ (0, 1], symmetric, and non-degenerate across proteins.
-
----
-
-### 6. mz_shuffle target multiplicity creating a ~2:1 T:D imbalance (historical, now fixed)
-
-**Affected versions:** before the target-dedup fix in `generate_mz_shuffle_candidates`.
-
-**Why it arose.** A target peptide whose [M+H]+ m/z falls within `matching_ppm` of several MALDI features contributed one target row per feature, but the derangement assigned it only one decoy (one relocated feature). A 1,398-feature run produced a 5901:2895 imbalance (~2:1). The excess target rows had no co-located decoy, so the per-feature winner competition was effectively uncontested for those targets, inflating identifications without a valid null.
-
-**Current state.** Fixed: targets are deduplicated to one representative row per unique peptide (lowest `|ppm_error|`) before the derangement is built and the combined frame is returned. No unique peptide identification is lost; only redundant near-isobaric secondary matches are dropped.
-
----
-
-## Configuration
-
-MSI-PICASSO uses `cascade_config` for hierarchical configuration. Priority (lowest to highest):
-
-1. `MSI-PICASSO/package_data/config_default.json` — all defaults
-2. User `--config-file` (JSON or TOML)
-3. CLI arguments (explicit only; `None` values never override lower-priority sources)
-
-The merged config is written to `<output_dir>/.full_config.json` at the start of every run for reproducibility.
-
-**Explicit falsy values are honored.** `cascade_config`'s merge rule (`elif v or k not in original`) silently drops a falsy-but-explicit scalar (`0`, `0.0`, `""`) when the key already has a value, keeping the lower-priority default. `parse_configurations` corrects this: after the cascade merge it re-applies user-provided non-None values (`_apply_explicit_overrides`) and then re-validates against the schema with `jsonschema`. Consequence: an explicit `0` is respected instead of being silently masked by the default. In particular `--matching-ppm 0` is honored — it means exact matching / no collision tolerance (useful in raw-query, where the matching grid is the exact peptide masses and a tolerance only inflates the target-feature count via near-isobaric cross-matches). `matching_ppm`'s schema constraint is therefore `minimum: 0` (not `exclusiveMinimum`); negative values are still rejected, and `None` still means "unset" and never overrides. `extraction_ppm`/`ppm_bin` keep `exclusiveMinimum: 0` (a zero-width extraction window is degenerate).
-
-### Adding a new configurable parameter
-
-1. Add it to `package_data/config_default.json` with a default value.
-2. Add a schema entry in `package_data/config_schema.json` (type, constraints; use `["type", "null"]` to allow CLI `None` passthrough).
-3. In `cli.py`: add `--param-name` to the appropriate argument group with `default=None`; add the snake_case name to `_TOP_LEVEL_ATTRS` (and to `_STORE_TRUE_ATTRS` for boolean flags); add it to the `rescore()` call at the bottom of `main()`.
-4. Add it to the `rescore()` signature in `pipeline.py` with the same default as the JSON.
-5. Add a test in `tests/test_config_parser.py`.
-
-### Feature composition via config
-
-Instead of editing `feature_generator.py`, specify in a TOML config file:
-
-```toml
-[MSI-PICASSO]
-features_preset = "all"          # "all" | "main"
-features_exclude = ["peptide_length", "adduct_colocalization_chca"]
-```
-
-`MALDI_INTRINSIC_FEATURES` and `MAIN_FEATURES` in `feature_generator.py` remain the canonical full definitions. Exclusions are applied at runtime in `pipeline.py`.
-
-### MALDI extraction parameters
-
-Raw extraction parameters (`ppm_bin`, smoothing, deisotoping, etc.) live under `[MSI-PICASSO.maldi_extraction]` in TOML or `"maldi_extraction": {...}` in JSON. The default assumption is pre-extracted features (NPZ or m/z list); these parameters are only active when `--maldi-raw` or `--maldi-imzml` is used.
-
-Example config file:
-
-```toml
-[MSI-PICASSO]
-model = "lda"
-decoy_method = "balanced_shuffle"
-features_exclude = ["peptide_length"]
-
-[MSI-PICASSO.maldi_extraction]
-matching_ppm = 15.0
-deisotope = true
-deisotope_min_score = 12.0
-```
+## Running
 
 ```bash
-picasso --config-file my_config.toml --maldi-d data/MALDI.d --fasta human.fasta
+picasso -c /home/robbe/MALDI_MSI_score/configs/amyloidosis_substitution.toml
+picasso -c /home/robbe/MALDI_MSI_score/configs/her2_test.toml
+picasso -c /home/robbe/MALDI_MSI_score/configs/kidney_test.toml
 ```
 
-(The console-script is `picasso`; `msi-picasso` is an alias for the same entry point.)
-
----
-
-## Reference pipeline commands
-
-**Run the baselines.** The two current reference runs are driven by TOML configs, which
-is the recommended way to reproduce or vary them:
+For an experiment, override the output directory and reuse the extraction cache:
 
 ```bash
-picasso -c /home/robbe/MALDI_MSI_score/configs/amyloidosis_substitution.toml   # working baseline
-picasso -c /home/robbe/MALDI_MSI_score/configs/kidney_test.toml                # case being improved
+picasso -c configs/kidney_test.toml \
+        --output-dir results/kidney/E007/ \
+        --raw-query-cache-dir .rawquery_cache
 ```
 
-Both configs set the current active stack: `maldi-query-raw = true`,
-`decoy-method = "substitution"`, Strategy C candidates (`lcms-peptides`, no `fasta`),
-`single-round = true`, spatial-ranker + region + mobility colocalization on. See
-`FIX_KIDNEY_DISCREPANCY.md` for the parameters that differ between them and why.
-
-**Equivalent explicit CLI form** (amyloidosis, for reference):
-
-```bash
-picasso \
-  --maldi-d /home/robbe/MALDI_MSI_score/data/amyloidosis/Amy_TMA_MS1.d --maldi-query-raw \
-  --lcms-peptides /home/robbe/MALDI_MSI_score/data/amyloidosis/fragpipe_output_amyloidosis/Amyl_tissue_psm.tsv \
-  --lcms-id-format psm_utils \
-  --decoy-method substitution --substitution-n-residues 2 \
-  --model lda \
-  --single-round --maldi-query-raw --matching-ppm 0 \
-  --use-spatial-ranker-features --use-protein-level-feats \
-  --region-coloc --mob-coloc \
-  --output-dir /home/robbe/MALDI_MSI_score/results/amyl_lda/ \
-  -v --im2deep-calibration finetune \
-  --debug-gt /home/robbe/MALDI_MSI_score/data/amyloidosis/GT_peptides.txt \
-  --n-interaction-features 0
-```
-
-Notes for raw-query:
-- `--decoy-method substitution`: size-fair, CCS-safe, spatial-ranker-compatible — the current default. **Compatible with `--match-ccs`** (unlike `mz_shuffle`), because its mass shift is small.
-- `--matching-ppm 0`: in raw-query the grid *is* the exact peptide masses, so 0-ppm = one feature per peptide (explicit 0 is honored, see config notes).
-- `--model lda` is the preferred backend; the checked-in configs currently use `rbf_svm`.
-- Optional: `--coloc-tic-quantile`, `--region-coloc-k`, `--coloc-tic-normalize`, `--coloc-common-mode`, `--match-ccs`.
-
-**Feature-list baseline (legacy).** Uses a pre-detected feature list; kept for comparison until raw-query is fast/robust enough to default:
-
-```bash
-picasso \
-  -f .../uniprot_human_reviewed.fasta \
-  --maldi-raw .../Amy_TMA_MS1.d \
-  --feature-mzs .../ff_with_new_algo._amyloidosies_Lme48.csv \
-  --lcms-peptides .../Amyl_tissue_psm.tsv --lcms-id-format psm_utils \
-  --model lda --decoy-method balanced_shuffle \
-  -v --im2deep-calibration linear --n-interaction-features 0 \
-  --output-dir .../results/new_algo_lda/
-```
-
-Key parameter choices (both modes):
-- `--model lda`: LDA default; no extra dependencies, fast cross-validated pseudo-label iteration.
-- `--decoy-method`: `substitution` for the current raw-query baselines; `balanced_shuffle` for the legacy feature-list path (retains only shuffled peptides matching a feature, preventing decoy starvation on sparse lists).
-- `--n-interaction-features 0`: polynomial interaction expansion disabled (default 5 was found to hurt performance).
-- `--im2deep-calibration linear`: IM2Deep CCS calibration mode.
-- `--debug-gt`: ground truth peptide list for diagnostic FDR plots (not used in scoring).
+Convention: one experiment = one ID shared across branch (`exp/E007-<slug>`), config
+(`configs/kidney_E007.toml`), results dir (`results/kidney/E007/`), and PROGRESS.md entry.

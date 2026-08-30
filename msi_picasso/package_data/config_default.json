@@ -60,6 +60,7 @@
     "match_ccs": false,
     "ccs_window_multiplier": 2.0,
     "maldi_query_raw": false,
+    "raw_query_cache_dir": null,
     "mob_coloc": false,
     "mob_protein_coloc": false,
     "mob_window_multiplier": 2.0,

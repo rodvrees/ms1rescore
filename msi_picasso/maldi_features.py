@@ -535,7 +535,7 @@ _REGION_COLOC_COLS = [
     "protein_region_colocalization_median",
 ]
 
-# O3 (FLAWS_AND_OPPORTUNITIES.md): within-region and dominant-region Pearson-r
+# O3 : within-region and dominant-region Pearson-r
 # colocalization column families — see compute_within_region_colocalization_features.
 _WITHIN_REGION_COLOC_COLS = [
     "protein_within_region_colocalization",
@@ -766,7 +766,7 @@ def _within_region_corr_matrices(
     This asks whether same-protein peptides co-vary pixel-to-pixel *inside* a
     shared tissue region — a question the fingerprint metric cannot answer,
     since it only compares per-region averages and is blind to within-region
-    pixel covariance (O3, FLAWS_AND_OPPORTUNITIES.md).
+    pixel covariance (experimental).
 
     Returns a dict with two ``(corr_matrix, valid_mz_arr, mz_to_idx)`` triples
     — the same contract as ``_pearson_r_matrix`` — so both plug directly into
@@ -784,7 +784,7 @@ def _within_region_corr_matrices(
     ``tic_normalize``/``common_mode_removal`` are forwarded to every
     ``_pearson_r_matrix`` call (region-level and canonical) so this uses the
     same preprocessing recipe as the best-performing global colocalization
-    metric (O2, FLAWS_AND_OPPORTUNITIES.md) rather than raw pixels.
+    metric  rather than raw pixels.
 
     When ``debug`` is a dict it is populated with ``region_labels`` (per-pixel
     region id, ``(H*W,)`` int32, -1 off-mask), ``region_pixel_counts``, and
@@ -814,7 +814,7 @@ def _within_region_corr_matrices(
 
     # Segmentation feature matrix — identical recipe to _region_profile_corr_matrix.
     # Duplicated rather than shared: this is an experimental, likely-to-be-reverted
-    # feature (see FLAWS_AND_OPPORTUNITIES.md O3), so the tested/shipping function is
+    # feature (see O3), so the tested/shipping function is
     # left untouched.
     col_tic = on.sum(axis=0, keepdims=True)
     comp = np.divide(on, col_tic, out=np.zeros_like(on), where=col_tic > 0)
@@ -892,9 +892,9 @@ def compute_within_region_colocalization_features(
     _global_corr_cache: tuple | None = None,
     debug: dict | None = None,
 ) -> pd.DataFrame:
-    """O3 (FLAWS_AND_OPPORTUNITIES.md): within-region and dominant-region
+    """O3 : within-region and dominant-region
     Pearson-r colocalization (opt-in, ``--within-region-coloc``; experimental /
-    unvalidated — see O3 for the validation protocol before trusting this in
+    unvalidated — see PROGRESS.md for the validation protocol before trusting this in
     the ranker).
 
     Segments on-tissue pixels the same way as

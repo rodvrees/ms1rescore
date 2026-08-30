@@ -1564,6 +1564,7 @@ def rescore(
     maldi_query_raw: bool = False,
     maldi_d_path: str | None = None,
     raw_query_cache: dict | None = None,
+    raw_query_cache_dir: str | None = None,
     extraction_ppm: float = 25.0,
     mob_quality_mz_window_ppm: float = 25.0,
     mob_quality_k0_tol: float = 0.02,
@@ -1841,6 +1842,12 @@ def rescore(
     maldi_d_path
         Path to the raw Bruker ``.d`` directory.  Required when
         ``maldi_query_raw=True``.
+    raw_query_cache_dir
+        Directory in which to persist the observed-centroid/CCS ``alphatims`` pass
+        (the dominant cost of a raw-query run) as an ``.npz`` keyed by the ``.d``
+        path, the query m/z grid, and the window parameters.  A re-run that changes
+        only scoring settings reuses it and skips the pass.  Unlike ``raw_query_cache``
+        (in-process, whole extraction) this survives across processes.
     extraction_ppm
         Ion image extraction half-window (ppm) used by raw-query mode.
     mz_shift_delta_min
@@ -2330,6 +2337,7 @@ def rescore(
                 maldi_d_path, maldi_mzs, extraction_ppm=extraction_ppm,
                 mob_quality_window_ppm=mob_quality_mz_window_ppm,
                 mob_quality_k0_tol=mob_quality_k0_tol,
+                cache_dir=raw_query_cache_dir,
             )
             logger.info(
                 "Raw-query mode: extracted %d ion images; %d features with M0 envelope signal.",

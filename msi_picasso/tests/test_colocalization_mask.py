@@ -32,6 +32,21 @@ def _two_layer_images():
     return np.stack([a, b])
 
 
+def _graded_tic_images():
+    """Same (2, 4, 4) padding layout, but with a per-pixel TIC that varies.
+
+    Both images are positively scaled copies of the same profile, so the summed
+    TIC spans a range and a quantile threshold can actually trim the low half.
+    """
+    H = W = 4
+    a = np.zeros((H, W), dtype=np.float32)
+    b = np.zeros((H, W), dtype=np.float32)
+    on = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], dtype=np.float32)
+    a[:, 2:] = on.reshape(4, 2)
+    b[:, 2:] = (2.0 * on).reshape(4, 2)  # TIC = 3*on, strictly increasing
+    return np.stack([a, b])
+
+
 class TestComputeTissueMask:
     def test_drops_zero_tic_padding(self):
         imgs = _two_layer_images()
@@ -41,12 +56,22 @@ class TestComputeTissueMask:
         assert mask.shape == (16,)
 
     def test_quantile_trims_low_signal(self):
-        imgs = _two_layer_images()
+        # NOT _two_layer_images(): there b = 7 - a, so the per-pixel TIC is a constant
+        # 7.0 across all on-tissue pixels. Every pixel then ties at the quantile
+        # threshold and `tic >= thr` (deliberately >=, so a tie-heavy image cannot
+        # yield an empty mask) keeps all of them. Trimming needs a graded TIC.
+        imgs = _graded_tic_images()
         mask0 = compute_tissue_mask(imgs, tic_quantile=0.0)
         mask_q = compute_tissue_mask(imgs, tic_quantile=0.5)
+        assert mask0.sum() == 8
         assert mask_q.sum() < mask0.sum()
         # every kept pixel must still be a measured pixel
         assert np.all(mask0[mask_q])
+
+    def test_uniform_tic_quantile_keeps_all_measured(self):
+        """A tie-heavy image must never be trimmed to an empty mask."""
+        imgs = _two_layer_images()  # constant on-tissue TIC of 7.0
+        assert compute_tissue_mask(imgs, tic_quantile=0.9).sum() == 8
 
     def test_all_measured_when_no_padding(self):
         rng = np.random.RandomState(0)

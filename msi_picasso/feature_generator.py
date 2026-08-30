@@ -135,11 +135,11 @@ REGION_COLOCALIZATION_FEATURES = [
 ]
 
 # Within-region and dominant-region Pearson-r colocalization (opt-in via
-# --within-region-coloc, requires ion_images). O3 (FLAWS_AND_OPPORTUNITIES.md):
+# --within-region-coloc, requires ion_images). O3 :
 # unlike REGION_COLOCALIZATION_FEATURES (per-region MEAN fingerprint), these
 # correlate RAW pixel intensities restricted to a region, asking whether
 # same-protein peptides co-vary pixel-to-pixel inside a shared region rather
-# than merely sharing a region average. Experimental / unvalidated — see O3's
+# than merely sharing a region average. Experimental / unvalidated — see the note below on
 # validation protocol before removing these from features-exclude in any config.
 WITHIN_REGION_COLOCALIZATION_FEATURES = [
     "protein_within_region_colocalization",
@@ -567,7 +567,7 @@ def compute_all_features(
             # Reuse protein_corr_cache's preprocessing recipe (coloc_tic_normalize /
             # coloc_common_mode) so the per-region correlation uses the same
             # best-performing recipe as compute_colocalization_features (O2,
-            # FLAWS_AND_OPPORTUNITIES.md) rather than raw pixels.
+            #) rather than raw pixels.
             df = compute_within_region_colocalization_features(
                 df, ion_images, ion_image_mzs, pixel_mask=pixel_mask,
                 n_regions=region_coloc_k, tic_normalize=coloc_tic_normalize,

@@ -399,6 +399,16 @@ def build_parser() -> argparse.ArgumentParser:
             "mz_shift decoys this queries the shifted (off-target) m/z."
         ),
     )
+    maldi_group.add_argument(
+        "--raw-query-cache-dir",
+        default=None,
+        help=(
+            "Directory in which to cache the raw-query observed-centroid/CCS alphatims "
+            "pass (the dominant cost of a raw-query run). Keyed by the .d path, the "
+            "candidate m/z grid and the window parameters, so a re-run that changes only "
+            "scoring settings reuses it; a changed candidate set misses and recomputes."
+        ),
+    )
 
     # --- Raw extraction parameters ---
     raw_grp = parser.add_argument_group(
@@ -996,8 +1006,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Include spatial ranker features (spatial_autocorrelation, spatial_morans_i, "
             "spatial_gearys_c, fraction_detected, intensity_cv, and protein_colocalization_*) "
-            "in the rescoring model. Only valid with --decoy-method entrapment or mz_shift; "
-            "with shuffle variants it is force-disabled with a warning. Disabled by default."
+            "in the rescoring model. Only valid with --decoy-method substitution, entrapment, "
+            "mz_shift or mz_shuffle (decoys that land on a real anchor); with the shuffle "
+            "variants it is force-disabled with a warning. Disabled by default."
         ),
     )
     rescore_grp.add_argument(
@@ -1296,7 +1307,7 @@ def build_parser() -> argparse.ArgumentParser:
             "whether same-protein peptides co-vary pixel-to-pixel inside a shared region "
             "rather than merely sharing a region average. Also emits a dominant-region-"
             "only variant (colocalization restricted to the single largest region). "
-            "Experimental / unvalidated — see FLAWS_AND_OPPORTUNITIES.md O3. Disabled by default."
+            "Experimental / unvalidated — see O3. Disabled by default."
         ),
     )
     rescore_grp.add_argument(
@@ -1521,7 +1532,7 @@ def main() -> None:
         "coloc_tic_normalize", "coloc_common_mode",
         "drop_zero_signal", "entrapment", "coloc_measured_mask",
         "deeplc_finetune_epochs", "deeplc_finetune_lr", "deeplc_finetune_patience",
-        "calibration_percentile", "maldi_query_raw",
+        "calibration_percentile", "maldi_query_raw", "raw_query_cache_dir",
         # file paths
         "fasta", "extra_fasta", "entrapment_fasta", "mzml",
         "maldi_npz", "maldi_mzs", "maldi_raw", "maldi_imzml", "maldi_d",
@@ -1911,6 +1922,7 @@ def main() -> None:
         maldi_envelopes=maldi_envelopes,
         maldi_query_raw=_maldi_query_raw,
         maldi_d_path=_maldi_raw_path,
+        raw_query_cache_dir=_ms1cfg.get("raw_query_cache_dir"),
         extraction_ppm=_extraction["extraction_ppm"],
         msf_path=args.msf,
         ppm_tolerance=_ms1cfg["ppm_tolerance"],

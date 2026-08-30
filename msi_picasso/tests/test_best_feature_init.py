@@ -68,7 +68,7 @@ class TestFindBestFeatureLabels:
         is_decoy = df["is_decoy"].values.astype(bool)
         X = df[["good_feature", "noise_feature"]].values
 
-        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], train_fdr=0.05)
+        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], init_fdr=0.05)
 
         assert result is not None
         labels, best_name, n_passing = result
@@ -80,7 +80,7 @@ class TestFindBestFeatureLabels:
         is_decoy = df["is_decoy"].values.astype(bool)
         X = df[["good_feature", "noise_feature"]].values
 
-        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], train_fdr=0.05)
+        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], init_fdr=0.05)
 
         assert result is not None
         _, best_name, _ = result
@@ -91,7 +91,7 @@ class TestFindBestFeatureLabels:
         is_decoy = df["is_decoy"].values.astype(bool)
         X = df[["good_feature", "noise_feature"]].values
 
-        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], train_fdr=0.05)
+        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], init_fdr=0.05)
 
         assert result is not None
         labels, _, _ = result
@@ -102,7 +102,7 @@ class TestFindBestFeatureLabels:
         is_decoy = df["is_decoy"].values.astype(bool)
         X = df[["good_feature", "noise_feature"]].values
 
-        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], train_fdr=0.05)
+        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], init_fdr=0.05)
 
         assert result is not None
         labels, _, _ = result
@@ -113,7 +113,7 @@ class TestFindBestFeatureLabels:
         is_decoy = df["is_decoy"].values.astype(bool)
         X = df[["good_feature", "noise_feature"]].values
 
-        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], train_fdr=0.05)
+        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], init_fdr=0.05)
 
         assert result is not None
         labels, _, _ = result
@@ -124,7 +124,7 @@ class TestFindBestFeatureLabels:
         is_decoy = df["is_decoy"].values.astype(bool)
         X = df[["good_feature", "noise_feature"]].values
 
-        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], train_fdr=0.05)
+        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], init_fdr=0.05)
 
         assert result is not None
         labels, _, n_passing = result
@@ -135,7 +135,7 @@ class TestFindBestFeatureLabels:
         X, is_decoy, names = _make_uniform_df()
 
         # Constant features are skipped before TDC; with nothing left, returns None.
-        result = _find_best_feature_labels(X, is_decoy, names, train_fdr=1e-15)
+        result = _find_best_feature_labels(X, is_decoy, names, init_fdr=1e-15)
 
         assert result is None
 
@@ -159,7 +159,7 @@ class TestFindBestFeatureLabels:
 
         # (a) Fully constant — std==0 guard should catch this.
         X_const = np.zeros((2 * n, 3))
-        assert _find_best_feature_labels(X_const, is_decoy, ["a", "b", "c"], train_fdr=0.01) is None
+        assert _find_best_feature_labels(X_const, is_decoy, ["a", "b", "c"], init_fdr=0.01) is None
 
         # (b) Mostly-zero but not constant: scatter a few 1s uniformly so both
         # classes have the same proportion — truly non-discriminative.
@@ -169,7 +169,7 @@ class TestFindBestFeatureLabels:
         X_sparse[one_idx, 0] = 1.0
         # With random tiebreak the result should be None or have very few
         # passing targets (well below all-targets count n=200).
-        result = _find_best_feature_labels(X_sparse, is_decoy, ["has_cys"], train_fdr=0.01)
+        result = _find_best_feature_labels(X_sparse, is_decoy, ["has_cys"], init_fdr=0.01)
         if result is not None:
             _, _, n_pass = result
             assert n_pass < n, (
@@ -183,7 +183,7 @@ class TestFindBestFeatureLabels:
         is_decoy = df["is_decoy"].values.astype(bool)
         X = df[["good_feature", "noise_feature"]].values
 
-        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], train_fdr=1e-15)
+        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], init_fdr=1e-15)
 
         assert result is None
 
@@ -221,7 +221,7 @@ class TestFindBestFeatureLabels:
         X = df[["good_feature", "noise_feature"]].values.copy()
         X[::5, 0] = np.nan  # inject NaN every 5th row into good_feature
 
-        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], train_fdr=0.05)
+        result = _find_best_feature_labels(X, is_decoy, ["good_feature", "noise_feature"], init_fdr=0.05)
 
         assert result is not None
         labels, _, n_passing = result

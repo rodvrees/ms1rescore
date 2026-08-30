@@ -12,7 +12,6 @@ dependencies = [
     "pandas>=2.0",
     "pyteomics>=4.7",
     "psm_utils>=1.1",
-    "mokapot>=0.10",
     "ms2pip>=4.0.0a1",
     "deeplc>=4.0.0a1",
     "scikit-learn>=1.3",
@@ -22,7 +21,6 @@ dependencies = [
 
 [project.optional-dependencies]
 maldi = ["imzy", "pyimzml", "ms-deisotope>=0.0.60"]
-catboost = ["catboost>=1.2"]
 timstof = ["alphatims>=1.0"]
 calibration = ["statsmodels>=0.14"]
 mobility = ["im2deep>=0.1"]

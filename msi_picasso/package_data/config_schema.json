@@ -128,6 +128,7 @@
         "match_ccs":              {"type": ["boolean", "null"]},
         "ccs_window_multiplier":  {"type": ["number", "null"], "minimum": 0},
         "maldi_query_raw":        {"type": ["boolean", "null"]},
+        "raw_query_cache_dir":    {"type": ["string", "null"]},
         "mob_coloc":              {"type": ["boolean", "null"]},
         "mob_protein_coloc":      {"type": ["boolean", "null"]},
         "mob_window_multiplier":  {"type": ["number", "null"], "minimum": 0},

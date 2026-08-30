@@ -20,12 +20,64 @@ for the ion images) exposes neither the per-peak m/z centroid nor mobility, so t
 ``.d`` must be opened a second time with ``alphatims``.
 """
 
+import hashlib
 import logging
+import os
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def _obs_stats_cache_path(cache_dir: str, d_path: str, query_mzs: np.ndarray, *params) -> str:
+    """Path of the on-disk cache entry for one ``extract_observed_feature_stats_raw`` call.
+
+    The alphatims pass is a pure function of the ``.d`` and its query parameters, and it
+    is the single most expensive stage of a run (~40 min of a ~69 min amyloidosis run,
+    streaming ~4e9 raw peaks) while producing only a few arrays of ``len(query_mzs)``.
+    Hashing the full m/z grid (not just its length) means a changed candidate set — a
+    different decoy method, digest, or FASTA — misses the cache rather than silently
+    reusing stale statistics.
+    """
+    h = hashlib.sha256()
+    h.update(os.path.abspath(d_path).encode())
+    h.update(np.asarray(query_mzs, dtype=np.float64).tobytes())
+    h.update(repr(params).encode())
+    return os.path.join(cache_dir, f"obs_stats_{h.hexdigest()[:16]}.npz")
+
+
+def _load_obs_stats_cache(path: str) -> tuple[np.ndarray, np.ndarray, dict | None] | None:
+    """Read a cache entry written by :func:`_save_obs_stats_cache`, or ``None`` on any failure."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with np.load(path) as z:
+            ccs = z["ccs"]
+            centroid_mz = z["centroid_mz"]
+            pq_keys = [str(k) for k in z["pq_keys"]]
+            peak_quality = {k: z[f"pq_{k}"] for k in pq_keys} if pq_keys else None
+    except Exception as exc:  # corrupt / truncated / older layout — recompute
+        logger.warning("Raw-query stats cache at %s unreadable (%s); recomputing.", path, exc)
+        return None
+    return ccs, centroid_mz, peak_quality
+
+
+def _save_obs_stats_cache(path: str, ccs, centroid_mz, peak_quality: dict | None) -> None:
+    """Write one cache entry, atomically. A failed write is logged and otherwise ignored."""
+    pq = peak_quality or {}
+    arrays = {"ccs": ccs, "centroid_mz": centroid_mz,
+              "pq_keys": np.array(sorted(pq), dtype=np.str_)}
+    arrays.update({f"pq_{k}": v for k, v in pq.items()})
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # np.savez appends ".npz" unless the name already ends in it, so keep that
+        # suffix last or os.replace will look for a file that was never written.
+        tmp = f"{path}.{os.getpid()}.tmp.npz"
+        np.savez(tmp, **arrays)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.warning("Could not write raw-query stats cache to %s (%s).", path, exc)
 
 
 def _weighted_mean_in_windows(
@@ -201,6 +253,7 @@ def extract_observed_feature_stats_raw(
     charge: int = 1,
     mob_quality_window_ppm: float = 25.0,
     mob_quality_k0_tol: float = 0.02,
+    cache_dir: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict | None]:
     """Observed per-candidate ``(CCS, peak-centroid m/z, peak_quality)`` from the raw ``.d``.
 
@@ -223,12 +276,30 @@ def extract_observed_feature_stats_raw(
     Returns ``(ccs, centroid_mz, peak_quality)``, the arrays aligned 1:1 with ``query_mzs``
     with ``NaN`` where no signal.  ``ccs``/``centroid_mz`` are all-``NaN`` (with a warning)
     when ``alphatims`` is unavailable.
+
+    ``cache_dir`` (CLI ``--raw-query-cache-dir``) persists the result to an ``.npz`` keyed
+    by a hash of the ``.d`` path, the full query grid, and the window parameters, so a
+    re-run that varies only scoring settings skips this pass entirely.
     """
     query_mzs = np.asarray(query_mzs, dtype=np.float64)
     n = len(query_mzs)
     nan_result = np.full(n, np.nan)
     if n == 0:
         return nan_result, nan_result, None
+
+    cache_path = None
+    if cache_dir:
+        cache_path = _obs_stats_cache_path(
+            cache_dir, d_path, query_mzs,
+            extraction_ppm, charge, mob_quality_window_ppm, mob_quality_k0_tol,
+        )
+        cached = _load_obs_stats_cache(cache_path)
+        if cached is not None:
+            logger.info(
+                "Reusing cached observed centroids + CCS for %d features from %s "
+                "(skipping the alphatims pass over %s).", n, cache_path, d_path,
+            )
+            return cached
 
     try:
         import alphatims.bruker as atb
@@ -295,6 +366,8 @@ def extract_observed_feature_stats_raw(
             "observed CCS and peak centroids all-NaN.",
             d_path,
         )
+        if cache_path:
+            _save_obs_stats_cache(cache_path, nan_result, nan_result, None)
         return nan_result, nan_result, None
 
     peak_mzs = np.concatenate(coll_mz)
@@ -328,6 +401,9 @@ def extract_observed_feature_stats_raw(
         "  Observed peak centroid for %d/%d features; observed CCS for %d/%d.",
         int(np.isfinite(centroid_mz).sum()), n, int(np.isfinite(ccs).sum()), n,
     )
+    if cache_path:
+        _save_obs_stats_cache(cache_path, ccs, centroid_mz, peak_quality)
+        logger.info("  Cached observed centroids + CCS to %s.", cache_path)
     return ccs, centroid_mz, peak_quality
 
 
