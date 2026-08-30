@@ -686,6 +686,10 @@ def generate_mz_shuffle_candidates(
     return result
 
 
+# Retry budget per peptide when the collision filter rejects a candidate decoy.
+_SUBSTITUTION_MAX_ATTEMPTS = 200
+
+
 def generate_substitution_candidates(
     target_df: pd.DataFrame,
     feature_mzs: np.ndarray,
@@ -694,6 +698,7 @@ def generate_substitution_candidates(
     random_seed: int = 42,
     mass_shift_min_da: float | None = None,
     collision_filter: bool = True,
+    collision_ppm: float | None = None,
     snap_to_features: bool = False,
     maldi_intensities: np.ndarray | None = None,
     maldi_intensities_p90: np.ndarray | None = None,
@@ -734,7 +739,7 @@ def generate_substitution_candidates(
     """
     feature_mzs = np.asarray(feature_mzs, dtype=np.float64)
     n_features = len(feature_mzs)
-    tol_frac = matching_ppm * 1e-6
+    tol_frac = (matching_ppm if collision_ppm is None else collision_ppm) * 1e-6
 
     unique_pep = (
         target_df[~target_df["is_decoy"].astype(bool)]
@@ -748,14 +753,15 @@ def generate_substitution_candidates(
     next_decoy_idx = n_features
     n_skipped = 0
     n_collisions = 0
+    n_relaxed = 0
 
     def _collides_target(mz: float) -> bool:
         lo = np.searchsorted(target_mzs_sorted, mz * (1.0 - tol_frac), side="left")
         hi = np.searchsorted(target_mzs_sorted, mz * (1.0 + tol_frac), side="right")
         return lo < hi
 
-    def _collides_used(mz: float) -> bool:
-        if not used_decoy_mz:
+    def _collides_used(mz: float, relax: bool = False) -> bool:
+        if relax or not used_decoy_mz:
             return False
         j = bisect.bisect_left(used_decoy_mz, mz * (1.0 - tol_frac))
         return j < len(used_decoy_mz) and used_decoy_mz[j] <= mz * (1.0 + tol_frac)
@@ -791,53 +797,58 @@ def generate_substitution_candidates(
             # Single substitution: try each position in shuffled order,
             # preferred direction first (pass 0), fallback direction second (pass 1).
             found = False
-            for pass_num in range(2):
+            for _relax in (False, True):
                 if found:
                     break
-                for pos in eligible_arr:
-                    current_aa = peptide[pos]
-                    current_mass = _AA_RESIDUE_MASSES.get(current_aa)
-                    if current_mass is None:
-                        continue
-                    sub_pool = [
-                        aa for aa in _SUB_ALPHABET
-                        if aa != current_aa and _AA_RESIDUE_MASSES[aa] != current_mass
-                    ]
-                    up_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] > current_mass]
-                    down_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] < current_mass]
-                    pool = (up_pool if upshift else down_pool) if pass_num == 0 else (
-                        down_pool if upshift else up_pool
-                    )
-                    if not pool:
-                        continue
-                    replacement = str(rng.choice(pool))
-                    mass_delta = _AA_RESIDUE_MASSES[replacement] - current_mass
-                    approx_mhz = orig_mhz + mass_delta
-
-                    min_shift = (
-                        mass_shift_min_da if mass_shift_min_da is not None
-                        else matching_ppm * orig_mhz / 1e6
-                    )
-                    if abs(mass_delta) < min_shift:
-                        continue
-
-                    if collision_filter:
-                        if _collides_target(approx_mhz):
-                            n_collisions += 1
+                for pass_num in range(2):
+                    if found:
+                        break
+                    for pos in eligible_arr:
+                        current_aa = peptide[pos]
+                        current_mass = _AA_RESIDUE_MASSES.get(current_aa)
+                        if current_mass is None:
                             continue
-                        if not snap_to_features and _collides_used(approx_mhz):
-                            n_collisions += 1
+                        sub_pool = [
+                            aa for aa in _SUB_ALPHABET
+                            if aa != current_aa and _AA_RESIDUE_MASSES[aa] != current_mass
+                        ]
+                        up_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] > current_mass]
+                        down_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] < current_mass]
+                        pool = (up_pool if upshift else down_pool) if pass_num == 0 else (
+                            down_pool if upshift else up_pool
+                        )
+                        if not pool:
+                            continue
+                        replacement = str(rng.choice(pool))
+                        mass_delta = _AA_RESIDUE_MASSES[replacement] - current_mass
+                        approx_mhz = orig_mhz + mass_delta
+
+                        min_shift = (
+                            mass_shift_min_da if mass_shift_min_da is not None
+                            else matching_ppm * orig_mhz / 1e6
+                        )
+                        if abs(mass_delta) < min_shift:
                             continue
 
-                    p_prime = peptide[:pos] + replacement + peptide[pos + 1:]
-                    cand_idx = -1
-                    if not snap_to_features:
-                        cand_idx = next_decoy_idx
-                        next_decoy_idx += 1
-                        bisect.insort(used_decoy_mz, approx_mhz)
-                    accepted.append((i, p_prime, mass_delta, approx_mhz, cand_idx))
-                    found = True
-                    break
+                        if collision_filter:
+                            if _collides_target(approx_mhz):
+                                n_collisions += 1
+                                continue
+                            if not snap_to_features and _collides_used(approx_mhz, _relax):
+                                n_collisions += 1
+                                continue
+                            if _relax:
+                                n_relaxed += 1
+
+                        p_prime = peptide[:pos] + replacement + peptide[pos + 1:]
+                        cand_idx = -1
+                        if not snap_to_features:
+                            cand_idx = next_decoy_idx
+                            next_decoy_idx += 1
+                            bisect.insort(used_decoy_mz, approx_mhz)
+                        accepted.append((i, p_prime, mass_delta, approx_mhz, cand_idx))
+                        found = True
+                        break
 
             if not found:
                 logger.debug(
@@ -849,96 +860,121 @@ def generate_substitution_candidates(
         else:
             # Multi-residue: apply n substitutions sequentially at distinct positions.
             # Sign constraint on net delta is best-effort; log when unsatisfied.
-            seq = list(peptide)
-            net_delta = 0.0
-            used_positions: set[int] = set()
-            applied = 0
+            # Retry with a different draw when the decoy m/z is rejected (shift too
+            # small, or colliding with a target / an already-placed decoy).  Without
+            # this the peptide is dropped on the first rejection, which costs ~60% of
+            # decoys once the collision filter is active.  The single-residue path
+            # already retries by walking its remaining positions.
+            accepted_here = False
+            for attempt in range(_SUBSTITUTION_MAX_ATTEMPTS):
+                if attempt > 0:
+                    # Attempt 0 preserves the original RNG draw order, so runs with an
+                    # inert collision filter produce byte-identical decoys.
+                    rng.shuffle(eligible_arr)
+                seq = list(peptide)
+                net_delta = 0.0
+                used_positions: set[int] = set()
+                applied = 0
 
-            for pass_num in range(2):
-                if applied >= n_residues:
-                    break
-                for pos in eligible_arr:
+                for pass_num in range(2):
                     if applied >= n_residues:
                         break
-                    if pos in used_positions:
-                        continue
-                    current_aa = seq[pos]
-                    current_mass = _AA_RESIDUE_MASSES.get(current_aa)
-                    if current_mass is None:
-                        continue
-                    sub_pool = [
-                        aa for aa in _SUB_ALPHABET
-                        if aa != current_aa and _AA_RESIDUE_MASSES[aa] != current_mass
-                    ]
-                    up_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] > current_mass]
-                    down_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] < current_mass]
-                    pool = (up_pool if upshift else down_pool) if pass_num == 0 else (
-                        down_pool if upshift else up_pool
+                    for pos in eligible_arr:
+                        if applied >= n_residues:
+                            break
+                        if pos in used_positions:
+                            continue
+                        current_aa = seq[pos]
+                        current_mass = _AA_RESIDUE_MASSES.get(current_aa)
+                        if current_mass is None:
+                            continue
+                        sub_pool = [
+                            aa for aa in _SUB_ALPHABET
+                            if aa != current_aa and _AA_RESIDUE_MASSES[aa] != current_mass
+                        ]
+                        up_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] > current_mass]
+                        down_pool = [aa for aa in sub_pool if _AA_RESIDUE_MASSES[aa] < current_mass]
+                        pool = (up_pool if upshift else down_pool) if pass_num == 0 else (
+                            down_pool if upshift else up_pool
+                        )
+                        if not pool:
+                            continue
+                        replacement = str(rng.choice(pool))
+                        delta = _AA_RESIDUE_MASSES[replacement] - current_mass
+                        seq[pos] = replacement
+                        net_delta += delta
+                        used_positions.add(pos)
+                        applied += 1
+
+                if applied < n_residues:
+                    # Structural: too few eligible positions. Retrying cannot help.
+                    logger.debug(
+                        "substitution: could not apply %d substitutions to '%s' (applied %d)",
+                        n_residues, peptide, applied,
                     )
-                    if not pool:
+                    break
+
+                if (upshift and net_delta < 0) or (not upshift and net_delta > 0):
+                    logger.debug(
+                        "substitution: net sign mismatch for '%s' (wanted %s, got %.4f Da)",
+                        peptide, "up" if upshift else "down", net_delta,
+                    )
+
+                approx_mhz = orig_mhz + net_delta
+                min_shift = (
+                    mass_shift_min_da if mass_shift_min_da is not None
+                    else matching_ppm * orig_mhz / 1e6
+                )
+                if abs(net_delta) < min_shift:
+                    logger.debug(
+                        "substitution: '%s' net shift %.4f Da < min %.4f Da — retrying",
+                        peptide, abs(net_delta), min_shift,
+                    )
+                    continue
+
+                if collision_filter:
+                    if _collides_target(approx_mhz):
+                        n_collisions += 1
                         continue
-                    replacement = str(rng.choice(pool))
-                    delta = _AA_RESIDUE_MASSES[replacement] - current_mass
-                    seq[pos] = replacement
-                    net_delta += delta
-                    used_positions.add(pos)
-                    applied += 1
+                    _relax = attempt >= _SUBSTITUTION_MAX_ATTEMPTS // 2
+                    if not snap_to_features and _collides_used(approx_mhz, _relax):
+                        n_collisions += 1
+                        continue
+                    if _relax:
+                        n_relaxed += 1
 
-            if applied < n_residues:
-                logger.debug(
-                    "substitution: could not apply %d substitutions to '%s' (applied %d)",
-                    n_residues, peptide, applied,
-                )
+                p_prime = "".join(seq)
+                cand_idx = -1
+                if not snap_to_features:
+                    cand_idx = next_decoy_idx
+                    next_decoy_idx += 1
+                    bisect.insort(used_decoy_mz, approx_mhz)
+                accepted.append((i, p_prime, net_delta, approx_mhz, cand_idx))
+                accepted_here = True
+                break
+
+            if not accepted_here:
                 n_skipped += 1
-                continue
-
-            if (upshift and net_delta < 0) or (not upshift and net_delta > 0):
-                logger.debug(
-                    "substitution: net sign mismatch for '%s' (wanted %s, got %.4f Da)",
-                    peptide, "up" if upshift else "down", net_delta,
-                )
-
-            approx_mhz = orig_mhz + net_delta
-            min_shift = (
-                mass_shift_min_da if mass_shift_min_da is not None
-                else matching_ppm * orig_mhz / 1e6
-            )
-            if abs(net_delta) < min_shift:
-                logger.debug(
-                    "substitution: skipping '%s' — net shift %.4f Da < min %.4f Da",
-                    peptide, abs(net_delta), min_shift,
-                )
-                n_skipped += 1
-                continue
-
-            if collision_filter:
-                if _collides_target(approx_mhz):
-                    n_collisions += 1
-                    continue
-                if not snap_to_features and _collides_used(approx_mhz):
-                    n_collisions += 1
-                    continue
-
-            p_prime = "".join(seq)
-            cand_idx = -1
-            if not snap_to_features:
-                cand_idx = next_decoy_idx
-                next_decoy_idx += 1
-                bisect.insort(used_decoy_mz, approx_mhz)
-            accepted.append((i, p_prime, net_delta, approx_mhz, cand_idx))
 
     n_accepted = len(accepted)
     logger.info(
         "substitution: %d/%d target peptides → valid decoys "
-        "(%d skipped, %d collision attempts filtered)",
-        n_accepted, n_unique, n_skipped, n_collisions,
+        "(%d skipped, %d colliding draws rejected across retries, "
+        "%d placed only after relaxing decoy-vs-decoy proximity)",
+        n_accepted, n_unique, n_skipped, n_collisions, n_relaxed,
     )
-    collision_rate = n_collisions / n_unique if n_unique > 0 else 0.0
-    if collision_rate > 0.05:
+    # With retries, n_collisions counts rejected *draws*, not peptides, so it is not
+    # a rate. What matters downstream is how many peptides ended up without a decoy:
+    # _tdc_qvalues assumes a 1:1 target:decoy ratio and applies no correction.
+    skip_rate = n_skipped / n_unique if n_unique > 0 else 0.0
+    if skip_rate > 0.05:
         logger.warning(
-            "substitution: collision rate %.1f%% > 5%% — "
-            "substituted m/z space overlaps with targets more than expected",
-            100.0 * collision_rate,
+            "substitution: %.1f%% of peptides (%d/%d) got no decoy after %d attempts each; "
+            "target:decoy is %.2f, and the TDC q-value assumes 1:1 — q-values are "
+            "anti-conservative by ~%.0f%%. Lower collision_ppm or raise the retry budget.",
+            100.0 * skip_rate, n_skipped, n_unique, _SUBSTITUTION_MAX_ATTEMPTS,
+            n_accepted / max(n_unique, 1),
+            100.0 * (n_unique / max(n_accepted, 1) - 1.0),
         )
 
     # Match targets against MALDI features (normal path)

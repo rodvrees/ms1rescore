@@ -790,6 +790,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     cand.add_argument(
+        "--substitution-collision-ppm",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help=(
+            "substitution only: m/z separation (ppm) the collision filter enforces "
+            "between a decoy and any target. Defaults to matching_ppm, which is 0 in "
+            "raw-query mode and therefore disables the filter; set at least the "
+            "extraction window so a decoy cannot capture a target's ion image."
+        ),
+    )
+    cand.add_argument(
         "--substitution-mass-shift-min-da",
         type=float,
         default=None,
@@ -1495,7 +1507,7 @@ def main() -> None:
         "decoy_method", "mz_shift_delta_min", "mz_shift_delta_max",
         "mz_shift_snap_tolerance_ppm", "max_shuffle_rounds", "decoy_target_ratio",
         "substitution_n_residues", "substitution_seed", "substitution_no_collision_filter",
-        "substitution_mass_shift_min_da",
+        "substitution_mass_shift_min_da", "substitution_collision_ppm",
         "protein_fdr", "peptide_fdr", "lcms_id_format",
         "im2deep_calibration", "init_ppm_threshold", "init_isotope_threshold",
         "features_preset", "features_exclude", "seed_features",
@@ -1989,6 +2001,7 @@ def main() -> None:
         substitution_seed=_ms1cfg["substitution_seed"],
         substitution_collision_filter=not bool(_ms1cfg.get("substitution_no_collision_filter", False)),
         substitution_mass_shift_min_da=_ms1cfg.get("substitution_mass_shift_min_da"),
+        substitution_collision_ppm=_ms1cfg.get("substitution_collision_ppm"),
     )
 
     # --- Write results ---

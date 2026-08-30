@@ -422,3 +422,108 @@ class TestProperties:
         # The pair (L→I) and (I→L) must never appear
         assert ("L", "I") not in seen_sub_pairs, "L was substituted with isobaric I"
         assert ("I", "L") not in seen_sub_pairs, "I was substituted with isobaric L"
+
+
+def test_collision_ppm_enforces_separation_when_matching_ppm_is_zero():
+    """Raw-query runs set matching_ppm=0, which silently disables the collision
+    filter (tolerance 0 rejects only exact ties). collision_ppm decouples the two."""
+    import numpy as np
+    import pandas as pd
+    from msi_picasso.candidates import generate_substitution_candidates
+
+    rng = np.random.default_rng(0)
+    peps = ["".join(rng.choice(list("ACDEFGHILMNPQSTVWY"), 12)) + "K" for _ in range(200)]
+    from ms1rescore_rs import compute_peptide_masses
+    mass, mh, nc, nh, nn, no, ns = compute_peptide_masses(peps)
+    target = pd.DataFrame({
+        "peptide": peps, "protein": ["P"] * len(peps), "is_decoy": False,
+        "mass": mass, "mh_mz": mh,
+        "n_C": nc, "n_H": nh, "n_N": nn, "n_O": no, "n_S": ns,
+    })
+    grid = np.sort(np.asarray(mh, dtype=float))
+
+    def _min_sep_ppm(collision_ppm):
+        out = generate_substitution_candidates(
+            target, grid, matching_ppm=0.0, n_residues=2,
+            collision_filter=True, collision_ppm=collision_ppm, snap_to_features=False,
+        )
+        dec = np.sort(out.loc[out.is_decoy, "feature_mz"].dropna().unique())
+        tm = np.sort(out.loc[~out.is_decoy, "feature_mz"].dropna().unique())
+        i = np.clip(np.searchsorted(tm, dec), 1, len(tm) - 1)
+        sep = np.minimum(np.abs(dec - tm[i - 1]), np.abs(dec - tm[i])) / dec * 1e6
+        return sep, len(dec)
+
+    sep_off, n_off = _min_sep_ppm(None)      # inherits matching_ppm=0 -> filter inert
+    sep_on, n_on = _min_sep_ppm(50.0)
+
+    assert (sep_on >= 50.0).all(), f"min separation {sep_on.min():.1f} ppm < 50"
+    assert (sep_off < 50.0).any(), "baseline should have decoys inside 50 ppm of a target"
+    # Yield must stay essentially complete: peptides left without a decoy shrink the
+    # DECOY_ protein namespace relative to its target, which makes protein_coverage
+    # (and every other size-sensitive protein feature) leak the label.
+    assert n_on >= 0.98 * n_off, f"collision filter kept only {n_on}/{n_off} decoys"
+
+
+def test_decoy_decoy_relaxation_preserves_target_separation():
+    """The second retry phase ignores decoy-vs-decoy proximity to recover yield, but
+    the decoy-vs-target separation is the one that matters and must never be relaxed."""
+    import numpy as np
+    import pandas as pd
+    from ms1rescore_rs import compute_peptide_masses
+    from msi_picasso.candidates import generate_substitution_candidates
+
+    rng = np.random.default_rng(11)
+    # A dense peptide set, so decoy-vs-decoy collisions actually bite.
+    peps = ["".join(rng.choice(list("ACDEFGHILMNPQSTVWY"), 11)) + "K" for _ in range(600)]
+    mass, mh, nc, nh, nn, no, ns = compute_peptide_masses(peps)
+    target = pd.DataFrame({
+        "peptide": peps, "protein": ["P"] * len(peps), "is_decoy": False,
+        "mass": mass, "mh_mz": mh,
+        "n_C": nc, "n_H": nh, "n_N": nn, "n_O": no, "n_S": ns,
+    })
+    grid = np.sort(np.asarray(mh, dtype=float))
+    out = generate_substitution_candidates(
+        target, grid, matching_ppm=0.0, n_residues=2,
+        collision_filter=True, collision_ppm=40.0, snap_to_features=False,
+    )
+    dec = np.sort(out.loc[out.is_decoy, "feature_mz"].dropna().unique())
+    tm = np.sort(out.loc[~out.is_decoy, "feature_mz"].dropna().unique())
+    i = np.clip(np.searchsorted(tm, dec), 1, len(tm) - 1)
+    sep = np.minimum(np.abs(dec - tm[i - 1]), np.abs(dec - tm[i])) / dec * 1e6
+
+    assert (sep >= 40.0).all(), f"target separation violated: min {sep.min():.1f} ppm"
+    assert out.is_decoy.sum() >= 0.98 * len(peps), "yield collapsed despite the relaxation"
+
+
+def test_retry_does_not_change_decoys_when_filter_is_inert():
+    """Attempt 0 must reproduce the pre-retry draw, so runs without the collision
+    filter are unaffected by the retry budget."""
+    import numpy as np
+    import pandas as pd
+    from ms1rescore_rs import compute_peptide_masses
+    import msi_picasso.candidates as candidates_mod
+    from msi_picasso.candidates import generate_substitution_candidates
+
+    rng = np.random.default_rng(3)
+    peps = ["".join(rng.choice(list("ACDEFGHILMNPQSTVWY"), 14)) + "R" for _ in range(150)]
+    mass, mh, nc, nh, nn, no, ns = compute_peptide_masses(peps)
+    target = pd.DataFrame({
+        "peptide": peps, "protein": ["P"] * len(peps), "is_decoy": False,
+        "mass": mass, "mh_mz": mh,
+        "n_C": nc, "n_H": nh, "n_N": nn, "n_O": no, "n_S": ns,
+    })
+    grid = np.sort(np.asarray(mh, dtype=float))
+
+    def _decoys(max_attempts):
+        original = candidates_mod._SUBSTITUTION_MAX_ATTEMPTS
+        candidates_mod._SUBSTITUTION_MAX_ATTEMPTS = max_attempts
+        try:
+            out = generate_substitution_candidates(
+                target, grid, matching_ppm=0.0, n_residues=2,
+                collision_filter=False, snap_to_features=False,
+            )
+        finally:
+            candidates_mod._SUBSTITUTION_MAX_ATTEMPTS = original
+        return list(out.loc[out.is_decoy].sort_values("feature_mz")["peptide"])
+
+    assert _decoys(1) == _decoys(200)
